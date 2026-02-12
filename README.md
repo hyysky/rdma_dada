@@ -1,6 +1,6 @@
 # RDMA + PSRDADA Standalone Module
 
-提取的 RDMA 与 psrdada 环形缓冲集成的独立模块。
+RoCE v2接收 与 psrdada 环形缓冲集成，实现数据流实时接收。
 
 ## ✨ 最新特性 (v1.2.0)
 
@@ -231,7 +231,7 @@ class PsrdadaRingBuf {
 };
 ```
 
-### RoCEv2Dada 类（原ZjlabRdma，已修复）
+### RoCEv2Dada 类
 
 RDMA 网络接收/发送实现，修复了多个严重BUG：
 
