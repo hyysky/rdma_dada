@@ -231,7 +231,7 @@ class PsrdadaRingBuf {
 };
 ```
 
-### RoCEv2Dada 类（原ZjlabRdma，已修复）
+### RoCEv2Dada 类
 
 RDMA 网络接收/发送实现，修复了多个严重BUG：
 
