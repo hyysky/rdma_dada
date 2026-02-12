@@ -1,6 +1,6 @@
 # RDMA + PSRDADA Standalone Module
 
-提取的 RDMA 与 psrdada 环形缓冲集成的独立模块。
+RoCE v2接收 与 psrdada 环形缓冲集成，实现数据流实时接收。
 
 ## ✨ 最新特性 (v1.2.0)
 
