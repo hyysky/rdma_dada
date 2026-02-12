@@ -1,0 +1,13 @@
+HDR_VERSION         1.0
+HDR_SIZE            4096
+OBS_OFFSET          0
+OBS_ID              100
+RESOLUTION          98304
+NANT                4          #天线数目
+PKT_HEADER          64         #udp包头大小 （Byte）
+PKT_DATA            8192       #udp包数据大小 （Byte）
+PKT_NSAMP           512        #udp包中采样数   
+PKT_TSAMP           1e-3       #udp包中采样时间间隔 （us）
+PKT_NPOL            2          #udp包中偏振通道数目
+PKT_NBIT            2          #udp包中数据大小 （Byte）
+BYTES_PER_SECOND    2064000000 #每秒接收的数据量 (Byte)

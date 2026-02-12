@@ -1,0 +1,34 @@
+# Build outputs
+build/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# Generated logs and runtime data
+data_out/
+*.log
+logs/
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Backup files
+*~
+*.swp
+*.swo
