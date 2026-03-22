@@ -140,6 +140,10 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     fflush(stdout);
     
     ibv_res_ptr->pkt_size = Param.pkt_size;
+    if (ibv_res_ptr->pkt_size <= PKT_HEAD_LEN) {
+        fprintf(stderr, "[ERROR] pkt_size (%u) must exceed PKT_HEAD_LEN (%u).\n", ibv_res_ptr->pkt_size, PKT_HEAD_LEN);
+        return;
+    }
     ibv_res_ptr->poll_n = 8;
     ibv_res_ptr->recv_completed = 0;
     ibv_res_ptr->recv_sum_completed = 0;
@@ -204,7 +208,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     printf("[RoCEv2Dada] Allocating memory buffers...\n");
     fflush(stdout);
     
-    uint32_t buf_size = (ibv_res_ptr->pkt_size + PKT_HEAD_LEN) * work_num;
+    uint32_t buf_size = ibv_res_ptr->pkt_size * work_num;
 
     if (!this->param.SendOrRecv && this->param.DirectToRing) {
         ibv_res_ptr->mem_buf = NULL;
@@ -226,15 +230,16 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
             ibv_res_ptr->mem_buf = (unsigned char *)malloc(buf_size);
         }
 
-        ret = register_memory(ibv_res_ptr, ibv_res_ptr->mem_buf, buf_size, (ibv_res_ptr->pkt_size + PKT_HEAD_LEN));
+        ret = register_memory(ibv_res_ptr, ibv_res_ptr->mem_buf, buf_size, ibv_res_ptr->pkt_size);
         if (ret < 0) { printf("Failed to register memory.\n"); fflush(stdout); return; }
         printf("Register memory successfully (buf_size=%u bytes).\n", buf_size);
         fflush(stdout);
     }
     
     if(this->param.SendOrRecv) {
+        const unsigned int udp_header_len = 8;
         for(int k = 0; k < work_num; k++) {
-            struct udp_pkt *pkt = (struct udp_pkt *)((uint8_t *)ibv_res_ptr->mem_buf + k * (ibv_res_ptr->pkt_size + PKT_HEAD_LEN));
+            struct udp_pkt *pkt = (struct udp_pkt *)((uint8_t *)ibv_res_ptr->mem_buf + k * ibv_res_ptr->pkt_size);
             set_dest_mac(pkt, ibv_res_ptr->pkt_info.dst_mac);
             set_src_mac(pkt, ibv_res_ptr->pkt_info.src_mac);
             set_eth_type(pkt, (uint8_t *)"\x08\x00");
@@ -242,7 +247,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
             set_dst_ip(pkt, (uint8_t *)(&ibv_res_ptr->pkt_info.dst_ip));
             set_udp_src_port(pkt, ibv_res_ptr->pkt_info.src_port);
             set_udp_dst_port(pkt, ibv_res_ptr->pkt_info.dst_port);
-            set_pkt_len(pkt, ibv_res_ptr->pkt_size + PKT_HEAD_LEN - 34);
+            set_pkt_len(pkt, ibv_res_ptr->pkt_size + udp_header_len);
             ret = this->param.WritSendBuff(pkt->payload, ibv_res_ptr->pkt_size);
             if (ret < 0) { printf("Failed to WritSendBuff.\n"); return; }
         }
