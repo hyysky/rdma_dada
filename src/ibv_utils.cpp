@@ -268,7 +268,15 @@ int ib_send(struct ibv_utils_res *ibv_res)
 
 int ib_recv(struct ibv_utils_res *ibv_res)
 {
-    if(ibv_res->recv_completed > 0){ for(int i = 0; i < ibv_res->recv_completed; i++){ ibv_res->recv_wr->wr_id = ibv_res->wc[i].wr_id; ibv_res->recv_wr->sg_list = &ibv_res->sge[ibv_res->wc[i].wr_id*ibv_res->recv_nsge]; ibv_res->recv_wr->num_sge = ibv_res->recv_nsge; ibv_res->recv_wr->next = NULL; ibv_post_recv(ibv_res->qp, ibv_res->recv_wr, &ibv_res->bad_recv_wr); } }
+    if(ibv_res->recv_completed > 0){ 
+        for(int i = 0; i < ibv_res->recv_completed; i++){ 
+            ibv_res->recv_wr->wr_id = ibv_res->wc[i].wr_id; 
+            ibv_res->recv_wr->sg_list = &ibv_res->sge[ibv_res->wc[i].wr_id*ibv_res->recv_nsge]; 
+            ibv_res->recv_wr->num_sge = ibv_res->recv_nsge; 
+            ibv_res->recv_wr->next = NULL; 
+            ibv_post_recv(ibv_res->qp, ibv_res->recv_wr, &ibv_res->bad_recv_wr); 
+        } 
+    }
     ibv_res->recv_completed = ibv_poll_cq(ibv_res->cq, ibv_res->poll_n, ibv_res->wc);
     return ibv_res->recv_completed;
 }

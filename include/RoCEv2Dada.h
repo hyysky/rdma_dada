@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 #define PKT_HEAD_LEN 64
+#define PKT_DATA_SIZE 8192
 
 struct ibv_mr;
 
