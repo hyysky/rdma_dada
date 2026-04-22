@@ -27,9 +27,7 @@
 
 #define ELAPSED_US(start,stop) (((int64_t)stop.tv_sec-start.tv_sec)*1000*1000+(stop.tv_nsec-start.tv_nsec)/1000)
 #define MEASURE_BANDWIDTH(size, t) ((double)size * 8.0 / t / 1000)
-
-// Constants from original
-#define PKT_DATA_SIZE 6414
+#define RX_STRIP_HEADER_BYTES 42
 
 static int check_send_recv_info(struct ibv_utils_res * ibv_res_ptr, RoCEv2Dada::RdmaParam * Param_ptr)
 {
@@ -139,7 +137,19 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
            tmp[0], tmp[1], tmp[2], tmp[3], ibv_res_ptr->pkt_info.dst_port);
     fflush(stdout);
     
-    ibv_res_ptr->pkt_size = Param.pkt_size;
+    if (!this->param.SendOrRecv) {
+        ibv_res_ptr->pkt_size = Param.pkt_size + RX_STRIP_HEADER_BYTES;
+    } else {
+        ibv_res_ptr->pkt_size = Param.pkt_size;
+    }
+    if (ibv_res_ptr->pkt_size <= PKT_HEAD_LEN) {
+        fprintf(stderr, "[ERROR] pkt_size (%u) must exceed PKT_HEAD_LEN (%u).\n", ibv_res_ptr->pkt_size, PKT_HEAD_LEN);
+        return;
+    }
+    if (!this->param.SendOrRecv && this->param.DirectToRing && RX_STRIP_HEADER_BYTES > 0) {
+        fprintf(stderr, "[WARN] DirectToRing disabled: stripping %d-byte headers before ring write.\n", RX_STRIP_HEADER_BYTES);
+        this->param.DirectToRing = 0;
+    }
     ibv_res_ptr->poll_n = 8;
     ibv_res_ptr->recv_completed = 0;
     ibv_res_ptr->recv_sum_completed = 0;
@@ -204,7 +214,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     printf("[RoCEv2Dada] Allocating memory buffers...\n");
     fflush(stdout);
     
-    uint32_t buf_size = (ibv_res_ptr->pkt_size + PKT_HEAD_LEN) * work_num;
+    uint32_t buf_size = ibv_res_ptr->pkt_size * work_num;
 
     if (!this->param.SendOrRecv && this->param.DirectToRing) {
         ibv_res_ptr->mem_buf = NULL;
@@ -226,15 +236,16 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
             ibv_res_ptr->mem_buf = (unsigned char *)malloc(buf_size);
         }
 
-        ret = register_memory(ibv_res_ptr, ibv_res_ptr->mem_buf, buf_size, (ibv_res_ptr->pkt_size + PKT_HEAD_LEN));
+        ret = register_memory(ibv_res_ptr, ibv_res_ptr->mem_buf, buf_size, ibv_res_ptr->pkt_size);
         if (ret < 0) { printf("Failed to register memory.\n"); fflush(stdout); return; }
         printf("Register memory successfully (buf_size=%u bytes).\n", buf_size);
         fflush(stdout);
     }
     
     if(this->param.SendOrRecv) {
+        const unsigned int udp_header_len = 8;
         for(int k = 0; k < work_num; k++) {
-            struct udp_pkt *pkt = (struct udp_pkt *)((uint8_t *)ibv_res_ptr->mem_buf + k * (ibv_res_ptr->pkt_size + PKT_HEAD_LEN));
+            struct udp_pkt *pkt = (struct udp_pkt *)((uint8_t *)ibv_res_ptr->mem_buf + k * ibv_res_ptr->pkt_size);
             set_dest_mac(pkt, ibv_res_ptr->pkt_info.dst_mac);
             set_src_mac(pkt, ibv_res_ptr->pkt_info.src_mac);
             set_eth_type(pkt, (uint8_t *)"\x08\x00");
@@ -242,7 +253,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
             set_dst_ip(pkt, (uint8_t *)(&ibv_res_ptr->pkt_info.dst_ip));
             set_udp_src_port(pkt, ibv_res_ptr->pkt_info.src_port);
             set_udp_dst_port(pkt, ibv_res_ptr->pkt_info.dst_port);
-            set_pkt_len(pkt, ibv_res_ptr->pkt_size + PKT_HEAD_LEN - 34);
+            set_pkt_len(pkt, ibv_res_ptr->pkt_size + udp_header_len);
             ret = this->param.WritSendBuff(pkt->payload, ibv_res_ptr->pkt_size);
             if (ret < 0) { printf("Failed to WritSendBuff.\n"); return; }
         }
@@ -331,10 +342,16 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
     char * cpu_data = NULL;
     // pkt_size already includes header (passed from run_demo.sh as PKT_HEADER+PKT_DATA)
     int pkt_len = ibv_res_ptr->pkt_size;
+    int ring_pkt_len = this_ptr->param.pkt_size;
     int send_idx = 0;
     time_t rawtime;
     struct tm *timeinfo;
     char time_buffer[80];
+
+    if (!this_ptr->param.SendOrRecv && this_ptr->param.pkt_size <= 0) {
+        fprintf(stderr, "ERROR: invalid payload pkt_size=%u.\n", this_ptr->param.pkt_size);
+        return NULL;
+    }
     
     // 初始化时间戳，避免第一次计算时使用未初始化的值
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts_start);
@@ -419,22 +436,19 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
             if((ns_elapsed) > 1000 * 1000 * 1) {
                 ts_start = ts_now;
                 if(total_recv != total_recv_pre) {
-                    double bandwidth = MEASURE_BANDWIDTH(((total_recv - total_recv_pre) * pkt_len), ns_elapsed);
+                    double bandwidth = MEASURE_BANDWIDTH(((total_recv - total_recv_pre) * ring_pkt_len), ns_elapsed);
                     time(&rawtime);
                     timeinfo = localtime(&rawtime);
                     timeinfo->tm_hour += 8;
                     strftime(time_buffer, sizeof(time_buffer), "year:%Y,month:%m,day:%d,hours:%H,minites:%M,second:%S", timeinfo);
                     printf("NowTime:%s,gpu_id:%d,total_recv:%-8luKB,Process Bandwidth:%6.3f Gbps,cost time:%lums\n",
-                           time_buffer, this_ptr->param.gpu_id, (unsigned long)(total_recv * pkt_len / 1024), bandwidth, (unsigned long)(ns_elapsed / 1000));
-                    total_recv_pre = 0;
-                    total_recv = 0;
-                } else {
-                    printf("total_recv: %-10lu Bandwidth: 0 Gbps, cost time us_elapsed: %lu \n", (unsigned long)total_recv, (unsigned long)ns_elapsed);
+                           time_buffer, this_ptr->param.gpu_id, (unsigned long)(total_recv * ring_pkt_len / 1024), bandwidth, (unsigned long)(ns_elapsed / 1000));
+                    total_recv_pre = total_recv;
                 }
             }
             
             // Calculate space needed for next batch
-            long int bytes_needed = (long int)(this_ptr->param.send_n * pkt_len);
+            long int bytes_needed = (long int)(this_ptr->param.send_n * ring_pkt_len);
             
             // Get new buffer if current buffer is empty OR insufficient for next batch
             if(block_bufsz <= 0 || block_bufsz < bytes_needed) {
@@ -479,6 +493,12 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                            this_ptr->param.send_n);
                     fflush(stdout);
                 }
+                // Accumulate newly polled completions into wc_tmp at the right offset.
+                // Without this, wc_tmp stays stale (all wr_id==0) and the same buffer
+                // slot gets copied send_n times instead of the real received packets.
+                memcpy(ibv_res_ptr->wc_tmp + ibv_res_ptr->recv_sum_completed,
+                       ibv_res_ptr->wc,
+                       sizeof(struct ibv_wc) * ibv_res_ptr->recv_completed);
                 ibv_res_ptr->recv_sum_completed += ibv_res_ptr->recv_completed;
             if(ibv_res_ptr->recv_sum_completed >= this_ptr->param.send_n) {
                     // Batch complete, process data
@@ -486,18 +506,23 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                         printf("[DEBUG] Processing batch: %d completions\n", this_ptr->param.send_n);
                         fflush(stdout);
                     }
-                    
-                    if(this_ptr->param.RdmaDirectGpu != 0) {
-                        CUDA_CALL(cudaMemcpy(gpu_ibuf,
-                                           (void *)ibv_res_ptr->sge[ibv_res_ptr->wc_tmp[0].wr_id*ibv_res_ptr->recv_nsge].addr,
-                                           this_ptr->param.send_n * pkt_len, cudaMemcpyDeviceToDevice));
-                    } else {
-                        memcpy(gpu_ibuf,
-                               (void *)ibv_res_ptr->sge[ibv_res_ptr->wc_tmp[0].wr_id*ibv_res_ptr->recv_nsge].addr,
-                               this_ptr->param.send_n * pkt_len);
+
+                    for (int i = 0; i < this_ptr->param.send_n; i++) {
+                        uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
+                        unsigned char *src = (unsigned char *)ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge].addr;
+                        if (this_ptr->param.RdmaDirectGpu != 0) {
+                            CUDA_CALL(cudaMemcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
+                                                 src + RX_STRIP_HEADER_BYTES,
+                                                 ring_pkt_len,
+                                                 cudaMemcpyDeviceToDevice));
+                        } else {
+                            memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
+                                   src + RX_STRIP_HEADER_BYTES,
+                                   ring_pkt_len);
+                        }
                     }
                     
-                    uint64_t bytes_written = this_ptr->param.send_n * pkt_len;
+                    uint64_t bytes_written = this_ptr->param.send_n * ring_pkt_len;
                     
                     gpu_ibuf += bytes_written;
                     block_bufsz -= (long int)bytes_written;

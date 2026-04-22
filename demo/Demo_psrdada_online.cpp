@@ -16,7 +16,6 @@
 #include "ibv_utils.h"
 
 #define PSRDADA_BUFFER_KEY 0xdada
-#define PKT_DATA_SIZE 8192
 
 PsrdadaRingBuf *g_ringbuf = NULL;
 volatile int g_thread_exit = 0;
@@ -49,8 +48,7 @@ char* GetBuffPtr(long int& buf_size) {
         }
     }
     
-    // 计算每次写入的字节数
-    // g_pkt_size 已经包含包头（从命令行传入的是完整包大小）
+    // g_pkt_size is payload bytes written into ring buffer per packet.
     g_bytes_per_write = (uint64_t)g_pkt_size * g_send_n;
     
     // 计算这个block可以接收多少次：N = block_size / (pkt_size * send_n)
@@ -170,7 +168,7 @@ void print_helper() {
     printf("    --dip, destination IP address (required)\n");
     printf("    --sport, source port number (required)\n");
     printf("    --dport, destination port number (required)\n");
-    printf("    --pkt_size, packet size including header (default: %d)\n", PKT_DATA_SIZE);
+    printf("    --pkt_size, packet size including header (default: %d)\n", PKT_DATA_SIZE+PKT_HEAD_LEN);
     printf("    --send_n, batch size (default: 64)\n");
     printf("    --nsge, scatter/gather entries per work request (default: 4)\n");
     printf("    --key, psrdada buffer key in hex (default: 0x%x)\n", PSRDADA_BUFFER_KEY);
@@ -287,9 +285,8 @@ int main(int argc, char *argv[]) {
         printf("[Debug] Mode: ENABLED\n");
     }
     
-    // pkt_size 已经包含包头（从 run_demo.sh 传入的是 PKT_HEADER+PKT_DATA）
-    uint64_t receive_bytes_per_time = (uint64_t)(param.pkt_size) * param.send_n;
-    printf("  Receive size per batch: %lu bytes (%.2f MB)\n", 
+    uint64_t receive_bytes_per_time = (uint64_t)param.pkt_size * param.send_n;
+    printf("  Receive payload per batch: %lu bytes (%.2f MB)\n", 
            receive_bytes_per_time, receive_bytes_per_time / 1024.0 / 1024.0);
     fflush(stdout);
 

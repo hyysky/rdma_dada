@@ -103,12 +103,58 @@ int register_memory(struct ibv_utils_res *ib_res, void *addr, size_t total_lengt
 {
     ib_res->mr = ibv_reg_mr(ib_res->pd, addr, total_length, IBV_ACCESS_LOCAL_WRITE);
     if(!ib_res->mr){ ibv_utils_error("Failed to register memory."); return -1; }
+
     int max_sge = ib_res->send_nsge > ib_res->recv_nsge ? ib_res->send_nsge : ib_res->recv_nsge;
-    int wr_num = total_length / chunck_size / max_sge;
-    if((wr_num != ib_res->send_wr_num) && (wr_num != ib_res->recv_wr_num)){ ibv_utils_error("The number of wr is not equal to the number of sge."); return -2; }
+    if (max_sge <= 0) {
+        ibv_utils_error("Invalid SGE count.");
+        return -1;
+    }
+
+    if (chunck_size == 0 || total_length == 0 || total_length % chunck_size != 0) {
+        ibv_utils_error("Invalid chunk size or total length for memory registration.");
+        return -2;
+    }
+
+    int wr_num = (int)(total_length / chunck_size);
+    if ((ib_res->send_wr_num > 0 && wr_num != ib_res->send_wr_num) &&
+        (ib_res->recv_wr_num > 0 && wr_num != ib_res->recv_wr_num)) {
+        ibv_utils_error("The number of WRs does not match queue configuration.");
+        return -3;
+    }
+
+    if ((size_t)max_sge > chunck_size) {
+        ibv_utils_error("chunk size is smaller than nsge, cannot split buffer.");
+        return -4;
+    }
+
     char *addr_char = (char*)addr;  // Cast to char* for pointer arithmetic
-    for(int i=0; i< wr_num * max_sge; i++){ ib_res->sge[i].addr = (uint64_t)(addr_char + i*chunck_size); ib_res->sge[i].length = chunck_size ; ib_res->sge[i].lkey = ib_res->mr->lkey; }
-    for(int i = 0; i < wr_num; i++){ ib_res->wc[i].wr_id = i; }
+    size_t base_len = chunck_size / max_sge;
+    size_t remainder = chunck_size % max_sge;
+
+    for(int wr = 0; wr < wr_num; wr++) {
+        char *wr_base = addr_char + ((size_t)wr * chunck_size);
+        size_t offset = 0;
+        for(int sge_idx = 0; sge_idx < max_sge; sge_idx++) {
+            size_t seg_len = base_len;
+            if (remainder > 0) {
+                // 均匀分摊余数，确保总长度一致
+                size_t distribute = (remainder > (size_t)sge_idx) ? 1 : 0;
+                seg_len += distribute;
+            }
+
+            if (seg_len == 0) {
+                ibv_utils_error("Computed SGE length is zero.");
+                return -5;
+            }
+
+            struct ibv_sge *sge = &ib_res->sge[wr * max_sge + sge_idx];
+            sge->addr = (uint64_t)(wr_base + offset);
+            sge->length = (uint32_t)seg_len;
+            sge->lkey = ib_res->mr->lkey;
+            offset += seg_len;
+        }
+        ib_res->wc[wr].wr_id = wr;
+    }
     return 0;
 }
 
@@ -222,7 +268,15 @@ int ib_send(struct ibv_utils_res *ibv_res)
 
 int ib_recv(struct ibv_utils_res *ibv_res)
 {
-    if(ibv_res->recv_completed > 0){ for(int i = 0; i < ibv_res->recv_completed; i++){ ibv_res->recv_wr->wr_id = ibv_res->wc[i].wr_id; ibv_res->recv_wr->sg_list = &ibv_res->sge[ibv_res->wc[i].wr_id*ibv_res->recv_nsge]; ibv_res->recv_wr->num_sge = ibv_res->recv_nsge; ibv_res->recv_wr->next = NULL; ibv_post_recv(ibv_res->qp, ibv_res->recv_wr, &ibv_res->bad_recv_wr); } }
+    if(ibv_res->recv_completed > 0){ 
+        for(int i = 0; i < ibv_res->recv_completed; i++){ 
+            ibv_res->recv_wr->wr_id = ibv_res->wc[i].wr_id; 
+            ibv_res->recv_wr->sg_list = &ibv_res->sge[ibv_res->wc[i].wr_id*ibv_res->recv_nsge]; 
+            ibv_res->recv_wr->num_sge = ibv_res->recv_nsge; 
+            ibv_res->recv_wr->next = NULL; 
+            ibv_post_recv(ibv_res->qp, ibv_res->recv_wr, &ibv_res->bad_recv_wr); 
+        } 
+    }
     ibv_res->recv_completed = ibv_poll_cq(ibv_res->cq, ibv_res->poll_n, ibv_res->wc);
     return ibv_res->recv_completed;
 }

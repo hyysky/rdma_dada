@@ -60,3 +60,6 @@ add_executable(Demo_psrdada_online demo/Demo_psrdada_online.cpp ${SRCS})
 target_include_directories(Demo_psrdada_online PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(Demo_psrdada_online PRIVATE _GNU_SOURCE)
 target_link_libraries(Demo_psrdada_online ${PSRDADA_LIBRARIES} ibverbs ${CMAKE_THREAD_LIBS_INIT} rt)
+
+add_executable(ssd_write_benchmark demo/ssd_write_benchmark.cpp)
+target_compile_definitions(ssd_write_benchmark PRIVATE _GNU_SOURCE)
