@@ -35,12 +35,40 @@ int create_ib_res(struct ibv_utils_res *ib_res, int send_wr_num, int recv_wr_num
     ib_res->qp = ibv_create_qp(ib_res->pd, &qp_init_attr);
     if(!ib_res->qp){ ibv_utils_error("Couldn't create QP."); return -4; }
     int max_sge = ib_res->send_nsge > ib_res->recv_nsge ? ib_res->send_nsge : ib_res->recv_nsge;
-    ib_res->sge = (struct ibv_sge *)malloc(wr_num * sizeof(struct ibv_sge)*max_sge);
-    if(!ib_res->sge) { ibv_utils_error("Failed to allocate memory for sge."); return -5; }
-    if(ib_res->send_wr_num > 0) { ib_res->send_wr = (struct ibv_send_wr *)malloc(ib_res->send_wr_num * sizeof(struct ibv_send_wr)); if(!ib_res->send_wr){ ibv_utils_error("Failed to allocate memory for send_wr."); return -6; } }
-    if(ib_res->recv_wr_num > 0) { ib_res->recv_wr = (struct ibv_recv_wr *)malloc(ib_res->recv_wr_num * sizeof(struct ibv_recv_wr)); if(!ib_res->recv_wr){ ibv_utils_error("Failed to allocate memory for recv_wr."); return -7; } }
-    ib_res->wc = (struct ibv_wc *)malloc(wr_num * sizeof(struct ibv_wc)); if(!ib_res->wc){ ibv_utils_error("Failed to allocate memory for wc."); return -8; }
-    ib_res->wc_tmp = (struct ibv_wc *)malloc(wr_num * sizeof(struct ibv_wc)); if(!ib_res->wc_tmp){ ibv_utils_error("Failed to allocate memory for wc_tmp."); return -8; }
+    
+    // 优化：单次分配所有缓冲区，减少 malloc 调用次数
+    size_t total_size = 0;
+    size_t sge_size = wr_num * sizeof(struct ibv_sge) * max_sge;
+    size_t send_wr_size = (send_wr_num > 0) ? send_wr_num * sizeof(struct ibv_send_wr) : 0;
+    size_t recv_wr_size = (recv_wr_num > 0) ? recv_wr_num * sizeof(struct ibv_recv_wr) : 0;
+    size_t wc_size = wr_num * sizeof(struct ibv_wc);
+    
+    // 计算总所需内存
+    total_size = sge_size + send_wr_size + recv_wr_size + wc_size * 2;  // wc + wc_tmp
+    
+    void *pool = malloc(total_size);
+    if (!pool) { ibv_utils_error("Failed to allocate memory pool."); return -9; }
+    
+    // 分片分配
+    char *ptr = (char *)pool;
+    ib_res->sge = (struct ibv_sge *)ptr;
+    ptr += sge_size;
+    
+    if (send_wr_size > 0) {
+        ib_res->send_wr = (struct ibv_send_wr *)ptr;
+        ptr += send_wr_size;
+    }
+    if (recv_wr_size > 0) {
+        ib_res->recv_wr = (struct ibv_recv_wr *)ptr;
+        ptr += recv_wr_size;
+    }
+    ib_res->wc = (struct ibv_wc *)ptr;
+    ptr += wc_size;
+    ib_res->wc_tmp = (struct ibv_wc *)ptr;
+    
+    // 记录 pool 起始地址用于后续释放（需要保存）
+    ib_res->mem_buf = (unsigned char *)pool;
+    
     return 0;
 }
 
@@ -318,12 +346,17 @@ int destroy_ib_res(struct ibv_utils_res *ib_res)
         }
     }
     
-    // 释放内存
-    free(ib_res->sge);
-    if(ib_res->send_wr_num > 0) free(ib_res->send_wr);
-    if(ib_res->recv_wr_num > 0) free(ib_res->recv_wr);
-    free(ib_res->wc);
-    free(ib_res->wc_tmp);
+    // 优化：释放内存池（单次释放代替多次 free）
+    if (ib_res->mem_buf) {
+        free(ib_res->mem_buf);
+        ib_res->mem_buf = NULL;
+    }
+    // 清空指针避免悬空
+    ib_res->sge = NULL;
+    ib_res->send_wr = NULL;
+    ib_res->recv_wr = NULL;
+    ib_res->wc = NULL;
+    ib_res->wc_tmp = NULL;
     
     return ret;
 }

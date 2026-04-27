@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <vector>
+#include <mutex>
 
 struct ibv_pd;
 struct ibv_mr;
@@ -60,6 +61,9 @@ private:
     std::vector<BlockMrInfo> block_mrs;
     struct ibv_pd *registered_pd;
     bool use_block_registration;  // 是否使用分块注册模式
+    
+    // 线程安全：互斥锁保护关键方法
+    std::mutex ring_mutex_;
 };
 
 #endif // PSRDADA_RINGBUF_H

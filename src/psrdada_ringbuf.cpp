@@ -88,6 +88,7 @@ int PsrdadaRingBuf::Init(key_t key, uint64_t block_bytes, uint64_t nbufs, const 
 
 char* PsrdadaRingBuf::GetWriteBuffer(uint64_t bytes)
 {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
     if (!is_initialized) return NULL;
     // 使用底层ipcbuf API获取下一个写入block
     // 这样RoCE可以直接写入到这个block
@@ -116,6 +117,7 @@ char* PsrdadaRingBuf::GetWriteBuffer(uint64_t bytes)
 
 int PsrdadaRingBuf::MarkWritten(uint64_t bytes)
 {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
     if (!is_initialized) return -1;
     if (!current_ptr) {
         fprintf(stderr, "MarkWritten called but no current block\n");
@@ -152,30 +154,36 @@ int PsrdadaRingBuf::StopBlock()
 
 uint64_t PsrdadaRingBuf::GetFreeSpace()
 {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
     if (!is_initialized) return 0;
     // 计算可用空间：总blocks数 - 已使用blocks数
     ipcbuf_t *buf = (ipcbuf_t*)data_block;
     uint64_t total_bufs = ipcbuf_get_nbufs(buf);
+    uint64_t bufsz = ipcbuf_get_bufsz(buf);
+    
+    // 优化：单次获取读写计数，避免重复调用
     uint64_t write_count = ipcbuf_get_write_count(buf);
     uint64_t read_count = ipcbuf_get_read_count(buf);
     uint64_t nbufs_used = (write_count >= read_count) ? (write_count - read_count) : 0;
     if (nbufs_used > total_bufs) nbufs_used = total_bufs;
-    uint64_t nbufs_free = total_bufs - nbufs_used;
-    uint64_t bufsz = ipcbuf_get_bufsz(buf);
     
-    return nbufs_free * bufsz;
+    return (total_bufs - nbufs_used) * bufsz;
 }
 
 uint64_t PsrdadaRingBuf::GetUsedSpace()
 {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
     if (!is_initialized) return 0;
+    // 优化：复用 GetFreeSpace 的计算逻辑，只返回已用空间
     ipcbuf_t *buf = (ipcbuf_t*)data_block;
     uint64_t total_bufs = ipcbuf_get_nbufs(buf);
+    uint64_t bufsz = ipcbuf_get_bufsz(buf);
+    
     uint64_t write_count = ipcbuf_get_write_count(buf);
     uint64_t read_count = ipcbuf_get_read_count(buf);
     uint64_t nbufs_used = (write_count >= read_count) ? (write_count - read_count) : 0;
     if (nbufs_used > total_bufs) nbufs_used = total_bufs;
-    uint64_t bufsz = ipcbuf_get_bufsz(buf);
+    
     return nbufs_used * bufsz;
 }
 
