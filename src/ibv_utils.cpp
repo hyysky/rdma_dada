@@ -66,8 +66,8 @@ int create_ib_res(struct ibv_utils_res *ib_res, int send_wr_num, int recv_wr_num
     ptr += wc_size;
     ib_res->wc_tmp = (struct ibv_wc *)ptr;
     
-    // 记录 pool 起始地址用于后续释放（需要保存）
-    ib_res->mem_buf = (unsigned char *)pool;
+    // 记录 pool 起始地址用于后续释放
+    ib_res->pool_ptr = pool;
     
     return 0;
 }
@@ -346,10 +346,10 @@ int destroy_ib_res(struct ibv_utils_res *ib_res)
         }
     }
     
-    // 优化：释放内存池（单次释放代替多次 free）
-    if (ib_res->mem_buf) {
-        free(ib_res->mem_buf);
-        ib_res->mem_buf = NULL;
+    // 释放 WR/SGE/WC 内存池
+    if (ib_res->pool_ptr) {
+        free(ib_res->pool_ptr);
+        ib_res->pool_ptr = NULL;
     }
     // 清空指针避免悬空
     ib_res->sge = NULL;

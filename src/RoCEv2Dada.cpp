@@ -583,6 +583,7 @@ RoCEv2Dada::~RoCEv2Dada()
             } else {
                 free(ibv_res_ptr->mem_buf);
             }
+            ibv_res_ptr->mem_buf = NULL;
         }
         destroy_ib_res(ibv_res_ptr);
         close_ib_device(ibv_res_ptr);

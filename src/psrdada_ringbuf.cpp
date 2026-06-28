@@ -152,39 +152,40 @@ int PsrdadaRingBuf::StopBlock()
     return 0;
 }
 
-uint64_t PsrdadaRingBuf::GetFreeSpace()
+void PsrdadaRingBuf::GetBufferStats(uint64_t &free_space, uint64_t &used_space)
 {
-    std::lock_guard<std::mutex> lock(ring_mutex_);
-    if (!is_initialized) return 0;
-    // 计算可用空间：总blocks数 - 已使用blocks数
+    if (!is_initialized) {
+        free_space = 0;
+        used_space = 0;
+        return;
+    }
     ipcbuf_t *buf = (ipcbuf_t*)data_block;
     uint64_t total_bufs = ipcbuf_get_nbufs(buf);
     uint64_t bufsz = ipcbuf_get_bufsz(buf);
-    
-    // 优化：单次获取读写计数，避免重复调用
+
     uint64_t write_count = ipcbuf_get_write_count(buf);
     uint64_t read_count = ipcbuf_get_read_count(buf);
     uint64_t nbufs_used = (write_count >= read_count) ? (write_count - read_count) : 0;
     if (nbufs_used > total_bufs) nbufs_used = total_bufs;
-    
-    return (total_bufs - nbufs_used) * bufsz;
+
+    used_space = nbufs_used * bufsz;
+    free_space = (total_bufs - nbufs_used) * bufsz;
+}
+
+uint64_t PsrdadaRingBuf::GetFreeSpace()
+{
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    uint64_t free_space, used_space;
+    GetBufferStats(free_space, used_space);
+    return free_space;
 }
 
 uint64_t PsrdadaRingBuf::GetUsedSpace()
 {
     std::lock_guard<std::mutex> lock(ring_mutex_);
-    if (!is_initialized) return 0;
-    // 优化：复用 GetFreeSpace 的计算逻辑，只返回已用空间
-    ipcbuf_t *buf = (ipcbuf_t*)data_block;
-    uint64_t total_bufs = ipcbuf_get_nbufs(buf);
-    uint64_t bufsz = ipcbuf_get_bufsz(buf);
-    
-    uint64_t write_count = ipcbuf_get_write_count(buf);
-    uint64_t read_count = ipcbuf_get_read_count(buf);
-    uint64_t nbufs_used = (write_count >= read_count) ? (write_count - read_count) : 0;
-    if (nbufs_used > total_bufs) nbufs_used = total_bufs;
-    
-    return nbufs_used * bufsz;
+    uint64_t free_space, used_space;
+    GetBufferStats(free_space, used_space);
+    return used_space;
 }
 
 uint64_t PsrdadaRingBuf::GetBlockSize()
@@ -558,18 +559,21 @@ struct ibv_mr* PsrdadaRingBuf::GetCurrentBlockMr()
         return NULL;
     }
     
-    // 通过地址查找对应的MR
+    // 优先使用 current_block 索引做 O(1) 查找
+    if (current_block < block_mrs.size() && block_mrs[current_block].addr == current_ptr) {
+        return block_mrs[current_block].mr;
+    }
+
+    // 索引与地址不匹配（异常情况），回退到线性查找
     for (size_t i = 0; i < block_mrs.size(); i++) {
         if (block_mrs[i].addr == current_ptr) {
+            fprintf(stderr, "[GetCurrentBlockMr] WARNING: current_block=%lu does not "
+                    "match current_ptr=%p (found at index %zu)\n",
+                    current_block, current_ptr, i);
             return block_mrs[i].mr;
         }
     }
-    
-    // 如果通过地址找不到，使用block_idx
-    if (current_block < block_mrs.size()) {
-        return block_mrs[current_block].mr;
-    }
-    
+
     fprintf(stderr, "[GetCurrentBlockMr] Block MR not found for ptr=%p idx=%lu\n",
             current_ptr, current_block);
     return NULL;

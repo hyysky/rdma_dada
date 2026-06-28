@@ -44,6 +44,7 @@ struct ibv_utils_res {
     unsigned int poll_n;
     unsigned int pkt_size;
     unsigned char * mem_buf;
+    void * pool_ptr;              // WR/SGE/WC memory pool (separate from mem_buf data buffer)
     struct ibv_pkt_info pkt_info;
     pthread_t tid;
     struct ibv_wc *wc_tmp;

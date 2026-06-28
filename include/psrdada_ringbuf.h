@@ -62,6 +62,8 @@ private:
     struct ibv_pd *registered_pd;
     bool use_block_registration;  // 是否使用分块注册模式
     
+    void GetBufferStats(uint64_t &free_space, uint64_t &used_space);
+
     // 线程安全：互斥锁保护关键方法
     std::mutex ring_mutex_;
 };
