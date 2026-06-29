@@ -89,19 +89,6 @@ rdma_dada/
 └── run_demo.sh       # 启动脚本
 ```
 
-### setup_psrdada_ring.sh
-自动配置ring buffer：
-```bash
-./setup_psrdada_ring.sh --force
-./setup_psrdada_ring.sh -p 6414 -n 64 -b 8
-```
-
-功能：
-- 自动检查和设置SHMMAX
-- 创建ring buffer
-- 验证内存连续性
-- 提供详细诊断信息
-
 ## 文档资源
 
 | 文档 | 描述 |
@@ -143,15 +130,15 @@ CMD="./build/Demo_psrdada_online ... --debug"
 **A:** 
 ```
 包大小 = PKT_HEADER + PKT_DATA (例如: 64 + 8192 = 8256)
-批次大小 = 包大小 × SEND_N (例如: 8256 × 64 = 528,384)
-Block大小 = 包大小 × PKT_PER_BLOCK (例如: 8256 × 16384 = 135,266,304)
+单批次发送/接收大小 = 包大小 × SEND_N (例如: 8256 × 64 = 528,384)
+Block大小 = 包大小 × PKT_PER_BLOCK（ = SEND_N × SEND_NUM_PER_BLOCK ） (例如: 8256 × 16384 = 135,266,304)
+Block大小是单批次大小的整数倍！
 ```
-
 **重要：** v1.2.0会自动处理非整数倍的情况，无需手动调整。
 
 ### Q4: 数据保存在哪里？
 
-**A:** 默认保存在 `./data_out/` 目录，文件名格式为 `YYYY-MM-DD-HH:MM:SS.dada`
+**A:** 默认保存在 `./data_out/` 目录，文件格式为 `*.dada`
 
 查看输出文件：
 ```bash
@@ -221,10 +208,6 @@ dada_db -k 0xdada -d
 
 # 如果不连续，增加SHMMAX
 sudo sysctl -w kernel.shmmax=17179869184
-
-# 重新创建ring
-dada_db -k 0xdada -d
-./setup_psrdada_ring.sh --force
 ```
 
 详见：[NON_CONTIGUOUS_MEMORY_SOLUTION.md](NON_CONTIGUOUS_MEMORY_SOLUTION.md)
@@ -234,11 +217,7 @@ dada_db -k 0xdada -d
 ```bash
 # 问题: "Failed to connect to dada_hdu"
 # 解决: 确保缓冲已创建
-dada_db -k 0xdada -b 8G -p 4
-
-# 问题: 权限错误
-# 解决: 设置共享内存权限
-sudo chmod 666 /dev/shm/dada*
+dada_db -k 0xdada -b $block_size -p -l 
 ```
 
 ### RDMA 设备错误
@@ -268,18 +247,3 @@ pkg-config --libs psrdada
 - `libsrc/udp_rdma/` - 原始 RDMA 模块
 - `libsrc/udp_rdma/demo/Demo_psrdada_online.cpp` - 原始演示
 
-## 许可证
-
-Copyright (C) 2024-2026 by ZheJiang Lab. All rights reserved.
-
-## 更新历史
-
-- **v1.1.0** (2026年2月): 
-  - ✅ 非连续内存支持（自动分块注册）
-  - ✅ 修复4个严重BUG（资源释放、未初始化变量等）
-  - ✅ 底层ipcbuf API集成
-  - ✅ 智能自动切换注册模式
-  - ✅ 增强错误处理和日志
-  - ✅ 新增实用脚本和完整文档
-  
-- **v1.0.0** (2026年2月): 初版，支持 RDMA + PSRDADA 集成
