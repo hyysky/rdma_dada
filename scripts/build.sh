@@ -40,6 +40,7 @@ echo "========================================"
 echo ""
 if [[ "${BUILD_RDMA_PIPELINE}" == "ON" ]]; then
     echo "RDMA ingest executable: ${BUILD_DIR}/rdma2dada"
+    echo "Pipeline worker executable: ${BUILD_DIR}/pipeline_worker"
 else
     echo "RDMA demo skipped (BUILD_RDMA_PIPELINE=OFF)"
 fi

@@ -49,12 +49,19 @@ ctest --test-dir build-linux --output-on-failure
 | --- | --- | --- | --- |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `pipeline_config_inspect_test` | `pipeline_config_inspect` 工具 | 确认示例 JSON 能通过用户侧配置检查工具 | `BUILD_TESTING=ON` |
+| `pipeline_worker_config_inspect_test` | `pipeline_worker_config_inspect` 工具 | 从 F/A/P、UDP 分组和 product 计算 input/beamformed/output block bytes | `BUILD_TESTING=ON` |
 | `pipeline_config_rejects_legacy_test` | `pipeline_config_inspect` 工具 | 确认运行时拒绝旧 `.conf`；CTest 将非零退出视为成功 | `BUILD_TESTING=ON` |
 | `config_conversion_test` | `config_conversion_test.py` | 将旧 `.conf` 转为 JSON，与示例比较，并确认未知字段、缺字段和非整数被拒绝 | 找到 Python 3 |
 | `pipeline_core_test` | `pipeline_core_test.cpp` | 验证 `AlgorithmModule` 的 header 传播、block view、sequence 和 host execution context | `BUILD_TESTING=ON` |
 | `beamform_module_test` | `beamform_module_test.cpp` | 验证 CPU reference、NPY int8/int16 权重、scale、TFPA→TFPB、shape 和容量错误路径 | `BUILD_TESTING=ON` |
 | `beamform_cuda_fp32_test` | `beamform_cuda_test.cpp` | 在 CUDA stream 上验证异步 FP32 batched complex GEMM，以及 T/F batch stride | `USE_CUDA=ON` |
 | `beamform_cuda_tf32_test` | `beamform_cuda_test.cpp` | 使用相同已知结果验证 TF32/Tensor Core 配置路径 | `USE_CUDA=ON`，GPU CC ≥ 8.0 |
+| `power_module_test` | `power_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFPB/F32`、header/byte rate、两帧数值结果和错误路径 | `BUILD_TESTING=ON` |
+| `power_cuda_test` | `power_cuda_test.cpp` | 在 worker 风格 non-blocking stream 上验证异步 Power kernel 与 CPU 已知结果一致 | `USE_CUDA=ON` |
+| `stokes_module_test` | `stokes_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFBS/F32`、四个相关产物、双偏振约束、header 和错误路径 | `BUILD_TESTING=ON` |
+| `stokes_cuda_test` | `stokes_cuda_test.cpp` | 在 non-blocking stream 上验证异步 Stokes kernel 与 CPU 已知结果一致 | `USE_CUDA=ON` |
+| `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
+| `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header 保真、block 规划，以及 Beamform/Power/Stokes 三种 CPU 模块链的 header 和数值结果 | `BUILD_TESTING=ON` |
 | `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成序列化/反序列化，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
 
 ## 单项调用
@@ -90,6 +97,16 @@ ctest --test-dir build \
 
 `pipeline_config_rejects_legacy_test` 设置了 `WILL_FAIL=TRUE`，所以直接运行工具时的
 非零返回值是预期结果。
+
+worker block 几何检查：
+
+```bash
+./build/pipeline_worker_config_inspect \
+  config/pipeline_worker.example.json
+
+ctest --test-dir build \
+  -R '^pipeline_worker_config_inspect_test$' --output-on-failure
+```
 
 ### `config_conversion_test`
 
@@ -148,6 +165,59 @@ Beamform，再在同一 stream 上异步拷回结果。测试覆盖 `T=2、F=2�
 
 和 CPU 测试一样，传入的 `.npy` 路径只用于临时 fixture，测试结束时会删除。
 
+### Power 测试
+
+CPU reference：
+
+```bash
+./build/power_module_test
+ctest --test-dir build -R '^power_module_test$' --output-on-failure
+```
+
+CUDA：
+
+```bash
+./build-cuda/power_cuda_test
+ctest --test-dir build-cuda -R '^power_cuda_test$' --output-on-failure
+```
+
+两个测试使用相同的 `T=2、F=2、P=2、B=2` 已知输入。CUDA 测试通过同一条
+non-blocking stream 完成 H2D、Power kernel 和 D2H；没有可用 CUDA device 时返回
+77，由 CTest 标记为 skipped。
+
+### Stokes 测试
+
+CPU reference：
+
+```bash
+./build/stokes_module_test
+ctest --test-dir build -R '^stokes_module_test$' --output-on-failure
+```
+
+CUDA：
+
+```bash
+./build-cuda/stokes_cuda_test
+ctest --test-dir build-cuda -R '^stokes_cuda_test$' --output-on-failure
+```
+
+两个测试使用相同的 `T=2、F=2、P=2、B=2` 输入，逐项检查
+`AA、BB、AB_REAL、AB_IMAG`。CUDA 测试使用 worker 风格 non-blocking stream；
+没有可用 CUDA device 时返回 77，由 CTest 标记为 skipped。
+
+### H2D/D2H round-trip 测试
+
+```bash
+./build-cuda/transfer_cuda_roundtrip_test
+ctest --test-dir build-cuda \
+  -R '^transfer_cuda_roundtrip_test$' --output-on-failure
+```
+
+测试建立一个 512-byte、8 个 `RESOLUTION` frame 的确定性输入，经同一条
+non-blocking stream 依次调用 `HostToDeviceModule` 和 `DeviceToHostModule`，只在链末
+同步一次。除逐字节比较外，还检查两级 header 的科学字段不变、`MEMORY` 正确变化，
+以及 block `size/sequence` 保持一致。没有 CUDA device 时返回 77。
+
 ### `dada_header_roundtrip_test`
 
 ```bash
@@ -157,6 +227,20 @@ ctest --test-dir build-linux \
 ```
 
 该测试链接 PSRDADA header API，因此不会出现在 macOS/portable build 中。
+
+### `pipeline_worker_core_test`
+
+```bash
+./build/pipeline_worker_core_test \
+  config/pipeline_worker.example.json \
+  build/manual_pipeline_worker_weights.npy
+
+ctest --test-dir build \
+  -R '^pipeline_worker_core_test$' --output-on-failure
+```
+
+第二个参数是测试临时 NPY 权重路径，测试结束时会删除，不能指向真实权重文件。
+该测试不连接 PSRDADA，因此可在 macOS 检查 JSON/header/block/module-chain 逻辑。
 
 ## 常用过滤方式
 

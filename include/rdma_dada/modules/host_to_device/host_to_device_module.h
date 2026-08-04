@@ -1,22 +1,19 @@
 #pragma once
 
-#include "rdma_dada/pipeline/complex32.h"
 #include "rdma_dada/pipeline/stage.h"
 
 #include <memory>
 
 namespace rdma_dada {
 namespace modules {
-namespace beamform {
+namespace host_to_device {
 
-using Complex32 = pipeline::Complex32;
-
-// Beamforming module with a host FP32 reference backend and an optional
-// asynchronous CUDA FP32/TF32 backend selected at configuration time.
-class BeamformModule : public pipeline::AlgorithmModule {
+// Enqueues a byte-preserving host-to-device transfer on a worker-owned CUDA
+// stream. The module owns neither the host block nor the device allocation.
+class HostToDeviceModule : public pipeline::AlgorithmModule {
 public:
-    BeamformModule();
-    ~BeamformModule();
+    HostToDeviceModule();
+    ~HostToDeviceModule();
 
     const char* Name() const;
 
@@ -37,6 +34,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace beamform
+}  // namespace host_to_device
 }  // namespace modules
 }  // namespace rdma_dada

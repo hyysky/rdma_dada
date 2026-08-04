@@ -28,8 +28,8 @@ output_data   = algorithm(input_data, configuration)
 
 Ring names A-D in the original diagram are examples, not fixed pipeline roles.
 The configured topology consists of ring edges, optional sinks, and worker
-processes. Each worker has exactly one input ring and one output ring, but may
-contain any compatible sequence of algorithm modules.
+processes. Each worker has exactly one input ring and one output ring. Process
+boundaries are configurable, but the observation-mode algorithm order is not.
 
 ```text
 NIC
@@ -38,7 +38,8 @@ NIC
   -> worker process [VDIF unpack]
   -> unpacked ring
        |-> optional dada_dbdisk sink
-       `-> worker process [beamform, power, stokes, ... configured order]
+       `-> worker process [H2D, convert, beamform,
+                           power OR stokes, optional time_integrate, D2H]
            -> processed ring
            -> optional DADA2RDMA / dada_dbdisk / downstream worker
 ```
@@ -46,8 +47,11 @@ NIC
 The topology is configuration-driven. Each process boundary is backpressured
 by its input and output rings. Algorithm boundaries do not imply process or ring
 boundaries. Beamforming, Power and Stokes remain independent modules even when
-they execute in one process and exchange device buffers directly. Configuration
-may split any compatible modules into separate workers by inserting a ring.
+they execute in one process and exchange device buffers directly. Power and
+Stokes are sibling consumers of beamformed complex voltage, not consecutive
+stages. Configuration may split compatible stages into separate workers by
+inserting a ring; producing both branches requires separate readers/workers in
+the first version.
 
 ```text
 input ring
@@ -59,10 +63,11 @@ input ring
    -> output ring
 ```
 
-"Freely ordered" means configuration selects the sequence; it does not bypass
-type safety. During startup, each module validates the previous module's output
-header, memory location, datatype, dimensions and block geometry. An invalid
-composition fails before the output header or any output data is published.
+Configuration selects which optional branch and integration stage are enabled,
+while the worker enforces the fixed observation order. During startup, each
+module validates the previous module's output header, memory location, datatype,
+dimensions and block geometry. An invalid composition fails before the output
+header or any output data is published.
 
 ## Ring contracts
 
@@ -78,11 +83,13 @@ consumers. Its `dada_db -r` value equals the number of enabled independent
 readers. For example, ring B uses `-r 2` only when both a processing worker and
 `dada_dbdisk` are enabled; without disk output it normally uses `-r 1`.
 
-Ring C uses PSRDADA's CUDA-backed data blocks (`dada_db -g GPU_ID`). PSRDADA
-requires persistence mode (`-w`) for a GPU ring, must be compiled with CUDA,
-and all producer/consumer processes must select a compatible CUDA device. Its
-header block remains host-accessible PSRDADA metadata; only data blocks live on
-the CUDA device.
+Ring C is a future optional process boundary using PSRDADA's CUDA-backed data
+blocks (`dada_db -g GPU_ID`). PSRDADA requires persistence mode (`-w`) for a GPU
+ring, must be compiled with CUDA, and all producer/consumer processes must
+select a compatible CUDA device. Its header block remains host-accessible
+PSRDADA metadata; only data blocks live on the CUDA device. The current
+`pipeline_worker` v1 connects two host rings and performs H2D/D2H inside the
+process; it does not yet accept a CUDA ring endpoint.
 
 ## Header propagation across A-D
 
@@ -143,3 +150,24 @@ EOD propagation.
 
 PSRDADA remains the authoritative implementation reference for header/data
 block lifecycle and transfer semantics.
+
+## Current worker v1
+
+The implemented worker binds its two HDUs by JSON hexadecimal keys. It accepts
+`CONVERTED/TFPA/CF32` host-ring input and supports three validated chains:
+Beamform, Beamform→Power, and Beamform→Stokes. The output header is published
+only after module, weight, frame, transfer and full-block geometry validation.
+
+The CUDA path uses explicit byte-preserving H2D and D2H modules on one
+worker-owned non-blocking stream, then synchronizes after D2H before committing
+each output block. Multi-stream event-driven overlap, the
+VDIF/unpack/convert front of the chain, time integration, arbitrary module
+registration and CUDA-ring endpoints are later phases.
+
+Worker v1 computes ring data-block geometry before data flow starts. The JSON
+supplies F/A/P, UDP payload bytes, samples per UDP and the number of UDP packets
+contributed by each antenna to one block. Therefore
+`T=samples_per_udp*packets_per_antenna_per_block`; the input block is
+`F*A*P*T*sizeof(CF32)` and must be divisible by `udp_payload_bytes*A`. The
+actual input/output HDU capacities and input header F/A/P are checked against
+this plan before the output header is published.

@@ -1,18 +1,26 @@
 # RDMA/PSRDADA Pipeline
 
-该项目正在重构为独立的 PSRDADA ring-connected pipeline。当前可用部分是 RoCE v2 数据接收到 raw ring，以及可在 macOS 上开发和测试的配置、DADA header、pipeline core 和 beamform FP32 reference。Beamform CUDA FP32/TF32 backend 已加入代码，尚待目标服务器验证；通用 worker 仍在建设中。
+该项目正在重构为独立的 PSRDADA ring-connected pipeline。当前可用部分是 RoCE v2
+数据接收到 raw ring，以及可在 macOS 上开发和测试的配置、DADA header、pipeline
+core、Beamform、Power 和 Stokes reference backend。三个算法的异步 CUDA backend
+均已加入代码，尚待目标服务器验证；`pipeline_worker` 第一版已经实现双 ring、
+header 传播和三种固定模块链。
 
 ## 当前数据契约
 
 - 所有运行时参数由 JSON 配置输入；`NANT`/`NCHAN`/`NPOL`、`PKT_TSAMP`、`UTC_START` 和 ring/file 几何不写死在程序中。
 - raw ring 中的每条 record 是 `64-byte application header + payload`。RoCE 接收缓冲区中额外的 Ethernet/IPv4/UDP 42 字节会在写 ring 前剔除。
 - PSRDADA 的 header block 描述一次 transfer；数据 block 不会重复前缀 ASCII header。
+- 一个解包/计算 block 包含所有 `A` 个阵元的数据。总 UDP record 数必须是 `A` 的
+  整数倍；`T=PKT_NSAMP×每阵元每block的UDP包数`。
 - `.dada` 文件大小由 `blocks_per_file` 配置，因此是 ring data block 大小的整数倍。
 - 当前 RDMA ingest 使用内部注册缓冲区，验证 CQ completion 后再拷贝到 raw ring。尚未启用 RDMA 直接写 ring 的优化路径。
 
 完整的目标架构和 header 传播规则见 [doc/PIPELINE_ARCHITECTURE.md](doc/PIPELINE_ARCHITECTURE.md)。
 算法模块的输入输出、`TFPA/TFPB/TFBS` 数据布局、独立积分模块和 worker 调用规则见
 [doc/ALGORITHM_MODULE_CONTRACTS.md](doc/ALGORITHM_MODULE_CONTRACTS.md)。
+后续开发顺序、各阶段验收标准、模块输入输出门禁和配置参数扩展规则见
+[doc/DEVELOPMENT_PLAN.md](doc/DEVELOPMENT_PLAN.md)。
 
 ## 分层与目录
 
@@ -24,7 +32,7 @@ include/rdma_dada/io/psrdada/   PSRDADA ring/header 适配器接口
 src/config|pipeline|io/         与公共接口镜像的底层实现
 modules/                        独立算法，不持有 ring 和进程生命周期
 apps/rdma2dada/                 已实现的 NIC→raw ring 组合入口
-apps/pipeline_worker/           计划中的模块链工作进程
+apps/pipeline_worker/           已实现的双 ring 模块链工作进程
 apps/dada2rdma|pipelinectl/     计划中的输出与编排入口
 tools/                          配置检查和 SSD 诊断工具
 scripts/                        最上层用户启动、构建和配置转换
@@ -66,12 +74,30 @@ RTX 4090 的默认 CUDA architecture 是 `89`，可通过
 `-DCMAKE_CUDA_ARCHITECTURES=89` 显式覆盖。CUDA 构建建议使用 CMake 3.24 或更新
 版本；项目最低版本仍为 3.18。
 
+Linux 上构建完成后，worker 使用一个 JSON 文件绑定输入、输出 ring key：
+
+```bash
+./build/pipeline_worker config/pipeline_worker.example.json
+```
+
+输入必须是 host ring 中的 `CONVERTED/TFPA/CF32` 数据。输出可以配置为
+`BEAMFORMED`、`POWER` 或 `STOKES`；ring block 的准确尺寸关系及 header 必填字段见
+[apps/pipeline_worker/README.md](apps/pipeline_worker/README.md)。
+
 ## JSON 配置
 
 示例文件是 [config/pipeline.example.json](config/pipeline.example.json)。开始前可检查派生的 record/block/ring/file 几何：
 
 ```bash
 ./build/pipeline_config_inspect config/pipeline.example.json
+```
+
+worker 输入、Beamform 中间结果和最终输出 block 大小由 worker JSON 的
+`F/A/P`、UDP 分组和 `NBEAM/product` 直接计算：
+
+```bash
+./build/pipeline_worker_config_inspect \
+  config/pipeline_worker.example.json
 ```
 
 将旧的 shell 配置转为 JSON：
@@ -95,6 +121,15 @@ bash scripts/run_demo.sh start
 ## 当前限制
 
 - Linux RDMA 构建、CQ 错误路径、NIC flow steering 和持续运行需要在目标服务器验证。
-- `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32 backend；CUDA 路径尚待 RTX 4090 服务器编译、数值和性能验证。`power` / `stokes` 仍待实现。这些算法保持独立模块，并可由配置组合为一个两端连 ring 的 worker 进程。
+- `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32
+  backend；`power`、`stokes` 已有 host FP32 reference 和异步 CUDA kernel。CUDA
+  路径尚待 RTX 4090 服务器编译、数值和性能验证。
+- `host_to_device`、`device_to_host` 已实现为无 buffer 所有权的异步 CUDA 传输
+  模块，并已接入 worker；当前 PSRDADA ring block 仍按普通 host 内存处理。
+- 观测流程固定为解析重排后执行 Beamform，再选择 Power 或 Stokes，最后按需执行
+  time integration。当前 worker 已实现 `beamform`、`beamform+power` 和
+  `beamform+stokes`；VDIF 解包、整数复数转 CF32、通用模块注册、积分模块仍待实现。
+- 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
+  同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
 - raw ring 的 payload order 目前可配置为 `UNKNOWN`；在前端格式确定前，不对其做推断。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

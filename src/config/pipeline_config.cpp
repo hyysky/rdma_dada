@@ -298,12 +298,26 @@ bool ComputePipelineLayout(const PipelineConfig& config,
         config.raw_ring_blocks == 0 || config.compute_ring_blocks == 0) {
         return Fail("packet, timing, block, and ring sizes must be greater than zero", error);
     }
+    if (config.records_per_block % config.nant != 0) {
+        return Fail(
+            "ring_buffers.records_per_block must be an integer multiple of "
+            "NANT so every block contains complete all-antenna UDP groups",
+            error);
+    }
     if (config.disk_enabled && config.file_blocks == 0) {
         return Fail("disk.blocks_per_file must be greater than zero when disk is enabled", error);
     }
     if (config.utc_start.empty()) return Fail("UTC_START must be supplied externally", error);
 
     PipelineLayout result = PipelineLayout();
+    result.packets_per_antenna_per_block =
+        config.records_per_block / config.nant;
+    if (!CheckedMultiply(config.packet_samples,
+                         result.packets_per_antenna_per_block,
+                         "samples per block", &result.samples_per_block,
+                         error)) {
+        return false;
+    }
     if (config.packet_header_bytes >
         std::numeric_limits<std::uint64_t>::max() - config.packet_payload_bytes) {
         return Fail("raw record size exceeds uint64 range", error);

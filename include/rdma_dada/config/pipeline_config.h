@@ -31,6 +31,10 @@ struct PipelineConfig {
 };
 
 struct PipelineLayout {
+    // records_per_block is the total packet count across all antennas.
+    // One complete time group contains exactly NANT packets.
+    std::uint64_t packets_per_antenna_per_block;
+    std::uint64_t samples_per_block;
     std::uint64_t raw_record_bytes;
     std::uint64_t compute_record_bytes;
     std::uint64_t raw_resolution;

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "rings": {
+    "input_key": "dada",
+    "output_key": "dadb"
+  },
+  "execution": {
+    "backend": "CPU_REFERENCE",
+    "cuda_device": 0,
+    "run_once": true
+  },
+  "input_geometry": {
+    "nchan": 1,
+    "nant": 4,
+    "npol": 2,
+    "udp_payload_bytes": 8192,
+    "samples_per_udp": 512,
+    "udp_packets_per_antenna_per_block": 4096
+  },
+  "beamform": {
+    "weights_file": "weights/beamform_weights.npy",
+    "weights_order": "FPAB2",
+    "weights_id": "example-observation-v1",
+    "weights_scale": 0.0078125,
+    "nbeam": 2,
+    "compute_mode": "FP32"
+  },
+  "output": {
+    "product": "POWER"
+  }
+}

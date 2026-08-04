@@ -17,9 +17,12 @@ intermediate values remain in GPU buffers, or place ring boundaries between
 them when process isolation is required.
 
 `beamform` has a portable FP32 reference implementation, strict NPY weight
-loader and an asynchronous CUDA FP32/TF32 backend. The CUDA path is pending
-target-server validation. The remaining algorithms are still planned and
-should use the worker-owned execution stream by default.
+loader and an asynchronous CUDA FP32/TF32 backend. `power` and `stokes` have
+portable FP32 reference implementations and asynchronous CUDA elementwise
+backends. `host_to_device` and `device_to_host` are byte-preserving asynchronous
+CUDA transfer modules and are used by `pipeline_worker`. All CUDA paths are
+pending target-server validation. The remaining algorithms are still planned
+and should use the worker-owned execution stream by default.
 
 The authoritative data layouts, module inputs/outputs, integration rules and
 worker invocation contract are documented in

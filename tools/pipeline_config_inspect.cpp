@@ -22,6 +22,9 @@ int main(int argc, char** argv) {
     // Machine-readable numeric output used by scripts/run_demo.sh. Keeping
     // this list numeric avoids shell evaluation of arbitrary config content.
     std::cout << "RAW_RECORD_BYTES=" << layout.raw_record_bytes << '\n'
+              << "PACKETS_PER_ANTENNA_PER_BLOCK="
+              << layout.packets_per_antenna_per_block << '\n'
+              << "SAMPLES_PER_BLOCK=" << layout.samples_per_block << '\n'
               << "RAW_BLOCK_BYTES=" << layout.raw_block_bytes << '\n'
               << "RAW_RING_BLOCKS=" << config.raw_ring_blocks << '\n'
               << "RAW_RING_BYTES=" << layout.raw_ring_bytes << '\n'

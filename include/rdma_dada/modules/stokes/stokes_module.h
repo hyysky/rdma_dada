@@ -1,22 +1,19 @@
 #pragma once
 
-#include "rdma_dada/pipeline/complex32.h"
 #include "rdma_dada/pipeline/stage.h"
 
 #include <memory>
 
 namespace rdma_dada {
 namespace modules {
-namespace beamform {
+namespace stokes {
 
-using Complex32 = pipeline::Complex32;
-
-// Beamforming module with a host FP32 reference backend and an optional
-// asynchronous CUDA FP32/TF32 backend selected at configuration time.
-class BeamformModule : public pipeline::AlgorithmModule {
+// Converts dual-polarization beamformed CF32 voltage in TFPB order to the
+// four F32 coherency products [AA, BB, AB_REAL, AB_IMAG] in TFBS order.
+class StokesModule : public pipeline::AlgorithmModule {
 public:
-    BeamformModule();
-    ~BeamformModule();
+    StokesModule();
+    ~StokesModule();
 
     const char* Name() const;
 
@@ -37,6 +34,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace beamform
+}  // namespace stokes
 }  // namespace modules
 }  // namespace rdma_dada

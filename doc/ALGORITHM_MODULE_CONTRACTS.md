@@ -118,7 +118,7 @@ contract version；不能仅删除校验而保留含糊语义。
 | `power` | `T-F-P-B`, `CF32` | `T-F-P-B`, `F32` | 复电压变成功率 |
 | `stokes` | `T-F-2-B`, `CF32` | `T-F-B-S`, `F32` | 生成 4 个相关产物 |
 | `time_integrate` | `T-F-P-B` 或 `T-F-B-S`, `F32` | `T/K-F-P-B` 或 `T/K-F-B-S` | 时间轴按 `K` 缩短 |
-| `device_to_host` | 任意受支持的 CUDA tensor | shape/type 不变，pinned host | 只改变内存位置 |
+| `device_to_host` | 任意受支持的 CUDA tensor | shape/type 不变，host/pinned host | 只改变内存位置 |
 
 ## 6. `vdif_unpack`
 
@@ -177,6 +177,10 @@ TFPA/CI16/Host -> TFPA/CI16/CudaDevice
 MEMORY=CUDA_DEVICE
 CUDA_DEVICE=<gpu_id>
 ```
+
+第一版实现要求 `RESOLUTION>0`，每个 block 必须包含整数个 `RESOLUTION`。模块从
+worker 提供的 `BlockExecutionContext` 获取 non-default stream，只排队拷贝；显存申请、
+stream 同步和 buffer 生命周期均由 worker 负责。
 
 ## 8. `complex_convert`
 
@@ -310,7 +314,7 @@ CUDA_DEVICE=<gpu_id，仅 CUDA>
 ### 计算
 
 ```text
-Input:  V[T,F,P,B], CF32
+Input:  V[T,F,P,B], CF32, DATA_STAGE=BEAMFORMED
 Output: Q[T,F,P,B], F32
 
 Q[t,f,p,b] = V.real^2 + V.imag^2
@@ -328,12 +332,24 @@ PRODUCTS=POWER
 
 Power 已丢失复数相位，不能作为 `beamform` 或 `stokes` 的输入。
 
+第一版参数为：
+
+```text
+EXECUTION_BACKEND=CPU_REFERENCE 或 CUDA
+CUDA_DEVICE=<gpu_id，仅 CUDA>
+```
+
+Power 是逐元素 FP32 运算，不使用 `COMPUTE_MODE`。CUDA 后端要求输入、输出均在
+`CUDA_DEVICE`，并在 worker 提供的 non-blocking stream 上异步启动 kernel；模块
+不能在 `ProcessBlock()` 内执行 stream 或 device 同步。输入和输出 buffer 不允许
+重叠，因为并行的 CF32→F32 压缩写入会覆盖尚未读取的复数样本。
+
 ## 11. `stokes`
 
 ### 输入约束
 
 ```text
-Input: V[T,F,P,B], CF32, CUDA device
+Input: V[T,F,P,B], CF32, DATA_STAGE=BEAMFORMED
 P必须等于2
 ```
 
@@ -380,6 +396,19 @@ NPRODUCT=4
 PRODUCTS=AA,BB,AB_REAL,AB_IMAG
 POL_LABELS=<实际偏振标签>
 ```
+
+`POL_LABELS` 是必填字段，由上游明确两路偏振的物理含义并原样传到输出。第一版
+参数为：
+
+```text
+EXECUTION_BACKEND=CPU_REFERENCE 或 CUDA
+CUDA_DEVICE=<gpu_id，仅 CUDA>
+```
+
+Stokes 是逐元素 FP32 运算，不使用 `COMPUTE_MODE`。CUDA 后端要求输入、输出均在
+`CUDA_DEVICE`，并在 worker stream 上异步启动 kernel。输入和输出 buffer 不允许
+重叠。两个 CF32 输入生成四个 F32，因此一个时间帧的字节数和
+`BYTES_PER_SECOND` 保持不变。
 
 ## 12. `time_integrate`
 
@@ -443,14 +472,18 @@ TOTAL_INTEGRATION_LENGTH = upstream_total * K
 `device_to_host` 只传输内存，不改变数据类型、shape 或 order：
 
 ```text
-CudaDevice -> PinnedHost
+CudaDevice -> Host 或 PinnedHost
 ```
 
 `cudaMemcpyAsync()` 完成前，worker 不能提交输出 ring block。输出 metadata 更新：
 
 ```text
-MEMORY=PINNED_HOST
+MEMORY=HOST 或 PINNED_HOST
 ```
+
+目标类型由模块参数 `OUTPUT_MEMORY` 指定。当前 PSRDADA output ring 使用 `HOST`；后续
+若 worker 对共享内存 block 完成 `cudaHostRegister()`，或使用 pinned bounce buffer，才
+声明为 `PINNED_HOST`。模块只排队 D2H，不负责注册共享内存，也不提交 ring block。
 
 ## 14. 合法和非法模块链
 
@@ -501,7 +534,8 @@ worker；第一版 worker 不支持两个输出 ring。由于 `stokes` 输出已
 
 1. 读取 worker JSON。
 2. 连接一个 input HDU 和一个 output HDU。
-3. 通过 `ModuleRegistry` 按顺序创建模块。
+3. 根据 `output.product` 创建 `beamform`、`beamform+power` 或
+   `beamform+stokes` 模块链。
 4. 读取并解析输入 header，得到 `Metadata H0` 和输入 `TensorSpec`。
 5. 依次调用模块的配置/规划接口，得到 `H1 ... Hout` 和每级 TensorSpec。
 6. 验证完整模块链、CUDA device、权重维度和每级 block bytes。
@@ -528,9 +562,15 @@ input ring BlockLease
 buffer 只能在对应 CUDA event 完成后释放或提交。
 
 worker 通过 `BlockExecutionContext` 向每个模块传入非持有的 CUDA device 和 stream。
-同一个 block 的 GPU 模块链使用同一 stream；不同 block 可以使用不同 stream 和
-buffer slot。CUDA 模块的 `ProcessBlock()` 只向该 stream 提交工作并返回，不执行逐
+CUDA 模块的 `ProcessBlock()` 只向该 stream 提交工作并返回，不在模块内部执行逐
 block `cudaDeviceSynchronize()` 或 `cudaStreamSynchronize()`。
+
+当前正确性优先版本在一个 transfer 内使用一条 non-blocking stream。worker 依次提交
+H2D、Beamform、Power/Stokes、D2H，然后在提交 output ring block 和释放 input ring
+block 前调用 `cudaStreamSynchronize()`。这样已经保证 ring lease 和 device buffer 的
+生命周期正确，但还没有跨 block overlap。
+
+后续性能版本使用多个 stream/buffer slot 和 CUDA event：
 
 典型双 buffer 流水为：
 
@@ -539,13 +579,13 @@ stream 0: block N   H2D -> convert -> beamform -> power/stokes -> D2H
 stream 1: block N+1 H2D -> convert -> beamform -> power/stokes -> D2H
 ```
 
-worker 在每条链末尾记录 event。event 完成后才能提交输出 ring block、释放输入 ring
-lease 并复用该 buffer slot。worker 必须先完成所有 stream/event，再调用模块
-`Finish()` 和销毁 stream。
+性能版本必须在每条链末尾记录 event。event 完成后才能提交输出 ring block、释放
+input ring lease 并复用该 buffer slot。worker 必须先完成所有 stream/event，再调用
+模块 `Finish()` 和销毁 stream。
 
 ### EOD
 
-第一版模块不允许跨 block 残留不完整时间帧或不完整积分，因此 `Finish()` 只负责：
+模块不允许跨 block 残留不完整时间帧或不完整积分，因此 `Finish()` 只负责：
 
 - 同步未完成的 CUDA event。
 - 检查模块内部无残留数据。
@@ -566,8 +606,16 @@ TFBS products = F * B * 4 * sizeof(F32)
 Block 字节数：
 
 ```text
-block_bytes = T * frame_bytes
+T = samples_per_udp * udp_packets_per_antenna_per_block
+input_block_bytes = T * TFPA_frame_bytes
+udp_antenna_group_bytes = udp_payload_bytes * A
+input_block_bytes % udp_antenna_group_bytes = 0
+output_block_bytes = T * selected_output_frame_bytes
 ```
+
+`udp_packets_per_antenna_per_block` 是每个阵元的包数；一个完整 UDP 时间分组包含
+`A` 个包。配置中的 F/A/P 与 input header 的 `NCHAN/NANT/NPOL` 必须一致。这里
+`F×A×P×T` 表示维度大小，实际线性内存顺序仍由 `ORDER=TFPA` 定义。
 
 经过长度为 `K` 的积分后：
 
@@ -583,49 +631,41 @@ output_block_bytes = output_T * output_frame_bytes
 
 ```json
 {
-  "name": "stokes_worker",
-  "input_ring": "b000",
-  "output_ring": "d000",
-  "cuda_device": 0,
-  "modules": [
-    {
-      "type": "host_to_device"
-    },
-    {
-      "type": "complex_convert",
-      "parameters": {
-        "output_datatype": "CF32",
-        "scale": 1.0
-      }
-    },
-    {
-      "type": "beamform",
-      "parameters": {
-        "weights_file": "config/beam_weights.bin",
-        "weights_order": "FPAB",
-        "nbeam": 90
-      }
-    },
-    {
-      "type": "stokes",
-      "parameters": {
-        "output_basis": "AA_BB_AB",
-        "products": ["AA", "BB", "AB_REAL", "AB_IMAG"]
-      }
-    },
-    {
-      "type": "time_integrate",
-      "parameters": {
-        "length": 128,
-        "operation": "mean"
-      }
-    },
-    {
-      "type": "device_to_host"
-    }
-  ]
+  "schema_version": 1,
+  "rings": {
+    "input_key": "dada",
+    "output_key": "dadb"
+  },
+  "execution": {
+    "backend": "CUDA",
+    "cuda_device": 0,
+    "run_once": true
+  },
+  "input_geometry": {
+    "nchan": 1,
+    "nant": 4,
+    "npol": 2,
+    "udp_payload_bytes": 8192,
+    "samples_per_udp": 512,
+    "udp_packets_per_antenna_per_block": 4096
+  },
+  "beamform": {
+    "weights_file": "weights/beamform_weights.npy",
+    "weights_order": "FPAB2",
+    "weights_id": "observation-v1",
+    "weights_scale": 0.0078125,
+    "nbeam": 90,
+    "compute_mode": "TF32"
+  },
+  "output": {
+    "product": "STOKES"
+  }
 }
 ```
+
+这是已实现的 schema v1。它固定 Beamform 为首个算法，并用 `output.product` 选择
+无后处理、Power 或 Stokes。支持任意模块数组、积分参数和 GPU ring 的通用 schema
+需要在相应模块实现后升级 schema version，不能悄悄改变 v1 语义。
 
 ## 18. 开发和测试要求
 
@@ -639,21 +679,9 @@ output_block_bytes = output_T * output_frame_bytes
 6. 在 Linux/CUDA 服务器运行 kernel correctness、block geometry 和 EOD 测试。
 7. 对比 CPU reference 与 GPU 输出后，再开始下一个模块。
 
-第一阶段建议实现顺序：
-
-```text
-TensorSpec/ModulePlan
-  -> ModuleChain mock tests
-  -> vdif_unpack
-  -> pipeline_worker + mock ring
-  -> PSRDADA ring adapter
-  -> host_to_device/device_to_host
-  -> complex_convert
-  -> beamform
-  -> power
-  -> stokes
-  -> time_integrate
-```
+后续实现顺序、每阶段完成标准、统一的输入输出门禁和 JSON 参数扩展规则见
+[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md)。该计划是当前执行基线；本文件只定义
+数据和模块契约，不再维护一份可能与实施进度不一致的开发顺序。
 
 ## 19. 实现前仍需确认的信息
 
@@ -661,6 +689,5 @@ TensorSpec/ModulePlan
 - raw payload 中 `T/F/P/A/real/imag` 的实际排列。
 - `component_bits` 的实际取值和是否有符号。
 - raw integer 转 `CF32` 的 scale、offset 和饱和规则。
-- beam weight 文件格式、数据类型、归一化方式和版本标识。
 - 两路偏振的实际标签，以及 `AB_IMAG` 的符号约定。
 - 每个 ring 的目标 `T`、block 数量和 CUDA device。

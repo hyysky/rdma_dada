@@ -1,20 +1,21 @@
 # Applications
 
-Final executables live here. Each processing application should remain a thin
-composition root: load configuration, construct one algorithm `Stage`, and run
-it between an input and output PSRDADA HDU.
+Final executables live here. Each processing application remains a thin
+composition root: load configuration, construct an algorithm module chain, and
+run it between PSRDADA HDUs.
 
 Application directories:
 
 - `rdma2dada`: implemented NIC to raw host ring A entry point.
-- `pipeline_worker`: planned ordered composition of compatible algorithm modules
-  inside one process, with one input ring and one output ring.
+- `pipeline_worker`: implemented first-version composition of Beamform followed
+  by optional Power or Stokes, with one input ring and one output ring.
 - `dada2rdma`: planned ring D to repacketized network output.
 - `pipelinectl`: planned ring/topology validation and process supervision.
 
-`vdif_unpack`, `beamform`, `power`, `stokes`, H2D and D2H are modules selected by
-`pipeline_worker`, not permanently fixed executable boundaries. Configuration
-may run one module or several modules in each worker.
+The first worker accepts `CONVERTED/TFPA/CF32` host-ring input. H2D and D2H are
+currently process-owned transfers around the selected CUDA module chain.
+`vdif_unpack`, integer-to-CF32 conversion, integration and the general module
+registry remain planned modules, not permanent executable boundaries.
 
 `dada_dbdisk` remains an optional external consumer attached to any configured
 host ring. Ring reader counts are derived from the enabled sinks and workers.

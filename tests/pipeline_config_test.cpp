@@ -38,6 +38,10 @@ int main(int argc, char** argv) {
     if (failures == 0) {
         Expect(layout.raw_record_bytes == 8256, "raw record includes 64-byte header");
         Expect(layout.compute_record_bytes == 8192, "compute record excludes header");
+        Expect(layout.packets_per_antenna_per_block == 4096,
+               "block contains 4096 UDP packets per antenna");
+        Expect(layout.samples_per_block == UINT64_C(2097152),
+               "T is packet samples times packets per antenna per block");
         Expect(layout.raw_resolution == 8256, "raw RESOLUTION is one raw record");
         Expect(layout.compute_resolution == 8192,
                "compute RESOLUTION is one payload record");
@@ -54,10 +58,17 @@ int main(int argc, char** argv) {
     }
 
     rdma_dada::PipelineConfig invalid = config;
-    invalid.records_per_block = 1;
+    invalid.records_per_block = 4;
     error.clear();
     Expect(!rdma_dada::ComputePipelineLayout(invalid, &layout, &error),
            "DIRECT_IO must reject a non-512-byte raw block");
+
+    invalid = config;
+    invalid.disk_enabled = false;
+    invalid.records_per_block = 3;
+    error.clear();
+    Expect(!rdma_dada::ComputePipelineLayout(invalid, &layout, &error),
+           "a block must contain complete NANT-sized UDP packet groups");
 
     invalid = config;
     invalid.packet_header_bytes = 32;
