@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "observation": {
+    "nant": 4,
+    "nchan": 1,
+    "npol": 2,
+    "payload_order": "UNKNOWN",
+    "utc_start": "2026-08-01-00:00:00"
+  },
+  "packet": {
+    "header_bytes": 64,
+    "payload_bytes": 8192,
+    "samples": 512,
+    "nbit": 16,
+    "sample_interval_us": 0.001
+  },
+  "ring_buffers": {
+    "records_per_block": 16384,
+    "raw_blocks": 8,
+    "compute_blocks": 8
+  },
+  "disk": {
+    "enabled": true,
+    "blocks_per_file": 10,
+    "direct_io": true
+  }
+}

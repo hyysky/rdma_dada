@@ -20,6 +20,7 @@ data_out/
 logs/
 
 # IDE and editor settings
+.DS_Store
 .vscode/
 .idea/
 *.code-workspace

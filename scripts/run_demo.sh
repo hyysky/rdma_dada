@@ -1,7 +1,9 @@
 #!/bin/bash
+set -o pipefail
 # RDMA + PSRDADA Ring Buffer Demo Launcher
-# Follows PAF_pipeline pattern: dada_db setup → Demo_psrdada_online → dada_dbdisk
-# Usage: ./run_demo.sh
+# The process group is owned by this foreground invocation and is cleaned up
+# when it exits. Cross-invocation stop/status commands are intentionally absent.
+# Usage: bash scripts/run_demo.sh [start]
 
 # Color output helper
 RED='\033[0;31m'
@@ -20,9 +22,6 @@ trap ctrl_c INT
 
 function ctrl_c() {
     echo_info "** Trapped CTRL-C, initiating shutdown..."
-    # Don't call cleanup here - let EXIT trap handle it
-    # Just set flag to exit the monitoring loop
-    g_should_exit=1
 }
 
 declare -a pids
@@ -40,10 +39,8 @@ DPORT="17201"
 # Hardware parameters
 DEVICE="1"
 
-# GPU memory mode (RdmaDirectGpu):
-#   =0：Host memory (malloc) - default, best compatibility
-#   >0：GPU memory (cudaMalloc) - GPUDirect RDMA, needs CUDA
-#   <0：Pinned host memory (cudaMallocHost) - DMA-friendly
+# CUDA device ID. The current raw ingest keeps RDMA receive buffers in host
+# memory; this value only selects a CUDA device in CUDA-enabled builds.
 GPU="0"
 
 # CPU thread affinity (bind_cpu_id):
@@ -54,66 +51,82 @@ CPU="-1"
 # Receiver configuration
 SEND_N=64
 NSGE="4"
-PKT_PER_BLOCK=16384
-# PSRDADA ring parameters
-PKT_HEADER=64
-PKT_DATA="8192"
-NBUFS="8"
-
-# Output file configuration (blocks per .dada file)
-NBLOCKSAVE="10"
 
 # Directories and files
 DUMP_DIR="./data_out"
 DUMP_HEADER="header/array_GZNU.header"
+PIPELINE_CONFIG="${PIPELINE_CONFIG:-config/pipeline.example.json}"
 LOG_DIR="${DUMP_DIR}/logs"
-DEMO_LOG="${LOG_DIR}/demo_psrdada_online.log"
+DEMO_LOG="${LOG_DIR}/rdma2dada.log"
 
-# ============= Compute Derived Params =============
-BLOCK_BYTES=$(( (PKT_HEADER + PKT_DATA) * PKT_PER_BLOCK ))
-RING_BYTES=$(( BLOCK_BYTES * NBUFS ))
-FILE_BYTES=$(( NBLOCKSAVE * BLOCK_BYTES ))
-PKT_SIZE=$(( PKT_HEADER + PKT_DATA ))
-
-# Convert hex key to decimal for dada_db
+# ============= Load and Validate Data Contract =============
 KEY="0xdada"
+ACTION="${1:-start}"
 
-echo_info "========================================"
-echo_info "RDMA + PSRDADA Ring Buffer Demo"
-echo_info "========================================"
-echo_info "Configuration:"
-echo_info "  Network: ${SMAC} → ${DMAC}, ${SIP}:${SPORT} → ${DIP}:${DPORT}"
-echo_info "  PSRDADA: PKT=(${PKT_HEADER}+${PKT_DATA})B, ${PKT_PER_BLOCK} pkt/block, ${NBUFS} blocks"
-echo_info "  Block size: ${BLOCK_BYTES} bytes, Ring: ${RING_BYTES} bytes"
-echo_info "  Output: ${FILE_BYTES} bytes/file, ${DUMP_DIR}/"
-echo_info "  Logs: ${LOG_DIR}/"
-echo_info "  NSGE per WR: ${NSGE}"
-echo_info "========================================"
-mkdir -p "${DUMP_DIR}"
-mkdir -p "${LOG_DIR}"
+if [ "${ACTION}" != "start" ]; then
+    echo_err "Unsupported action: ${ACTION}"
+    echo "Usage: bash $0 [start]"
+    echo "Stop the running foreground session with Ctrl+C."
+    exit 2
+fi
+
+    CONFIG_INSPECT="./build/pipeline_config_inspect"
+    if [ ! -x "${CONFIG_INSPECT}" ]; then
+        echo "ERROR: ${CONFIG_INSPECT} is missing; run scripts/build.sh first" >&2
+        exit 1
+    fi
+
+    if ! CONFIG_VALUES=$("${CONFIG_INSPECT}" "${PIPELINE_CONFIG}"); then
+        echo "ERROR: invalid pipeline config: ${PIPELINE_CONFIG}" >&2
+        exit 1
+    fi
+
+    while IFS='=' read -r config_key config_value; do
+        case "${config_key}" in
+            RAW_RECORD_BYTES) RAW_RECORD_BYTES="${config_value}" ;;
+            RAW_BLOCK_BYTES) BLOCK_BYTES="${config_value}" ;;
+            RAW_RING_BLOCKS) NBUFS="${config_value}" ;;
+            RAW_RING_BYTES) RING_BYTES="${config_value}" ;;
+            RAW_FILE_BYTES) FILE_BYTES="${config_value}" ;;
+            DBDISK_ENABLED) DBDISK_ENABLED="${config_value}" ;;
+            DIRECT_IO) DIRECT_IO="${config_value}" ;;
+        esac
+    done <<< "${CONFIG_VALUES}"
+
+    if [ -z "${RAW_RECORD_BYTES}" ] || [ -z "${BLOCK_BYTES}" ] ||
+       [ -z "${NBUFS}" ] || [ -z "${RING_BYTES}" ] ||
+       [ -z "${FILE_BYTES}" ] || [ -z "${DBDISK_ENABLED}" ] ||
+       [ -z "${DIRECT_IO}" ]; then
+        echo "ERROR: incomplete output from ${CONFIG_INSPECT}" >&2
+        exit 1
+    fi
+
+    if [ "${DBDISK_ENABLED}" -ne 1 ]; then
+        echo_err "disk.enabled must be true for the current demo launcher."
+        echo_err "No downstream pipeline worker is started yet, so disabling dada_dbdisk would leave the raw ring without a reader."
+        exit 1
+    fi
+
+    echo_info "========================================"
+    echo_info "RDMA + PSRDADA Ring Buffer Demo"
+    echo_info "========================================"
+    echo_info "Configuration:"
+    echo_info "  Network: ${SMAC} → ${DMAC}, ${SIP}:${SPORT} → ${DIP}:${DPORT}"
+    echo_info "  Data contract: ${PIPELINE_CONFIG}"
+    echo_info "  PSRDADA: ${RAW_RECORD_BYTES} bytes/record, ${NBUFS} blocks"
+    echo_info "  Block size: ${BLOCK_BYTES} bytes, Ring: ${RING_BYTES} bytes"
+    if [ "${DBDISK_ENABLED}" -eq 1 ]; then
+        echo_info "  Disk sink: enabled, ${FILE_BYTES} bytes/file, ${DUMP_DIR}/"
+    else
+        echo_info "  Disk sink: disabled"
+    fi
+    echo_info "  Logs: ${LOG_DIR}/"
+    echo_info "  NSGE per WR: ${NSGE}"
+    echo_info "========================================"
+    mkdir -p "${DUMP_DIR}"
+    mkdir -p "${LOG_DIR}"
 
 # ============= Function Definitions =============
-
-function status() {
-    echo_info "Status of running processes:"
-    
-    if [ -f "${PID_FILE}" ]; then
-        while read pid; do
-            if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
-                cmd=$(ps -p $pid -o cmd= 2>/dev/null || echo "unknown")
-                echo_info "  PID ${pid}: ${cmd}"
-            fi
-        done < "${PID_FILE}"
-    else
-        echo_warn "  No PID file found"
-    fi
-    
-    # Check ring buffer
-    if command -v dada_db >/dev/null 2>&1; then
-        echo_info "PSRDADA ring buffers:"
-        dada_db -l 2>/dev/null || echo_warn "  (dada_db -l not supported)"
-    fi
-}
 
 function cleanup {
     # Prevent running cleanup multiple times
@@ -215,65 +228,65 @@ function cleanup {
 
 # ============= Main Flow =============
 
-ACTION="${1:-start}"
-
 trap cleanup EXIT
 
-case "${ACTION}" in
-    start)
         # Step 1: Create ring buffer
-        # Note: Use -p to create only, no -w (writer lock) or -l (keep locked)
-        # The Demo_psrdada_online will lock it as writer
-        dada_create_cmd="dada_db -k ${KEY} -b ${BLOCK_BYTES} -n ${NBUFS} -p"
-        echo_info "Command: ${dada_create_cmd}"
-        eval "${dada_create_cmd}"
+        # -p asks PSRDADA to page the allocated blocks into memory.
+        # rdma2dada acquires the writer lock after creation.
+        dada_create_cmd=(dada_db -k "${KEY}" -b "${BLOCK_BYTES}" -n "${NBUFS}" -p)
+        echo_info "Command: ${dada_create_cmd[*]}"
+        "${dada_create_cmd[@]}"
         if [ $? -ne 0 ]; then
             echo_err "Failed to create ring buffer"
             exit 1
         fi
-        keys+=(`echo $KEY `)
+        keys+=("${KEY}")
         echo_info "Created ringbuffer (unlocked, ready for writer)"
         sleep 1
         
-        # Step 2: Start dada_dbdisk (data reader/writer)
-        # Use nohup to prevent receiving SIGINT so it can finish reading after EOD
-        dada_dbdisk_cmd="nohup dada_dbdisk -k ${KEY} -D ${DUMP_DIR} -o -z > ${DUMP_DIR}/dada_dbdisk.log 2>&1"
-        echo_info "Command: ${dada_dbdisk_cmd} &"
-        eval "${dada_dbdisk_cmd} &"
-        DBDISK_PID=$!
-        pids+=($DBDISK_PID)
-        echo_info "Started dada_dbdisk (PID: ${DBDISK_PID}, protected from SIGINT)"
-        
-        # Wait for dada_dbdisk to connect as reader
-        echo_info "Waiting for dada_dbdisk to connect as reader..."
-        sleep 3
-        
-        # Check if dada_dbdisk is still running
-        if ! kill -0 ${DBDISK_PID} 2>/dev/null; then
-            echo_err "ERROR: dada_dbdisk (PID ${DBDISK_PID}) exited prematurely!"
-            echo_err "Check log: ${DUMP_DIR}/dada_dbdisk.log"
-            cat "${DUMP_DIR}/dada_dbdisk.log"
-            exit 1
-        fi
-        
-        # Check log for connection success
-        if grep -q "locked" "${DUMP_DIR}/dada_dbdisk.log" 2>/dev/null; then
-            echo_info "✓ dada_dbdisk connected successfully"
+        # Step 2: Start dada_dbdisk, the current demo's only ring reader.
+        if [ "${DBDISK_ENABLED}" -eq 1 ]; then
+            # Use nohup to prevent receiving SIGINT so it can finish after EOD.
+            dada_dbdisk_args=(-k "${KEY}" -D "${DUMP_DIR}" -z)
+            if [ "${DIRECT_IO}" -eq 1 ]; then
+                dada_dbdisk_args+=(-o)
+            fi
+            echo_info "Command: nohup dada_dbdisk ${dada_dbdisk_args[*]} &"
+            nohup dada_dbdisk "${dada_dbdisk_args[@]}" \
+                > "${DUMP_DIR}/dada_dbdisk.log" 2>&1 &
+            DBDISK_PID=$!
+            pids+=("${DBDISK_PID}")
+            echo_info "Started dada_dbdisk (PID: ${DBDISK_PID}, protected from SIGINT)"
+
+            echo_info "Waiting for dada_dbdisk to connect as reader..."
+            sleep 3
+
+            if ! kill -0 "${DBDISK_PID}" 2>/dev/null; then
+                echo_err "ERROR: dada_dbdisk (PID ${DBDISK_PID}) exited prematurely!"
+                echo_err "Check log: ${DUMP_DIR}/dada_dbdisk.log"
+                cat "${DUMP_DIR}/dada_dbdisk.log"
+                exit 1
+            fi
+
+            if grep -q "locked" "${DUMP_DIR}/dada_dbdisk.log" 2>/dev/null; then
+                echo_info "✓ dada_dbdisk connected successfully"
+            else
+                echo_warn "WARNING: Cannot confirm dada_dbdisk connection. Check log if issues occur."
+                echo_warn "Log file: ${DUMP_DIR}/dada_dbdisk.log"
+            fi
         else
-            echo_warn "WARNING: Cannot confirm dada_dbdisk connection. Check log if issues occur."
-            echo_warn "Log file: ${DUMP_DIR}/dada_dbdisk.log"
+            echo_info "dada_dbdisk is disabled by configuration"
         fi
 
         # Step 3: Start receiver (run in foreground, but trap will handle cleanup)
-        CMD="./build/Demo_psrdada_online \
-        --smac ${SMAC} --dmac ${DMAC} \
-        --sip ${SIP} --dip ${DIP} --sport ${SPORT} --dport ${DPORT} \
-        --key ${KEY} --device ${DEVICE} --gpu ${GPU} --cpu ${CPU} \
-        --pkt_size ${PKT_SIZE} --send_n ${SEND_N} \
-        --nsge ${NSGE} \
-        --file-bytes ${FILE_BYTES}"
+        CMD=(./build/rdma2dada
+            --smac "${SMAC}" --dmac "${DMAC}"
+            --sip "${SIP}" --dip "${DIP}" --sport "${SPORT}" --dport "${DPORT}"
+            --key "${KEY}" --device "${DEVICE}" --gpu "${GPU}" --cpu "${CPU}"
+            --send_n "${SEND_N}" --nsge "${NSGE}"
+            --config "${PIPELINE_CONFIG}" --dump-header "${DUMP_HEADER}")
     
-        echo_info "Command: ${CMD}"
+        echo_info "Command: ${CMD[*]}"
         echo_info "========================================"
         echo_info "Logs: ${DEMO_LOG}"
         echo_info "========================================"
@@ -282,40 +295,28 @@ case "${ACTION}" in
         echo "" >> "${DEMO_LOG}"
         echo "========================================" >> "${DEMO_LOG}"
         echo "Run started at: $(date '+%Y-%m-%d %H:%M:%S')" >> "${DEMO_LOG}"
-        echo "Command: ${CMD}" >> "${DEMO_LOG}"
+        echo "Command: ${CMD[*]}" >> "${DEMO_LOG}"
         echo "========================================" >> "${DEMO_LOG}"
         
         # Run receiver in foreground with output to both terminal and log file
         # tee -a appends to log file, 2>&1 redirects stderr to stdout
-        $CMD 2>&1 | tee -a "${DEMO_LOG}"
+        "${CMD[@]}" 2>&1 | tee -a "${DEMO_LOG}"
+        DEMO_STATUS=${PIPESTATUS[0]}
+        if [ "${DEMO_STATUS}" -ne 0 ]; then
+            echo_err "rdma2dada exited with status ${DEMO_STATUS}"
+            exit "${DEMO_STATUS}"
+        fi
         
         # Add exit timestamp marker to log file
         echo "========================================" >> "${DEMO_LOG}"
         echo "Run ended at: $(date '+%Y-%m-%d %H:%M:%S')" >> "${DEMO_LOG}"
         echo "========================================" >> "${DEMO_LOG}"
         
-        echo_info "Receiver exited, waiting for readers to finish..."
-        # Give dada_dbdisk time to detect EOD, close files, and exit cleanly
-        sleep 5
+        if [ "${DBDISK_ENABLED}" -eq 1 ]; then
+            echo_info "Receiver exited, waiting for readers to finish..."
+            # Give dada_dbdisk time to detect EOD, close files, and exit cleanly.
+            sleep 5
+        fi
         echo_info "Starting cleanup sequence..."
-        ;;
-    
-    stop)
-        cleanup
-        ;;
-    
-    status)
-        status
-        ;;
-    
-    *)
-        echo "Usage: $0 {start|stop|status}"
-        echo ""
-        echo "  start  : Create ring buffer → start receiver → start dada_dbdisk"
-        echo "  stop   : Terminate all processes and clean up ring buffer"
-        echo "  status : Show running processes and ring buffer status"
-        exit 1
-        ;;
-esac
 
 echo_info "Done."

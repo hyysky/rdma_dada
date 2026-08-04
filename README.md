@@ -1,249 +1,100 @@
-# RDMA + PSRDADA Standalone Module
+# RDMA/PSRDADA Pipeline
 
-基于 RoCE v2 的零拷贝网络数据接收模块，数据直接写入 PSRDADA 环形缓冲区并落盘。
+该项目正在重构为独立的 PSRDADA ring-connected pipeline。当前可用部分是 RoCE v2 数据接收到 raw ring，以及可在 macOS 上开发和测试的配置、DADA header、pipeline core 和 beamform FP32 reference。Beamform CUDA FP32/TF32 backend 已加入代码，尚待目标服务器验证；通用 worker 仍在建设中。
 
-## ✨ 特性一览
+## 当前数据契约
 
-- **零拷贝 RDMA 接收**: RoCE v2 网卡直接 DMA 写入 ring buffer
-- **PSRDADA 集成**: 数据自动写入 psrdada 环形缓冲区，支持 dada_dbdisk 后台写盘
-- **智能内存注册**: 自动检测内存连续性，连续 → 单个 MR／非连续 → 分块注册
-- **自动缓冲管理**: 空间不足时自动请求新 block，永不 crash
-- **线程安全**: 互斥锁保护关键路径
-- **Debug 模式**: `--debug` 参数开启详细诊断日志
+- 所有运行时参数由 JSON 配置输入；`NANT`/`NCHAN`/`NPOL`、`PKT_TSAMP`、`UTC_START` 和 ring/file 几何不写死在程序中。
+- raw ring 中的每条 record 是 `64-byte application header + payload`。RoCE 接收缓冲区中额外的 Ethernet/IPv4/UDP 42 字节会在写 ring 前剔除。
+- PSRDADA 的 header block 描述一次 transfer；数据 block 不会重复前缀 ASCII header。
+- `.dada` 文件大小由 `blocks_per_file` 配置，因此是 ring data block 大小的整数倍。
+- 当前 RDMA ingest 使用内部注册缓冲区，验证 CQ completion 后再拷贝到 raw ring。尚未启用 RDMA 直接写 ring 的优化路径。
 
-> 详细文档：[QUICKSTART.md](QUICKSTART.md) · [WORKFLOW.md](WORKFLOW.md) · [BUGFIXES_AND_IMPROVEMENTS.md](BUGFIXES_AND_IMPROVEMENTS.md)
+完整的目标架构和 header 传播规则见 [doc/PIPELINE_ARCHITECTURE.md](doc/PIPELINE_ARCHITECTURE.md)。
+算法模块的输入输出、`TFPA/TFPB/TFBS` 数据布局、独立积分模块和 worker 调用规则见
+[doc/ALGORITHM_MODULE_CONTRACTS.md](doc/ALGORITHM_MODULE_CONTRACTS.md)。
 
----
+## 分层与目录
 
-## 快速开始
+```text
+include/rdma_dada/config/       便携 JSON 和运行参数契约
+include/rdma_dada/pipeline/     block、metadata、stage 和 DADA header 契约
+include/rdma_dada/io/rdma/      RoCE/libibverbs 适配器接口
+include/rdma_dada/io/psrdada/   PSRDADA ring/header 适配器接口
+src/config|pipeline|io/         与公共接口镜像的底层实现
+modules/                        独立算法，不持有 ring 和进程生命周期
+apps/rdma2dada/                 已实现的 NIC→raw ring 组合入口
+apps/pipeline_worker/           计划中的模块链工作进程
+apps/dada2rdma|pipelinectl/     计划中的输出与编排入口
+tools/                          配置检查和 SSD 诊断工具
+scripts/                        最上层用户启动、构建和配置转换
+tests/                          macOS 单元测试与后续 Linux 集成测试
+```
 
-### 1. 安装依赖
+依赖只能向底层流动：`scripts → apps`；`apps` 负责组合 `io + pipeline + modules`；`modules` 只依赖 `pipeline/config` 契约。算法模块通过 `AlgorithmModule` 交换 metadata 和 block view，不直接调用 PSRDADA 或 libibverbs。
+
+## macOS 开发
+
+macOS 不编译 libibverbs/PSRDADA/CUDA 数据面，只构建可移植部分：
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install libpsrdada-dev libibverbs-dev librdmacm-dev
-pkg-config --cflags --libs psrdada   # 验证
+bash scripts/build.sh
+ctest --test-dir build --output-on-failure
 ```
 
-### 2. 编译
+这个模式不需要 CUDA，也不要求在 macOS 安装 PSRDADA。
+
+## Linux 服务器构建
+
+服务器需要 libibverbs 开发文件与 PSRDADA。当前对照的 PSRDADA 源码版本是 `151198ea3ec4a3a237f51e6217a5a2d7ff39194e`。CUDA 不是 raw RDMA ingest 的必需依赖：
 
 ```bash
-cd rdma_dada
-bash build.sh
-# 或手动：mkdir -p build && cd build && cmake .. && make
+BUILD_RDMA_PIPELINE=ON USE_CUDA=OFF bash scripts/build.sh
+ctest --test-dir build --output-on-failure
 ```
 
-### 3. 配置并启动
+启用 CUDA 的算法模块后，再使用 `USE_CUDA=ON`。
 
-编辑 `run_demo.sh` 中的网络参数（SMAC、DMAC、SIP、DIP 等），然后一键启动：
+在服务器上可以先关闭 RDMA/PSRDADA，只验证 CUDA 算法模块：
 
 ```bash
-./run_demo.sh start     # 创建 ring buffer + 启动接收器 + 启动写盘器
-./run_demo.sh status    # 查看运行状态
-./run_demo.sh stop      # 停止
+BUILD_RDMA_PIPELINE=OFF USE_CUDA=ON bash scripts/build.sh
+ctest --test-dir build -L cuda --output-on-failure
 ```
 
-数据文件保存在 `./data_out/*.dada`。
+RTX 4090 的默认 CUDA architecture 是 `89`，可通过
+`-DCMAKE_CUDA_ARCHITECTURES=89` 显式覆盖。CUDA 构建建议使用 CMake 3.24 或更新
+版本；项目最低版本仍为 3.18。
 
-也可手动分步操作：
+## JSON 配置
+
+示例文件是 [config/pipeline.example.json](config/pipeline.example.json)。开始前可检查派生的 record/block/ring/file 几何：
 
 ```bash
-# 创建 ring buffer（8GB）
-dada_db -k 0xdada -b 8G
-
-# 启动接收器
-./build/Demo_psrdada_online \
-  --smac a0:88:c2:6b:40:c6 --dmac c4:70:bd:01:43:c8 \
-  --sip 192.168.14.13 --dip 192.168.14.12 \
-  --sport 61440 --dport 4144 \
-  --pkt_size 8256 --send_n 64 --key 0xdada \
-  --dump-dir ./data_out --dump-header header/array_GZNU.header
-
-# 另一终端监控
-watch -n 1 'dada_dbmetric -k 0xdada'
+./build/pipeline_config_inspect config/pipeline.example.json
 ```
 
----
-
-## 实用工具
-
-| 脚本 | 用途 |
-|------|------|
-| `build.sh` | 一键编译 |
-| `run_demo.sh` | 一键启动／停止（含 dada_dbdisk 写盘） |
-| `check_psrdada_ring.sh` | 检查 ring buffer 内存连续性 |
-
----
-
-## 项目结构
-
-```
-rdma_dada/
-├── include/          # 头文件
-├── src/              # 源码
-├── demo/             # 演示程序
-│   ├── Demo_psrdada_online.cpp
-│   └── ssd_write_benchmark.cpp
-├── header/           # PSRDADA header 模板
-├── build.sh          # 编译脚本
-└── run_demo.sh       # 启动脚本
-```
-
-## 文档资源
-
-| 文档 | 描述 |
-|------|------|
-| [QUICKSTART.md](QUICKSTART.md) | ⭐ **快速开始** - 5分钟上手指南 |
-| [WORKFLOW.md](WORKFLOW.md) | 📊 **工作流程** - 详细架构和数据流说明 |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 🏗️ **系统架构** - 组件交互和内存管理详解 |
-| [BUGFIXES_AND_IMPROVEMENTS.md](BUGFIXES_AND_IMPROVEMENTS.md) | 🐛 **v1.2.0改进** - Bug修复和功能增强 |
-| [USAGE_EXAMPLE.md](USAGE_EXAMPLE.md) | 📖 使用示例和最佳实践 |
-| [PSRDADA_ROCE_INTEGRATION.md](PSRDADA_ROCE_INTEGRATION.md) | 🔧 技术集成详解 |
-| [NON_CONTIGUOUS_MEMORY_SOLUTION.md](NON_CONTIGUOUS_MEMORY_SOLUTION.md) | 💾 非连续内存解决方案 |
-
-## 常见问题 (FAQ)
-
-### Q1: "Insufficient buffer space" 错误
-
-**A:** v1.2.0已修复此问题。如果使用旧版本，请升级并重新编译：
-```bash
-git pull  # 如果使用git
-./build.sh
-```
-
-新版本会自动检测剩余空间并请求新block。
-
-### Q2: 如何启用Debug模式？
-
-**A:** 编辑 `run_demo.sh`，在启动命令中添加 `--debug`：
-```bash
-CMD="./build/Demo_psrdada_online ... --debug"
-```
-
-或直接运行：
-```bash
-./build/Demo_psrdada_online --smac ... --debug
-```
-
-### Q3: Block大小如何计算？
-
-**A:** 
-```
-包大小 = PKT_HEADER + PKT_DATA (例如: 64 + 8192 = 8256)
-单批次发送/接收大小 = 包大小 × SEND_N (例如: 8256 × 64 = 528,384)
-Block大小 = 包大小 × PKT_PER_BLOCK（ = SEND_N × SEND_NUM_PER_BLOCK ） (例如: 8256 × 16384 = 135,266,304)
-Block大小是单批次大小的整数倍！
-```
-**重要：** v1.2.0会自动处理非整数倍的情况，无需手动调整。
-
-### Q4: 数据保存在哪里？
-
-**A:** 默认保存在 `./data_out/` 目录，文件格式为 `*.dada`
-
-查看输出文件：
-```bash
-ls -lh ./data_out/*.dada
-```
-
-### Q5: 如何查看实时进度？
-
-**A:** 程序会自动每2秒打印进度：
-```
-[Progress] Blocks written: 10 | Ring buffer: 25.3% full (256/1024 MB)
-```
-
-或查看日志文件：
-```bash
-tail -f ./data_out/logs/demo_psrdada_online.log
-```
-
-### Q6: Ring buffer已存在怎么办？
-
-**A:** 停止并清理：
-```bash
-./run_demo.sh stop
-```
-
-或者手动清理：
-```bash
-dada_db -k 0xdada -d
-```
-
----
-
-## 版本历史
-
-### v1.2.0 (2026-02-10)
-- 🐛 **修复critical bug**: 包大小重复计算导致block不对齐
-- 🐛 **修复critical bug**: 缓冲区空间不足检查逻辑错误
-- ✨ **新增**: Debug模式（`--debug`参数）
-- ✨ **改进**: 简化日志输出，正常模式更清晰
-- ✨ **改进**: 智能缓冲区管理，自动检测并请求新block
-- 🔧 **重构**: 简化block写入逻辑
-- 📖 **文档**: 新增详细的bug修复说明文档
-
-详细改进请参考：[BUGFIXES_AND_IMPROVEMENTS.md](BUGFIXES_AND_IMPROVEMENTS.md)
-
-### v1.1.0
-- ✅ 智能内存注册，支持连续/非连续内存
-- ✅ 分块RDMA注册支持
-- ✅ 底层ipcbuf API集成
-- ✅ 资源释放顺序修复
-- ✅ 增强错误处理
-
-### v1.0.0
-- 🎉 初始版本发布
-- 基础RDMA接收功能
-- PSRDADA ring buffer集成
-
----
-
-## 故障排查
-
-### 内存不连续问题
+将旧的 shell 配置转为 JSON：
 
 ```bash
-# 检查ring
-./check_psrdada_ring.sh 0xdada
-
-# 如果不连续，增加SHMMAX
-sudo sysctl -w kernel.shmmax=17179869184
+python3 scripts/convert_config_to_json.py old.conf config/pipeline.json
 ```
 
-详见：[NON_CONTIGUOUS_MEMORY_SOLUTION.md](NON_CONTIGUOUS_MEMORY_SOLUTION.md)
+## 运行当前 demo
 
-### PSRDADA 缓冲错误
+先修改 [scripts/run_demo.sh](scripts/run_demo.sh) 顶部的 MAC/IP/port/NIC 参数，以及 JSON 配置。当前 launcher 没有启动下游 worker，所以要求 `disk.enabled=true`，由 `dada_dbdisk` 作为 raw ring 的 reader。
 
 ```bash
-# 问题: "Failed to connect to dada_hdu"
-# 解决: 确保缓冲已创建
-dada_db -k 0xdada -b $block_size -p -l 
+bash scripts/run_demo.sh start
 ```
 
-### RDMA 设备错误
+该脚本在前台持有本次运行的所有 PID 和 ring key。在同一终端按 `Ctrl+C` 会停止 receiver、等待 reader 处理 EOD，然后清理 ring。`stop` 和 `status` 子命令已禁用，因为脚本不保存跨进程的 PID 状态。
 
-```bash
-# 检查 IB 设备
-ibv_devices
-lspci | grep -i infiniband
+数据和日志默认写入 `data_out/`。当前可执行文件名为 `build/rdma2dada`。
 
-# 检查网络配置
-ifconfig
-ethtool <interface>
-```
+## 当前限制
 
-### 编译问题
-
-```bash
-# 检查 psrdada 库
-pkg-config --exists psrdada && echo "OK" || echo "psrdada not found"
-pkg-config --cflags psrdada
-pkg-config --libs psrdada
-```
-
-## 原始工程位置
-
-此模块原始文件位置：
-- `libsrc/udp_rdma/` - 原始 RDMA 模块
-- `libsrc/udp_rdma/demo/Demo_psrdada_online.cpp` - 原始演示
-
+- Linux RDMA 构建、CQ 错误路径、NIC flow steering 和持续运行需要在目标服务器验证。
+- `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32 backend；CUDA 路径尚待 RTX 4090 服务器编译、数值和性能验证。`power` / `stokes` 仍待实现。这些算法保持独立模块，并可由配置组合为一个两端连 ring 的 worker 进程。
+- raw ring 的 payload order 目前可配置为 `UNKNOWN`；在前端格式确定前，不对其做推断。
+- `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。
