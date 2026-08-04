@@ -16,13 +16,17 @@ separate modules. A configured worker may compose them in one process so
 intermediate values remain in GPU buffers, or place ring boundaries between
 them when process isolation is required.
 
-`beamform` has a portable FP32 reference implementation, strict NPY weight
-loader and an asynchronous CUDA FP32/TF32 backend. `power` and `stokes` have
-portable FP32 reference implementations and asynchronous CUDA elementwise
+`complex_convert` has portable and CUDA backends for signed little-endian
+CI8/CI16 to CF32 conversion with an explicit scale. `beamform` has a portable
+FP32 reference implementation, strict NPY weight loader and an asynchronous
+CUDA FP32/TF32 backend. `power`, `stokes` and `time_integrate` have portable
+FP32 reference implementations and asynchronous CUDA elementwise/reduction
 backends. `host_to_device` and `device_to_host` are byte-preserving asynchronous
-CUDA transfer modules and are used by `pipeline_worker`. All CUDA paths are
-pending target-server validation. The remaining algorithms are still planned
-and should use the worker-owned execution stream by default.
+CUDA transfer modules and are used by `pipeline_worker`. Their standalone CUDA
+correctness tests have passed on the target server. The full
+H2D→Beamform→Power→TimeIntegrate→D2H in-process CUDA chain has also passed;
+PSRDADA ring lifecycle and performance validation remain. Future algorithms
+should use the worker-owned execution stream by default.
 
 The authoritative data layouts, module inputs/outputs, integration rules and
 worker invocation contract are documented in

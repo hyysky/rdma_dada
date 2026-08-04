@@ -3,6 +3,7 @@
 #include "rdma_dada/modules/beamform/beamform_module.h"
 #include "rdma_dada/modules/power/power_module.h"
 #include "rdma_dada/modules/stokes/stokes_module.h"
+#include "rdma_dada/modules/time_integrate/time_integrate_module.h"
 #include "rdma_dada/pipeline/complex32.h"
 
 #include <limits>
@@ -90,6 +91,10 @@ StageParameters MakeModuleParameters(const WorkerConfig& config) {
     parameters.SetUint64("NBEAM", config.nbeam);
     parameters.SetString("COMPUTE_MODE", config.compute_mode);
     parameters.SetString("EXECUTION_BACKEND", config.execution_backend);
+    parameters.SetUint64(
+        "INTEGRATION_LENGTH", config.integration_length);
+    parameters.SetString(
+        "INTEGRATION_OPERATION", config.integration_operation);
     if (config.execution_backend == "CUDA") {
         parameters.SetUint64(
             "CUDA_DEVICE", static_cast<std::uint64_t>(config.cuda_device));
@@ -104,7 +109,10 @@ public:
     Impl() : configured(false), product(WorkerProduct::kBeamformed) {
         plan.input_frame_bytes = 0;
         plan.beamformed_frame_bytes = 0;
+        plan.product_frame_bytes = 0;
         plan.output_frame_bytes = 0;
+        plan.integration_length = 1;
+        plan.integration_enabled = false;
         plan.module_count = 0;
         plan.execution_location = MemoryLocation::kHost;
     }
@@ -114,6 +122,7 @@ public:
     ModuleChainPlan plan;
     modules::beamform::BeamformModule beamform;
     std::unique_ptr<AlgorithmModule> post_beamform;
+    std::unique_ptr<AlgorithmModule> integration;
 };
 
 ModuleChain::ModuleChain() : impl_(new Impl) {}
@@ -248,7 +257,7 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
         return status;
     }
 
-    Metadata module_output_header = beamformed_header;
+    Metadata product_header = beamformed_header;
     impl_->product = config.product;
     switch (config.product) {
         case WorkerProduct::kBeamformed:
@@ -265,7 +274,7 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
     }
     if (impl_->post_beamform) {
         status = impl_->post_beamform->ConfigureHeader(
-            beamformed_header, parameters, &module_output_header);
+            beamformed_header, parameters, &product_header);
         if (!status.ok()) {
             impl_->post_beamform->Finish();
             impl_->post_beamform.reset();
@@ -274,34 +283,61 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
         }
     }
 
-    std::uint64_t output_frame_bytes = 0;
-    if (!module_output_header.GetUint64("RESOLUTION", &output_frame_bytes) ||
-        output_frame_bytes == 0) {
+    std::uint64_t product_frame_bytes = 0;
+    if (!product_header.GetUint64("RESOLUTION", &product_frame_bytes) ||
+        product_frame_bytes == 0) {
         Finish();
         return MissingOrInvalid("module chain output RESOLUTION");
     }
-    if (output_frame_bytes != configured_geometry.output_frame_bytes) {
+    if (product_frame_bytes != configured_geometry.output_frame_bytes) {
         Finish();
         return StageStatus::Error(
             "module output frame does not match configured block geometry");
     }
     status = ScaleGlobalByteFields(
-        ring_input_header, input_frame_bytes, output_frame_bytes,
-        &module_output_header);
+        ring_input_header, input_frame_bytes, product_frame_bytes,
+        &product_header);
     if (!status.ok()) {
         Finish();
         return status;
     }
 
+    Metadata module_output_header = product_header;
+    if (config.integration_enabled) {
+        impl_->integration.reset(
+            new modules::time_integrate::TimeIntegrateModule);
+        status = impl_->integration->ConfigureHeader(
+            product_header, parameters, &module_output_header);
+        if (!status.ok()) {
+            Finish();
+            return status;
+        }
+    }
+
+    std::uint64_t output_frame_bytes = 0;
+    if (!module_output_header.GetUint64(
+            "RESOLUTION", &output_frame_bytes) ||
+        output_frame_bytes != product_frame_bytes) {
+        Finish();
+        return StageStatus::Error(
+            "integration must preserve the product frame resolution");
+    }
+
     Metadata published_header = module_output_header;
     published_header.SetString("MEMORY", "HOST");
-    published_header.SetString(
-        "PIPELINE_MODULES",
+    std::string pipeline_modules =
         config.product == WorkerProduct::kBeamformed ?
             "beamform" :
             (config.product == WorkerProduct::kPower ?
-                 "beamform,power" : "beamform,stokes"));
-    published_header.SetUint64("BLOCK_NTIME", configured_geometry.ntime);
+                 "beamform,power" : "beamform,stokes");
+    if (config.integration_enabled) {
+        pipeline_modules += ",time_integrate";
+    }
+    published_header.SetString("PIPELINE_MODULES", pipeline_modules);
+    published_header.SetUint64(
+        "INPUT_BLOCK_NTIME", configured_geometry.ntime);
+    published_header.SetUint64(
+        "BLOCK_NTIME", configured_geometry.output_ntime);
     published_header.SetUint64(
         "UDP_PAYLOAD_BYTES", config.udp_payload_bytes);
     published_header.SetUint64("UDP_NSAMP", config.samples_per_udp);
@@ -322,20 +358,24 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
     impl_->plan.output_header = published_header;
     impl_->plan.input_frame_bytes = input_frame_bytes;
     impl_->plan.beamformed_frame_bytes = beamformed_frame_bytes;
+    impl_->plan.product_frame_bytes = product_frame_bytes;
     impl_->plan.output_frame_bytes = output_frame_bytes;
-    impl_->plan.module_count = impl_->post_beamform ? 2U : 1U;
+    impl_->plan.integration_length = config.integration_length;
+    impl_->plan.integration_enabled = config.integration_enabled;
+    impl_->plan.module_count = 1U + (impl_->post_beamform ? 1U : 0U) +
+                               (impl_->integration ? 1U : 0U);
     impl_->configured = true;
     *ring_output_header = published_header;
     return StageStatus::Ok();
 }
 
 StageStatus ModuleChain::PlanBlock(std::uint64_t input_bytes,
-                                   std::uint64_t* beamformed_bytes,
+                                   std::uint64_t* scratch_bytes,
                                    std::uint64_t* output_bytes) const {
     if (!impl_->configured) {
         return StageStatus::Error("module chain is not configured");
     }
-    if (!beamformed_bytes || !output_bytes) {
+    if (!scratch_bytes || !output_bytes) {
         return StageStatus::Error("null block plan output");
     }
     if (input_bytes == 0 ||
@@ -344,11 +384,35 @@ StageStatus ModuleChain::PlanBlock(std::uint64_t input_bytes,
             "input block does not contain complete TFPA time frames");
     }
     const std::uint64_t ntime = input_bytes / impl_->plan.input_frame_bytes;
+    if (impl_->plan.integration_enabled &&
+        ntime % impl_->plan.integration_length != 0) {
+        return StageStatus::Error(
+            "input T must be divisible by integration length");
+    }
+    std::uint64_t beamformed_bytes = 0;
+    std::uint64_t product_bytes = 0;
     if (!CheckedMultiply(ntime, impl_->plan.beamformed_frame_bytes,
-                         beamformed_bytes) ||
-        !CheckedMultiply(ntime, impl_->plan.output_frame_bytes,
-                         output_bytes)) {
+                         &beamformed_bytes) ||
+        !CheckedMultiply(ntime, impl_->plan.product_frame_bytes,
+                         &product_bytes)) {
         return StageStatus::Error("planned block geometry overflows");
+    }
+    if (!impl_->post_beamform) {
+        *scratch_bytes = 0;
+    } else if (!impl_->plan.integration_enabled) {
+        *scratch_bytes = beamformed_bytes;
+    } else {
+        if (product_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                beamformed_bytes) {
+            return StageStatus::Error("planned scratch geometry overflows");
+        }
+        *scratch_bytes = beamformed_bytes + product_bytes;
+    }
+    const std::uint64_t output_ntime = impl_->plan.integration_enabled ?
+        ntime / impl_->plan.integration_length : ntime;
+    if (!CheckedMultiply(output_ntime, impl_->plan.output_frame_bytes,
+                         output_bytes)) {
+        return StageStatus::Error("planned output geometry overflows");
     }
     return StageStatus::Ok();
 }
@@ -366,10 +430,10 @@ StageStatus ModuleChain::ProcessBlock(
             "module chain block memory does not match configured backend");
     }
 
-    std::uint64_t beamformed_bytes = 0;
+    std::uint64_t scratch_bytes = 0;
     std::uint64_t output_bytes = 0;
     StageStatus status = PlanBlock(
-        input.size, &beamformed_bytes, &output_bytes);
+        input.size, &scratch_bytes, &output_bytes);
     if (!status.ok()) return status;
     if (output->capacity < output_bytes || !output->data) {
         return StageStatus::Error("module chain output block is too small");
@@ -378,9 +442,19 @@ StageStatus ModuleChain::ProcessBlock(
     if (!impl_->post_beamform) {
         return impl_->beamform.ProcessBlock(input, output, context);
     }
-    if (!scratch || scratch_capacity < beamformed_bytes) {
+    if (!scratch || scratch_capacity < scratch_bytes) {
         return StageStatus::Error(
-            "module chain beamform scratch block is too small");
+            "module chain scratch block is too small");
+    }
+    const std::uint64_t ntime =
+        input.size / impl_->plan.input_frame_bytes;
+    std::uint64_t beamformed_bytes = 0;
+    std::uint64_t product_bytes = 0;
+    if (!CheckedMultiply(ntime, impl_->plan.beamformed_frame_bytes,
+                         &beamformed_bytes) ||
+        !CheckedMultiply(ntime, impl_->plan.product_frame_bytes,
+                         &product_bytes)) {
+        return StageStatus::Error("module chain scratch geometry overflows");
     }
     OutputBlock beamformed = {
         scratch, scratch_capacity, 0, input.sequence,
@@ -392,10 +466,33 @@ StageStatus ModuleChain::ProcessBlock(
         beamformed.data, beamformed.size, beamformed.sequence,
         beamformed.location
     };
-    return impl_->post_beamform->ProcessBlock(post_input, output, context);
+    if (!impl_->integration) {
+        return impl_->post_beamform->ProcessBlock(
+            post_input, output, context);
+    }
+    std::uint8_t* product_data =
+        scratch + static_cast<std::size_t>(beamformed_bytes);
+    OutputBlock product_output = {
+        product_data, product_bytes, 0, input.sequence,
+        impl_->plan.execution_location
+    };
+    status = impl_->post_beamform->ProcessBlock(
+        post_input, &product_output, context);
+    if (!status.ok()) return status;
+    const InputBlock integration_input = {
+        product_output.data, product_output.size, product_output.sequence,
+        product_output.location
+    };
+    return impl_->integration->ProcessBlock(
+        integration_input, output, context);
 }
 
 StageStatus ModuleChain::Finish() {
+    StageStatus integration_status = StageStatus::Ok();
+    if (impl_->integration) {
+        integration_status = impl_->integration->Finish();
+        impl_->integration.reset();
+    }
     StageStatus post_status = StageStatus::Ok();
     if (impl_->post_beamform) {
         post_status = impl_->post_beamform->Finish();
@@ -405,11 +502,15 @@ StageStatus ModuleChain::Finish() {
     impl_->configured = false;
     impl_->plan.input_frame_bytes = 0;
     impl_->plan.beamformed_frame_bytes = 0;
+    impl_->plan.product_frame_bytes = 0;
     impl_->plan.output_frame_bytes = 0;
+    impl_->plan.integration_length = 1;
+    impl_->plan.integration_enabled = false;
     impl_->plan.module_count = 0;
     impl_->plan.execution_location = MemoryLocation::kHost;
     impl_->plan.input_header = Metadata();
     impl_->plan.output_header = Metadata();
+    if (!integration_status.ok()) return integration_status;
     if (!post_status.ok()) return post_status;
     return beam_status;
 }

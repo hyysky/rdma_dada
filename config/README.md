@@ -33,8 +33,8 @@ The legacy launcher always started `dada_dbdisk`, so the converter writes
 `"disk.enabled": true`. Change it to `false` when raw disk recording is not a
 consumer of the ring.
 
-`pipeline_worker.example.json` is a separate strict schema for the processing
-worker. It contains:
+`pipeline_worker.example.json` is a separate strict schema version 2 for the
+processing worker. It contains:
 
 - `rings`: hexadecimal input/output PSRDADA keys. The two keys must differ.
 - `execution`: `CPU_REFERENCE` or `CUDA`, CUDA device and one-transfer mode.
@@ -42,6 +42,11 @@ worker. It contains:
   阵元在一个 block 中贡献的 UDP 包数。
 - `beamform`: NPY weight path/scale/identity, output beam count and FP32/TF32.
 - `output`: one of `BEAMFORMED`, `POWER` or `STOKES`.
+- `integration`: enable flag, positive integer length and `sum` or `mean`.
+
+Schema version 1 remains readable as integration disabled with length 1. New
+configs should use version 2. Integration may follow `POWER` or `STOKES`, not
+`BEAMFORMED`, and the configured block `T` must be divisible by its length.
 
 Relative `weights_file` paths are resolved from the worker JSON directory, not
 from the process working directory. The example therefore expects
@@ -54,6 +59,9 @@ T = samples_per_udp * udp_packets_per_antenna_per_block
 input_block_bytes = F * A * P * T * sizeof(CF32)
 udp_antenna_group_bytes = udp_payload_bytes * A
 input_block_bytes % udp_antenna_group_bytes == 0
+product_block_bytes = T * selected_output_frame_bytes
+output_T = integration.enabled ? T / integration.length : T
+output_block_bytes = output_T * selected_output_frame_bytes
 ```
 
 创建 ring 前可输出全部派生尺寸：

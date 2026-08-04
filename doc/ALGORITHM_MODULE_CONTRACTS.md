@@ -100,6 +100,7 @@ SAMPLE_FORMAT=CI8
 COMPONENT_NBIT=8
 SAMPLE_NBIT=16
 COMPONENT_ORDER=RI
+COMPONENT_SIGNED=1
 ENDIAN=LITTLE
 ```
 
@@ -113,7 +114,7 @@ contract version；不能仅删除校验而保留含糊语义。
 | --- | --- | --- | --- |
 | `vdif_unpack` | raw records | `T-F-P-A`, `CI8/CI16/...`, host | 去包头、校验、重排 |
 | `host_to_device` | `T-F-P-A`, host/pinned host | shape/type 不变，CUDA device | 只改变内存位置 |
-| `complex_convert` | `T-F-P-A`, `CI8/CI16/...`, CUDA device | `T-F-P-A`, `CF32`, CUDA device | 转换为 `cuComplex` |
+| `complex_convert` | `T-F-P-A`, `CI8/CI16`, host 或 CUDA device | `T-F-P-A`, `CF32`，位置不变 | 转换为逻辑复数浮点 |
 | `beamform` | 数据 `T-F-P-A`，系数 `F-P-A-B` | `T-F-P-B`, `CF32` | `A` 轴变为 `B` 轴 |
 | `power` | `T-F-P-B`, `CF32` | `T-F-P-B`, `F32` | 复电压变成功率 |
 | `stokes` | `T-F-2-B`, `CF32` | `T-F-B-S`, `F32` | 生成 4 个相关产物 |
@@ -184,12 +185,12 @@ stream 同步和 buffer 生命周期均由 worker 负责。
 
 ## 8. `complex_convert`
 
-解包后的整数复数数据在 GPU 上转换为 `cuComplex`。模块逻辑类型使用 `CF32`，
-避免让 PSRDADA header 依赖 CUDA 类型名称。
+解包后的整数复数数据转换为逻辑 `CF32`；CUDA backend 的存储与 `cuComplex` 兼容，
+但 PSRDADA header 不依赖 CUDA 类型名称。CPU reference 用于便携 oracle。
 
 ```text
-Input:  X[T,F,P,A], CI8/CI16/..., CUDA device
-Output: Y[T,F,P,A], CF32, CUDA device
+Input:  X[T,F,P,A], CI8/CI16, host 或 CUDA device
+Output: Y[T,F,P,A], CF32，memory location 与输入一致
 ```
 
 示例计算：
@@ -199,8 +200,49 @@ Y.real = scale * X.real
 Y.imag = scale * X.imag
 ```
 
-`scale`、offset、饱和处理和是否归一化由模块配置决定。第一版不允许该模块改变
-轴顺序或 shape。
+第一版仅支持以下无歧义格式：
+
+```text
+SAMPLE_FORMAT=CI8  -> COMPONENT_NBIT=8,  SAMPLE_NBIT=16
+SAMPLE_FORMAT=CI16 -> COMPONENT_NBIT=16, SAMPLE_NBIT=32
+COMPONENT_ORDER=RI
+COMPONENT_SIGNED=1
+ENDIAN=LITTLE
+```
+
+模块参数为：
+
+```text
+CONVERSION_SCALE=<positive finite scalar>
+EXECUTION_BACKEND=CPU_REFERENCE 或 CUDA
+CUDA_DEVICE=<gpu_id，仅 CUDA>
+```
+
+第一版计算为 `Y=CONVERSION_SCALE*X`，offset 固定为零，不自动归一化或饱和。
+`CONVERSION_SCALE` 是整个 tensor 共用的反量化比例；如果后续需要 per-channel 或
+per-antenna scale，应升级配置 schema。模块不改变轴顺序或 shape。
+
+CPU reference 接受 `HOST/PINNED_HOST`，CUDA backend 要求输入输出均为
+`CUDA_DEVICE`，并只向 worker 提供的 non-default stream 异步提交 kernel。两种 backend
+均禁止输入输出 buffer 重叠。
+
+Header 更新：
+
+```text
+DATA_STAGE=CONVERTED
+ORDER=TFPA
+SAMPLE_FORMAT=CF32
+COMPONENT_NBIT=32
+SAMPLE_NBIT=64
+SOURCE_SAMPLE_FORMAT=CI8 或 CI16
+SOURCE_COMPONENT_NBIT=8 或 16
+SOURCE_COMPONENT_SIGNED=1
+RECORD_BYTES=F*P*A*8
+RESOLUTION=F*P*A*8
+```
+
+`BYTES_PER_SECOND` 以及可选 `TRANSFER_SIZE/FILE_SIZE/OBS_OFFSET` 按 input/output
+frame bytes 比例精确缩放；未知观测 metadata 保留。
 
 为性能优化，可以将 H2D 和 conversion 在实现层融合，但逻辑上仍保留两个模块
 契约、两个 header transform 和独立测试。
@@ -421,6 +463,9 @@ Stokes 是逐元素 FP32 运算，不使用 `COMPUTE_MODE`。CUDA 后端要求�
 - 配置积分长度 `K=integration_length`，且 `K > 0`。
 - 每个输入 block 的 `T` 必须满足 `T % K == 0`。
 - 不跨 block 保存未完成积分，不在 EOD 时拼接相邻 block。
+- CPU 和 CUDA 第一版均使用 FP32 累加；`mean` 在累加后乘 `1/K`。
+- 输入必须提供正数 `BYTES_PER_SECOND` 和正数有限值 `TSAMP`。
+- `RECORD_BYTES`、`RESOLUTION` 必须等于一个完整 F32 时间帧。
 
 ### 输入输出
 
@@ -455,7 +500,7 @@ output_block_bytes = input_block_bytes / K
 DATA_STAGE=<上游阶段>_INTEGRATED
 INTEGRATION_LENGTH=K
 INTEGRATION_OPERATION=SUM 或 MEAN
-TSAMP_OUT=TSAMP_IN * K
+TSAMP=上游 TSAMP * K
 ```
 
 若上游已经做过积分，累计积分长度相乘：
@@ -464,8 +509,10 @@ TSAMP_OUT=TSAMP_IN * K
 TOTAL_INTEGRATION_LENGTH = upstream_total * K
 ```
 
-输出 `BYTES_PER_SECOND` 按 `1/K` 缩小，输出 `RESOLUTION` 使用一个完整输出时间帧
-的字节数。非整除 block 在第一版中直接报错，不能静默丢弃或补齐。
+输出 `BYTES_PER_SECOND` 按 `1/K` 缩小；存在时，`TRANSFER_SIZE`、`FILE_SIZE` 和
+`OBS_OFFSET` 也按 `1/K` 缩小，所有除法必须整除。输出 `RESOLUTION` 和
+`RECORD_BYTES` 使用一个完整输出时间帧的字节数。输入输出 buffer 不允许重叠；非整除
+block 在第一版中直接报错，不能静默丢弃或补齐。
 
 ## 13. `device_to_host`
 
@@ -535,7 +582,8 @@ worker；第一版 worker 不支持两个输出 ring。由于 `stokes` 输出已
 1. 读取 worker JSON。
 2. 连接一个 input HDU 和一个 output HDU。
 3. 根据 `output.product` 创建 `beamform`、`beamform+power` 或
-   `beamform+stokes` 模块链。
+   `beamform+stokes` 模块链；若启用积分，在 Power/Stokes 后追加
+   `time_integrate`。
 4. 读取并解析输入 header，得到 `Metadata H0` 和输入 `TensorSpec`。
 5. 依次调用模块的配置/规划接口，得到 `H1 ... Hout` 和每级 TensorSpec。
 6. 验证完整模块链、CUDA device、权重维度和每级 block bytes。
@@ -610,6 +658,7 @@ T = samples_per_udp * udp_packets_per_antenna_per_block
 input_block_bytes = T * TFPA_frame_bytes
 udp_antenna_group_bytes = udp_payload_bytes * A
 input_block_bytes % udp_antenna_group_bytes = 0
+product_block_bytes = T * selected_output_frame_bytes
 output_block_bytes = T * selected_output_frame_bytes
 ```
 
@@ -631,7 +680,7 @@ output_block_bytes = output_T * output_frame_bytes
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "rings": {
     "input_key": "dada",
     "output_key": "dadb"
@@ -659,13 +708,19 @@ output_block_bytes = output_T * output_frame_bytes
   },
   "output": {
     "product": "STOKES"
+  },
+  "integration": {
+    "enabled": true,
+    "length": 128,
+    "operation": "mean"
   }
 }
 ```
 
-这是已实现的 schema v1。它固定 Beamform 为首个算法，并用 `output.product` 选择
-无后处理、Power 或 Stokes。支持任意模块数组、积分参数和 GPU ring 的通用 schema
-需要在相应模块实现后升级 schema version，不能悄悄改变 v1 语义。
+这是已实现的 schema v2。它固定 Beamform 为首个算法，用 `output.product` 选择
+无后处理、Power 或 Stokes，并允许在 Power/Stokes 后追加积分。schema v1 仍以
+“积分关闭、K=1”兼容读取。支持任意模块数组和 GPU ring 的通用 schema 需要在相应
+模块实现后再次升级 schema version，不能悄悄改变 v2 语义。
 
 ## 18. 开发和测试要求
 

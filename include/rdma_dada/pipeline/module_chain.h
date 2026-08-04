@@ -18,7 +18,10 @@ struct ModuleChainPlan {
     Metadata output_header;
     std::uint64_t input_frame_bytes;
     std::uint64_t beamformed_frame_bytes;
+    std::uint64_t product_frame_bytes;
     std::uint64_t output_frame_bytes;
+    std::uint64_t integration_length;
+    bool integration_enabled;
     std::size_t module_count;
     MemoryLocation execution_location;
 };
@@ -36,10 +39,11 @@ public:
                           Metadata* ring_output_header);
 
     StageStatus PlanBlock(std::uint64_t input_bytes,
-                          std::uint64_t* beamformed_bytes,
+                          std::uint64_t* scratch_bytes,
                           std::uint64_t* output_bytes) const;
 
-    // scratch is required only when a post-beamforming module is enabled.
+    // scratch contains all intermediate buffers. With integration enabled it
+    // contains adjacent full-size beamformed and unintegrated product blocks.
     StageStatus ProcessBlock(const InputBlock& input, OutputBlock* output,
                              std::uint8_t* scratch,
                              std::uint64_t scratch_capacity,

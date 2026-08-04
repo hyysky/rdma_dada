@@ -59,6 +59,30 @@ bool WriteWeights(const std::string& path) {
     return output.good();
 }
 
+bool WriteLegacyWorkerConfig(const std::string& path,
+                             const std::string& weights_path) {
+    std::ofstream output(path.c_str(), std::ios::trunc);
+    if (!output) return false;
+    output
+        << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"rings\": {\"input_key\": \"dada\", "
+           "\"output_key\": \"dadb\"},\n"
+        << "  \"execution\": {\"backend\": \"CPU_REFERENCE\", "
+           "\"cuda_device\": 0, \"run_once\": true},\n"
+        << "  \"input_geometry\": {\"nchan\": 1, \"nant\": 2, "
+           "\"npol\": 2, \"udp_payload_bytes\": 16, "
+           "\"samples_per_udp\": 1, "
+           "\"udp_packets_per_antenna_per_block\": 1},\n"
+        << "  \"beamform\": {\"weights_file\": \"" << weights_path
+        << "\", \"weights_order\": \"FPAB2\", "
+           "\"weights_id\": \"legacy-v1\", \"weights_scale\": 1.0, "
+           "\"nbeam\": 1, \"compute_mode\": \"FP32\"},\n"
+        << "  \"output\": {\"product\": \"POWER\"}\n"
+        << "}\n";
+    return output.good();
+}
+
 rdma_dada::pipeline::Metadata MakeInputHeader() {
     rdma_dada::pipeline::Metadata header;
     header.SetString("DATA_STAGE", "CONVERTED");
@@ -76,6 +100,7 @@ rdma_dada::pipeline::Metadata MakeInputHeader() {
     header.SetUint64("TRANSFER_SIZE", 64);
     header.SetUint64("FILE_SIZE", 64);
     header.SetUint64("OBS_OFFSET", 32);
+    header.SetDouble("TSAMP", 1.0);
     return header;
 }
 
@@ -101,6 +126,9 @@ rdma_dada::pipeline::WorkerConfig MakeConfig(const std::string& weights_path) {
     config.nbeam = 1;
     config.compute_mode = "FP32";
     config.product = rdma_dada::pipeline::WorkerProduct::kBeamformed;
+    config.integration_enabled = false;
+    config.integration_length = 1;
+    config.integration_operation = "MEAN";
     return config;
 }
 
@@ -116,6 +144,9 @@ void TestConfigAndAsciiCodec(const std::string& config_path) {
            "execution settings are parsed");
     Expect(config.product == rdma_dada::pipeline::WorkerProduct::kPower,
            "output product is parsed");
+    Expect(config.integration_enabled && config.integration_length == 128 &&
+               config.integration_operation == "MEAN",
+           "time integration settings are parsed from schema v2");
     Expect(EndsWith(config.weights_file,
                     "config/weights/beamform_weights.npy"),
            "relative weight path is resolved from the JSON directory");
@@ -131,8 +162,13 @@ void TestConfigAndAsciiCodec(const std::string& config_path) {
                geometry.input_block_bytes == UINT64_C(134217728),
            "CF32 TFPA input block is computed from F*A*P*T");
     Expect(geometry.beamformed_block_bytes == UINT64_C(67108864) &&
-               geometry.output_block_bytes == UINT64_C(33554432),
-           "beamformed and power output blocks are derived from T");
+               geometry.product_block_bytes == UINT64_C(33554432),
+           "beamformed and unintegrated power blocks are derived from T");
+    Expect(geometry.output_ntime == UINT64_C(16384) &&
+               geometry.output_block_bytes == UINT64_C(262144),
+           "integration shortens T and final output block by K");
+    Expect(geometry.scratch_block_bytes == UINT64_C(100663296),
+           "integrated power chain scratch holds beamformed and product blocks");
 
     const char input[] =
         "HDR_SIZE 4096\n"
@@ -161,6 +197,17 @@ void TestConfigAndAsciiCodec(const std::string& config_path) {
     Expect(!rdma_dada::pipeline::ParseAsciiMetadata(
                duplicate, sizeof(duplicate), &roundtrip, &error),
            "duplicate header fields are rejected");
+}
+
+void TestLegacyConfigDefaults(const std::string& config_path) {
+    rdma_dada::pipeline::WorkerConfig config;
+    std::string error;
+    Expect(rdma_dada::pipeline::LoadWorkerConfig(
+               config_path, &config, &error),
+           "schema v1 worker JSON remains readable: " + error);
+    Expect(!config.integration_enabled && config.integration_length == 1 &&
+               config.integration_operation == "MEAN",
+           "schema v1 defaults to disabled time integration");
 }
 
 void TestModuleChain(const std::string& weights_path) {
@@ -301,6 +348,176 @@ void TestModuleChain(const std::string& weights_path) {
     Expect(!status.ok(), "unknown output product enum is rejected");
 }
 
+void TestIntegratedModuleChain(const std::string& weights_path) {
+    typedef rdma_dada::pipeline::Complex32 Complex32;
+    const Complex32 input_data[] = {
+        {1.0f, 0.0f}, {1.0f, 0.0f},
+        {2.0f, 0.0f}, {2.0f, 0.0f},
+        {2.0f, 0.0f}, {2.0f, 0.0f},
+        {3.0f, 0.0f}, {3.0f, 0.0f},
+        {3.0f, 0.0f}, {3.0f, 0.0f},
+        {4.0f, 0.0f}, {4.0f, 0.0f},
+        {4.0f, 0.0f}, {4.0f, 0.0f},
+        {5.0f, 0.0f}, {5.0f, 0.0f}
+    };
+    rdma_dada::pipeline::Metadata input_header = MakeInputHeader();
+    input_header.SetUint64("TRANSFER_SIZE", sizeof(input_data));
+    input_header.SetUint64("FILE_SIZE", sizeof(input_data));
+    input_header.SetUint64("OBS_OFFSET", 0);
+
+    rdma_dada::pipeline::WorkerConfig config = MakeConfig(weights_path);
+    config.product = rdma_dada::pipeline::WorkerProduct::kPower;
+    config.udp_packets_per_antenna_per_block = 4;
+    config.integration_enabled = true;
+    config.integration_length = 2;
+    config.integration_operation = "MEAN";
+
+    rdma_dada::pipeline::ModuleChain chain;
+    rdma_dada::pipeline::Metadata output_header;
+    rdma_dada::pipeline::StageStatus status =
+        chain.Configure(input_header, config, &output_header);
+    Expect(status.ok(),
+           "beamform+power+integration chain configures: " +
+               status.message());
+    if (!status.ok()) return;
+
+    std::string text;
+    std::uint64_t number = 0;
+    Expect(output_header.GetString("PIPELINE_MODULES", &text) &&
+               text == "beamform,power,time_integrate",
+           "output header records integration module");
+    Expect(output_header.GetUint64("INTEGRATION_LENGTH", &number) &&
+               number == 2,
+           "chain publishes integration length");
+    Expect(output_header.GetUint64("BLOCK_NTIME", &number) && number == 2,
+           "chain publishes integrated output T");
+    Expect(output_header.GetUint64("INPUT_BLOCK_NTIME", &number) &&
+               number == 4,
+           "chain preserves input block T");
+    Expect(output_header.GetUint64("OUTPUT_BLOCK_BYTES", &number) &&
+               number == 16,
+           "chain publishes integrated output block bytes");
+
+    std::uint64_t scratch_bytes = 0;
+    std::uint64_t output_bytes = 0;
+    status = chain.PlanBlock(
+        sizeof(input_data), &scratch_bytes, &output_bytes);
+    Expect(status.ok(), "integrated chain plans one input block");
+    Expect(scratch_bytes == 96,
+           "integrated chain scratch holds beamformed and power blocks");
+    Expect(output_bytes == 16, "integrated chain output is reduced by K");
+
+    std::uint8_t scratch[96] = {};
+    float output_data[4] = {};
+    const rdma_dada::pipeline::InputBlock input = {
+        reinterpret_cast<const std::uint8_t*>(input_data),
+        sizeof(input_data), 121,
+        rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    rdma_dada::pipeline::OutputBlock output = {
+        reinterpret_cast<std::uint8_t*>(output_data), sizeof(output_data),
+        0, 0, rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    const rdma_dada::pipeline::BlockExecutionContext context = {
+        rdma_dada::pipeline::ExecutionBackend::kHost, -1, NULL
+    };
+    status = chain.ProcessBlock(
+        input, &output, scratch, sizeof(scratch), context);
+    Expect(status.ok(), "integrated chain processes one block");
+    if (!status.ok()) std::cerr << status.message() << '\n';
+    const float expected[] = {10.0f, 26.0f, 50.0f, 82.0f};
+    for (std::size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        ExpectNear(output_data[i], expected[i],
+                   "known beamform+power+mean value");
+    }
+    Expect(output.size == sizeof(output_data),
+           "integrated chain reports final output size");
+    Expect(output.sequence == 121,
+           "integrated chain preserves block sequence");
+
+    rdma_dada::pipeline::WorkerConfig invalid_config = config;
+    invalid_config.udp_packets_per_antenna_per_block = 3;
+    rdma_dada::pipeline::WorkerBlockGeometry invalid_geometry;
+    std::string geometry_error;
+    Expect(!rdma_dada::pipeline::ComputeWorkerBlockGeometry(
+               invalid_config, &invalid_geometry, &geometry_error),
+           "worker geometry rejects T not divisible by integration length");
+
+    invalid_config = config;
+    invalid_config.product = rdma_dada::pipeline::WorkerProduct::kBeamformed;
+    Expect(!rdma_dada::pipeline::ComputeWorkerBlockGeometry(
+               invalid_config, &invalid_geometry, &geometry_error),
+           "worker geometry rejects integration before power or Stokes");
+}
+
+void TestIntegratedStokesChain(const std::string& weights_path) {
+    typedef rdma_dada::pipeline::Complex32 Complex32;
+    const Complex32 input_data[] = {
+        {1.0f, 0.0f}, {1.0f, 0.0f},
+        {2.0f, 0.0f}, {2.0f, 0.0f},
+        {3.0f, 0.0f}, {3.0f, 0.0f},
+        {4.0f, 0.0f}, {4.0f, 0.0f}
+    };
+    rdma_dada::pipeline::Metadata input_header = MakeInputHeader();
+    input_header.SetUint64("TRANSFER_SIZE", sizeof(input_data));
+    input_header.SetUint64("FILE_SIZE", sizeof(input_data));
+    input_header.SetUint64("OBS_OFFSET", 0);
+
+    rdma_dada::pipeline::WorkerConfig config = MakeConfig(weights_path);
+    config.product = rdma_dada::pipeline::WorkerProduct::kStokes;
+    config.udp_packets_per_antenna_per_block = 2;
+    config.integration_enabled = true;
+    config.integration_length = 2;
+    config.integration_operation = "SUM";
+
+    rdma_dada::pipeline::ModuleChain chain;
+    rdma_dada::pipeline::Metadata output_header;
+    rdma_dada::pipeline::StageStatus status =
+        chain.Configure(input_header, config, &output_header);
+    Expect(status.ok(),
+           "beamform+Stokes+integration chain configures: " +
+               status.message());
+    if (!status.ok()) return;
+
+    std::uint64_t number = 0;
+    double decimal = 0.0;
+    Expect(output_header.GetUint64("BYTES_PER_SECOND", &number) &&
+               number == 800,
+           "Stokes integration scales output byte rate by K");
+    Expect(output_header.GetDouble("TSAMP", &decimal) && decimal == 2.0,
+           "Stokes integration scales output sample interval by K");
+
+    std::uint64_t scratch_bytes = 0;
+    std::uint64_t output_bytes = 0;
+    status = chain.PlanBlock(
+        sizeof(input_data), &scratch_bytes, &output_bytes);
+    Expect(status.ok() && scratch_bytes == 64 && output_bytes == 16,
+           "integrated Stokes chain plans beamformed/product scratch");
+
+    std::uint8_t scratch[64] = {};
+    float output_data[4] = {};
+    const rdma_dada::pipeline::InputBlock input = {
+        reinterpret_cast<const std::uint8_t*>(input_data),
+        sizeof(input_data), 122,
+        rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    rdma_dada::pipeline::OutputBlock output = {
+        reinterpret_cast<std::uint8_t*>(output_data), sizeof(output_data),
+        0, 0, rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    const rdma_dada::pipeline::BlockExecutionContext context = {
+        rdma_dada::pipeline::ExecutionBackend::kHost, -1, NULL
+    };
+    status = chain.ProcessBlock(
+        input, &output, scratch, sizeof(scratch), context);
+    Expect(status.ok(), "integrated Stokes chain processes one block");
+    const float expected[] = {40.0f, 80.0f, 56.0f, 0.0f};
+    for (std::size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        ExpectNear(output_data[i], expected[i],
+                   "known beamform+Stokes+sum value");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -313,7 +530,17 @@ int main(int argc, char** argv) {
         std::cerr << "failed to create worker test NPY file\n";
         return 2;
     }
+    const std::string legacy_config_path = std::string(argv[2]) + ".json";
+    if (!WriteLegacyWorkerConfig(legacy_config_path, argv[2])) {
+        std::cerr << "failed to create schema v1 worker config\n";
+        std::remove(argv[2]);
+        return 2;
+    }
+    TestLegacyConfigDefaults(legacy_config_path);
     TestModuleChain(argv[2]);
+    TestIntegratedModuleChain(argv[2]);
+    TestIntegratedStokesChain(argv[2]);
+    std::remove(legacy_config_path.c_str());
     std::remove(argv[2]);
     if (failures != 0) return 1;
     std::cout << "pipeline_worker_core_test passed\n";

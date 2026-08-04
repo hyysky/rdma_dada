@@ -14,6 +14,16 @@ namespace {
 
 int failures = 0;
 
+void PrintUsage(std::ostream& output, const char* program) {
+    output << "Usage: " << program << " [OPTIONS]\n"
+           << "Run the CUDA host-to-device-to-host round-trip test on CUDA "
+              "device 0.\n\n"
+           << "Options:\n"
+           << "  -h, --help  Show this help message\n\n"
+           << "Exit codes: 0=passed/help, 1=failed, 2=invalid usage, "
+              "77=no CUDA device\n";
+}
+
 void Expect(bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -30,7 +40,18 @@ void ExpectString(const rdma_dada::pipeline::Metadata& metadata,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 &&
+        (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+        PrintUsage(std::cout, argv[0]);
+        return 0;
+    }
+    if (argc != 1) {
+        std::cerr << "Error: unexpected command-line argument\n";
+        PrintUsage(std::cerr, argv[0]);
+        return 2;
+    }
+
     int device_count = 0;
     const cudaError_t count_status = cudaGetDeviceCount(&device_count);
     if (count_status != cudaSuccess || device_count == 0) {

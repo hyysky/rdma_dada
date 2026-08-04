@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "rings": {
     "input_key": "dada",
     "output_key": "dadb"
@@ -27,5 +27,10 @@
   },
   "output": {
     "product": "POWER"
+  },
+  "integration": {
+    "enabled": true,
+    "length": 128,
+    "operation": "mean"
   }
 }

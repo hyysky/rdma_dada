@@ -30,6 +30,17 @@ bool CheckedMultiply(std::uint64_t left, std::uint64_t right,
     return true;
 }
 
+bool CheckedAdd(std::uint64_t left, std::uint64_t right,
+                const std::string& name, std::uint64_t* result,
+                std::string* error) {
+    if (!result) return Fail(name + " output pointer is null", error);
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        return Fail(name + " exceeds uint64 range", error);
+    }
+    *result = left + right;
+    return true;
+}
+
 bool RequireObject(const json::Value& value, const std::string& path,
                    const json::Value::Object** object, std::string* error) {
     if (value.type() != json::Value::kObject) {
@@ -166,18 +177,36 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     if (!json::Parse(contents.str(), &root, error)) return false;
     const json::Value::Object* root_object = NULL;
     if (!RequireObject(root, "root", &root_object, error)) return false;
-    static const char* const root_keys[] = {
+    static const char* const root_keys_v1[] = {
         "schema_version", "rings", "execution", "input_geometry",
         "beamform", "output"
     };
-    if (!RequireExactKeys(*root_object, root_keys,
-                          sizeof(root_keys) / sizeof(root_keys[0]),
-                          "root", error)) return false;
+    static const char* const root_keys_v2[] = {
+        "schema_version", "rings", "execution", "input_geometry",
+        "beamform", "output", "integration"
+    };
 
     std::uint64_t schema_version = 0;
+    if (root_object->count("schema_version") == 0U) {
+        return Fail("root is missing required field: schema_version", error);
+    }
     if (!ParseUint64("root.schema_version", Field(*root_object, "schema_version"),
                      &schema_version, error)) return false;
-    if (schema_version != 1) {
+    if (schema_version == 1) {
+        if (!RequireExactKeys(
+                *root_object, root_keys_v1,
+                sizeof(root_keys_v1) / sizeof(root_keys_v1[0]),
+                "root", error)) {
+            return false;
+        }
+    } else if (schema_version == 2) {
+        if (!RequireExactKeys(
+                *root_object, root_keys_v2,
+                sizeof(root_keys_v2) / sizeof(root_keys_v2[0]),
+                "root", error)) {
+            return false;
+        }
+    } else {
         return Fail("unsupported worker schema_version", error);
     }
 
@@ -186,6 +215,7 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     const json::Value::Object* input_geometry = NULL;
     const json::Value::Object* beamform = NULL;
     const json::Value::Object* output = NULL;
+    const json::Value::Object* integration = NULL;
     if (!RequireObject(Field(*root_object, "rings"), "rings", &rings, error) ||
         !RequireObject(Field(*root_object, "execution"), "execution",
                        &execution, error) ||
@@ -195,6 +225,11 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                        &beamform, error) ||
         !RequireObject(Field(*root_object, "output"), "output", &output,
                        error)) {
+        return false;
+    }
+    if (schema_version == 2 &&
+        !RequireObject(Field(*root_object, "integration"), "integration",
+                       &integration, error)) {
         return false;
     }
 
@@ -211,6 +246,9 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
         "nbeam", "compute_mode"
     };
     static const char* const output_keys[] = {"product"};
+    static const char* const integration_keys[] = {
+        "enabled", "length", "operation"
+    };
     if (!RequireExactKeys(*rings, ring_keys,
                           sizeof(ring_keys) / sizeof(ring_keys[0]),
                           "rings", error) ||
@@ -229,9 +267,19 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                           "output", error)) {
         return false;
     }
+    if (schema_version == 2 &&
+        !RequireExactKeys(
+            *integration, integration_keys,
+            sizeof(integration_keys) / sizeof(integration_keys[0]),
+            "integration", error)) {
+        return false;
+    }
 
     WorkerConfig parsed = WorkerConfig();
     parsed.cuda_device = -1;
+    parsed.integration_enabled = false;
+    parsed.integration_length = 1;
+    parsed.integration_operation = "MEAN";
     std::uint64_t cuda_device = 0;
     std::uint64_t nbeam = 0;
     std::string product;
@@ -320,6 +368,35 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                     error);
     }
 
+    if (schema_version == 2) {
+        std::string integration_operation;
+        if (!ReadBool(*integration, "enabled", "integration",
+                      &parsed.integration_enabled, error) ||
+            !ParseUint64("integration.length",
+                         Field(*integration, "length"),
+                         &parsed.integration_length, error) ||
+            !ReadString(*integration, "operation", "integration",
+                        &integration_operation, error)) {
+            return false;
+        }
+        if (parsed.integration_length == 0) {
+            return Fail("integration.length must be greater than zero", error);
+        }
+        if (integration_operation == "sum") {
+            parsed.integration_operation = "SUM";
+        } else if (integration_operation == "mean") {
+            parsed.integration_operation = "MEAN";
+        } else {
+            return Fail("integration.operation must be sum or mean", error);
+        }
+        if (parsed.integration_enabled &&
+            parsed.product == WorkerProduct::kBeamformed) {
+            return Fail(
+                "time integration requires output.product POWER or STOKES",
+                error);
+        }
+    }
+
     parsed.weights_file = ResolveRelativePath(path, parsed.weights_file);
     WorkerBlockGeometry geometry;
     if (!ComputeWorkerBlockGeometry(parsed, &geometry, error)) return false;
@@ -346,6 +423,19 @@ bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
     if (config.product == WorkerProduct::kStokes && config.npol != 2) {
         return Fail("STOKES block geometry requires input_geometry.npol=2",
                     error);
+    }
+    if (config.integration_enabled) {
+        if (config.product == WorkerProduct::kBeamformed) {
+            return Fail(
+                "time integration requires POWER or STOKES product", error);
+        }
+        if (config.integration_length == 0) {
+            return Fail("integration length must be greater than zero", error);
+        }
+        if (config.integration_operation != "SUM" &&
+            config.integration_operation != "MEAN") {
+            return Fail("integration operation must be SUM or MEAN", error);
+        }
     }
 
     WorkerBlockGeometry result = WorkerBlockGeometry();
@@ -422,9 +512,30 @@ bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
             return Fail("unsupported worker output product", error);
     }
     if (!CheckedMultiply(result.output_frame_bytes, result.ntime,
-                         "output block bytes", &result.output_block_bytes,
+                         "unintegrated product block bytes",
+                         &result.product_block_bytes,
                          error)) {
         return false;
+    }
+    result.output_ntime = result.ntime;
+    result.output_block_bytes = result.product_block_bytes;
+    result.scratch_block_bytes =
+        config.product == WorkerProduct::kBeamformed ?
+            0 : result.beamformed_block_bytes;
+    if (config.integration_enabled) {
+        if (result.ntime % config.integration_length != 0) {
+            return Fail(
+                "block T must be divisible by integration length", error);
+        }
+        result.output_ntime = result.ntime / config.integration_length;
+        result.output_block_bytes =
+            result.product_block_bytes / config.integration_length;
+        if (!CheckedAdd(result.beamformed_block_bytes,
+                        result.product_block_bytes,
+                        "integrated chain scratch block bytes",
+                        &result.scratch_block_bytes, error)) {
+            return false;
+        }
     }
     *geometry = result;
     return true;

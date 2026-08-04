@@ -13,6 +13,19 @@ namespace {
 
 int failures = 0;
 
+void PrintUsage(std::ostream& output, const char* program) {
+    output << "Usage: " << program << " WEIGHTS_PATH FP32|TF32\n"
+           << "Run the CUDA beamforming correctness test on CUDA device 0.\n\n"
+           << "Arguments:\n"
+           << "  WEIGHTS_PATH  Existing NPY fixture, or a writable path where\n"
+           << "                the test may create a temporary fixture\n"
+           << "  FP32|TF32     cuBLAS compute mode to validate\n\n"
+           << "Options:\n"
+           << "  -h, --help    Show this help message\n\n"
+           << "Exit codes: 0=passed/help, 1=failed, 2=invalid usage, "
+              "77=no CUDA device\n";
+}
+
 void Expect(bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -54,11 +67,21 @@ bool WriteInt8Weights(const std::string& path) {
     return output.good();
 }
 
+bool FileExists(const std::string& path) {
+    std::ifstream input(path.c_str(), std::ios::binary);
+    return input.good();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 &&
+        (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+        PrintUsage(std::cout, argv[0]);
+        return 0;
+    }
     if (argc != 3) {
-        std::cerr << "usage: beamform_cuda_test WEIGHTS_PATH FP32|TF32\n";
+        PrintUsage(std::cerr, argv[0]);
         return 2;
     }
 
@@ -75,7 +98,8 @@ int main(int argc, char** argv) {
         std::cerr << "compute mode must be FP32 or TF32\n";
         return 2;
     }
-    if (!WriteInt8Weights(weights_path)) {
+    const bool created_weights = !FileExists(weights_path);
+    if (created_weights && !WriteInt8Weights(weights_path)) {
         std::cerr << "failed to create test NPY file\n";
         return 2;
     }
@@ -106,7 +130,7 @@ int main(int argc, char** argv) {
     Expect(status.ok(), "CUDA backend configures with requested compute mode");
     if (!status.ok()) {
         std::cerr << status.message() << '\n';
-        std::remove(weights_path.c_str());
+        if (created_weights) std::remove(weights_path.c_str());
         return 1;
     }
 
@@ -138,7 +162,7 @@ int main(int argc, char** argv) {
         if (device_input) cudaFree(device_input);
         if (device_output) cudaFree(device_output);
         if (stream) cudaStreamDestroy(stream);
-        std::remove(weights_path.c_str());
+        if (created_weights) std::remove(weights_path.c_str());
         return 1;
     }
 
@@ -192,7 +216,7 @@ int main(int argc, char** argv) {
     cudaFree(device_input);
     cudaFree(device_output);
     cudaStreamDestroy(stream);
-    std::remove(weights_path.c_str());
+    if (created_weights) std::remove(weights_path.c_str());
 
     if (failures != 0) return 1;
     std::cout << "beamform_cuda_test passed\n";

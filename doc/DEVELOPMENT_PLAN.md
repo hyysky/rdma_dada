@@ -14,12 +14,17 @@
 - JSON 配置、DADA ASCII header、block view 和模块接口；
 - Beamform、Power、Stokes 的 CPU reference backend；
 - Beamform、Power、Stokes 的 CUDA backend 源码；
+- Complex Convert 的 CI8/CI16 CPU reference 和异步 CUDA backend；
+- Time Integration 的 CPU reference 和 CUDA backend 源码，支持 SUM/MEAN、TFPB/TFBS；
 - 无 buffer 所有权的 H2D/D2H CUDA 传输模块；
 - 双 host ring `pipeline_worker`，支持 Beamform、Beamform→Power、
-  Beamform→Stokes 三条固定链；
-- 10 项 macOS portable CTest，以及 CUDA 算法和 H2D→D2H round-trip 测试源码。
+  Beamform→Stokes 三条固定链，并可在 Power/Stokes 后追加积分；
+- macOS portable CTest，以及 CUDA 算法和 H2D→D2H round-trip 测试源码。
 
-CUDA、PSRDADA、RDMA 数据面仍需要在目标 Linux/RTX 4090 服务器验证。
+Beamform FP32/TF32、Power、Stokes、Time Integration、Complex Convert 和 H2D/D2H
+的独立 CUDA correctness test 已在目标服务器通过。完整的
+H2D→Beamform→Power→TimeIntegrate→D2H CUDA worker 组合链也已通过。PSRDADA 双 ring、
+RDMA 数据面和性能仍需要在目标 Linux/RTX 3090 服务器验证。
 
 ## 每个模块的输入输出门禁
 
@@ -65,7 +70,7 @@ CUDA、PSRDADA、RDMA 数据面仍需要在目标 Linux/RTX 4090 服务器验证
 
 目标：在开发新算法前，确认当前 CUDA、PSRDADA 和 RDMA 基线可靠。
 
-- 使用 CUDA 12.8、RTX 4090 编译全部 CUDA targets；
+- 使用 CUDA 12.8、RTX 3090（compute capability 8.6）编译全部 CUDA targets；
 - 运行 Beamform FP32/TF32、Power、Stokes、H2D→D2H 测试；
 - 比较 CUDA 和 CPU reference 的数值与允许误差；
 - 创建两个测试 ring，分别验证 CPU 和 CUDA `pipeline_worker`；
@@ -80,6 +85,10 @@ CUDA、PSRDADA、RDMA 数据面仍需要在目标 Linux/RTX 4090 服务器验证
 
 目标：将当前 worker 的输入边界从 `CONVERTED/TFPA/CF32` 前移到 raw packet ring。
 
+状态：CI8/CI16 的 CPU reference、CUDA backend、header/frame 几何和独立测试已完成；
+payload order、64-byte application header 字段、丢包策略和 worker 前段串联等待前端格式
+固化后继续。
+
 - 固化实际 payload order 和包头字段；
 - 实现 64-byte application header 校验、序号检查、去头和 TFPA 重排；
 - 定义丢包、乱序、重复包和跨 block 包组处理规则；
@@ -93,6 +102,10 @@ CUDA、PSRDADA、RDMA 数据面仍需要在目标 Linux/RTX 4090 服务器验证
 ## Milestone 3：时间积分模块
 
 目标：在 Power 或 Stokes 之后提供独立、可配置的 block-local integration。
+
+状态：CPU reference、CUDA kernel、schema v2、worker 串联、header/block 几何和便携
+测试已完成，独立 CUDA integration test 已通过；完整 CUDA worker 组合链及真实双 ring
+生命周期仍待目标服务器验证。
 
 - 支持 `sum` 和 `mean`；
 - 定义 `INTEGRATION_LENGTH`、累计 dtype 和溢出策略；

@@ -37,6 +37,10 @@ struct WorkerConfig {
     std::string compute_mode;
 
     WorkerProduct product;
+
+    bool integration_enabled;
+    std::uint64_t integration_length;
+    std::string integration_operation;
 };
 
 struct WorkerBlockGeometry {
@@ -48,14 +52,18 @@ struct WorkerBlockGeometry {
     std::uint64_t beamformed_frame_bytes;
     std::uint64_t beamformed_block_bytes;
     std::uint64_t output_frame_bytes;
+    std::uint64_t product_block_bytes;
+    std::uint64_t output_ntime;
     std::uint64_t output_block_bytes;
+    std::uint64_t scratch_block_bytes;
 };
 
 bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                       std::string* error);
 
 // Compute full-block geometry from F/A/P, UDP grouping, CF32 input and the
-// configured Beamform/Power/Stokes product. No ring needs to exist yet.
+// configured Beamform/Power/Stokes product and optional time integration.
+// product_block_bytes is before integration; output_block_bytes is final.
 bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
                                 WorkerBlockGeometry* geometry,
                                 std::string* error);

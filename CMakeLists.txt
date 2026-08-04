@@ -26,7 +26,7 @@ option(USE_CUDA
 
 if(USE_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING
             "CUDA architectures for GPU algorithm modules")
     endif()
     enable_language(CUDA)
@@ -69,6 +69,23 @@ if(USE_CUDA)
         CUDA::cublas)
 endif()
 
+add_library(rdma_module_complex_convert STATIC
+    modules/complex_convert/complex_convert_module.cpp)
+target_include_directories(rdma_module_complex_convert
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rdma_module_complex_convert PUBLIC rdma_pipeline_core)
+if(USE_CUDA)
+    target_sources(rdma_module_complex_convert PRIVATE
+        modules/complex_convert/complex_convert_cuda_backend.cu)
+    target_compile_definitions(rdma_module_complex_convert PRIVATE
+        RDMA_DADA_HAVE_CUDA=1)
+    set_target_properties(rdma_module_complex_convert PROPERTIES
+        CUDA_STANDARD 11
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(rdma_module_complex_convert PRIVATE CUDA::cudart)
+endif()
+
 add_library(rdma_module_power STATIC
     modules/power/power_module.cpp)
 target_include_directories(rdma_module_power
@@ -103,6 +120,23 @@ if(USE_CUDA)
     target_link_libraries(rdma_module_stokes PRIVATE CUDA::cudart)
 endif()
 
+add_library(rdma_module_time_integrate STATIC
+    modules/time_integrate/time_integrate_module.cpp)
+target_include_directories(rdma_module_time_integrate
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rdma_module_time_integrate PUBLIC rdma_pipeline_core)
+if(USE_CUDA)
+    target_sources(rdma_module_time_integrate PRIVATE
+        modules/time_integrate/time_integrate_cuda_backend.cu)
+    target_compile_definitions(rdma_module_time_integrate PRIVATE
+        RDMA_DADA_HAVE_CUDA=1)
+    set_target_properties(rdma_module_time_integrate PROPERTIES
+        CUDA_STANDARD 11
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(rdma_module_time_integrate PRIVATE CUDA::cudart)
+endif()
+
 add_library(rdma_module_transfer STATIC
     modules/host_to_device/host_to_device_module.cpp
     modules/device_to_host/device_to_host_module.cpp)
@@ -131,7 +165,8 @@ target_link_libraries(rdma_pipeline_worker_core
         rdma_pipeline_core
         rdma_module_beamform
         rdma_module_power
-        rdma_module_stokes)
+        rdma_module_stokes
+        rdma_module_time_integrate)
 
 add_executable(pipeline_config_inspect tools/pipeline_config_inspect.cpp)
 target_link_libraries(pipeline_config_inspect PRIVATE rdma_pipeline_config)
@@ -148,10 +183,18 @@ if(BUILD_TESTING)
     target_link_libraries(pipeline_core_test PRIVATE rdma_pipeline_core)
     add_executable(beamform_module_test tests/beamform_module_test.cpp)
     target_link_libraries(beamform_module_test PRIVATE rdma_module_beamform)
+    add_executable(complex_convert_module_test
+        tests/complex_convert_module_test.cpp)
+    target_link_libraries(complex_convert_module_test PRIVATE
+        rdma_module_complex_convert)
     add_executable(power_module_test tests/power_module_test.cpp)
     target_link_libraries(power_module_test PRIVATE rdma_module_power)
     add_executable(stokes_module_test tests/stokes_module_test.cpp)
     target_link_libraries(stokes_module_test PRIVATE rdma_module_stokes)
+    add_executable(time_integrate_module_test
+        tests/time_integrate_module_test.cpp)
+    target_link_libraries(time_integrate_module_test PRIVATE
+        rdma_module_time_integrate)
     add_executable(pipeline_worker_core_test
         tests/pipeline_worker_core_test.cpp)
     target_link_libraries(pipeline_worker_core_test
@@ -161,6 +204,11 @@ if(BUILD_TESTING)
         target_link_libraries(beamform_cuda_test PRIVATE
             rdma_module_beamform
             CUDA::cudart)
+        add_executable(complex_convert_cuda_test
+            tests/complex_convert_cuda_test.cpp)
+        target_link_libraries(complex_convert_cuda_test PRIVATE
+            rdma_module_complex_convert
+            CUDA::cudart)
         add_executable(power_cuda_test tests/power_cuda_test.cpp)
         target_link_libraries(power_cuda_test PRIVATE
             rdma_module_power
@@ -169,9 +217,20 @@ if(BUILD_TESTING)
         target_link_libraries(stokes_cuda_test PRIVATE
             rdma_module_stokes
             CUDA::cudart)
+        add_executable(time_integrate_cuda_test
+            tests/time_integrate_cuda_test.cpp)
+        target_link_libraries(time_integrate_cuda_test PRIVATE
+            rdma_module_time_integrate
+            CUDA::cudart)
         add_executable(transfer_cuda_roundtrip_test
             tests/transfer_cuda_roundtrip_test.cpp)
         target_link_libraries(transfer_cuda_roundtrip_test PRIVATE
+            rdma_module_transfer
+            CUDA::cudart)
+        add_executable(pipeline_worker_cuda_chain_test
+            tests/pipeline_worker_cuda_chain_test.cpp)
+        target_link_libraries(pipeline_worker_cuda_chain_test PRIVATE
+            rdma_pipeline_worker_core
             rdma_module_transfer
             CUDA::cudart)
     endif()
@@ -202,14 +261,23 @@ if(BUILD_TESTING)
                     $<TARGET_FILE:pipeline_config_inspect>
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.conf
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
+        add_test(
+            NAME beamform_test_weights_generator_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/beamform_test_weights_generator_test.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_beamform_test_weights.py)
     endif()
     add_test(NAME pipeline_core_test COMMAND pipeline_core_test)
     add_test(
         NAME beamform_module_test
         COMMAND beamform_module_test
                 ${CMAKE_CURRENT_BINARY_DIR}/beamform_test_weights.npy)
+    add_test(
+        NAME complex_convert_module_test
+        COMMAND complex_convert_module_test)
     add_test(NAME power_module_test COMMAND power_module_test)
     add_test(NAME stokes_module_test COMMAND stokes_module_test)
+    add_test(NAME time_integrate_module_test COMMAND time_integrate_module_test)
     add_test(
         NAME pipeline_worker_core_test
         COMMAND pipeline_worker_core_test
@@ -226,17 +294,50 @@ if(BUILD_TESTING)
             COMMAND beamform_cuda_test
                     ${CMAKE_CURRENT_BINARY_DIR}/beamform_cuda_tf32_weights.npy
                     TF32)
+        add_test(
+            NAME complex_convert_cuda_test
+            COMMAND complex_convert_cuda_test)
         add_test(NAME power_cuda_test COMMAND power_cuda_test)
         add_test(NAME stokes_cuda_test COMMAND stokes_cuda_test)
+        add_test(NAME time_integrate_cuda_test COMMAND time_integrate_cuda_test)
         add_test(
             NAME transfer_cuda_roundtrip_test
             COMMAND transfer_cuda_roundtrip_test)
+        add_test(
+            NAME pipeline_worker_cuda_chain_test
+            COMMAND pipeline_worker_cuda_chain_test
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/beamform_cuda_weights_f2_p1_a2_b2_i8.npy)
+        add_test(
+            NAME complex_convert_cuda_help_test
+            COMMAND complex_convert_cuda_test -h)
+        add_test(NAME beamform_cuda_help_test COMMAND beamform_cuda_test -h)
+        add_test(NAME power_cuda_help_test COMMAND power_cuda_test -h)
+        add_test(NAME stokes_cuda_help_test COMMAND stokes_cuda_test -h)
+        add_test(
+            NAME time_integrate_cuda_help_test
+            COMMAND time_integrate_cuda_test -h)
+        add_test(
+            NAME transfer_cuda_roundtrip_help_test
+            COMMAND transfer_cuda_roundtrip_test -h)
+        add_test(
+            NAME pipeline_worker_cuda_chain_help_test
+            COMMAND pipeline_worker_cuda_chain_test -h)
         set_tests_properties(
             beamform_cuda_fp32_test
             beamform_cuda_tf32_test
+            complex_convert_cuda_test
             power_cuda_test
             stokes_cuda_test
+            time_integrate_cuda_test
             transfer_cuda_roundtrip_test
+            pipeline_worker_cuda_chain_test
+            complex_convert_cuda_help_test
+            beamform_cuda_help_test
+            power_cuda_help_test
+            stokes_cuda_help_test
+            time_integrate_cuda_help_test
+            transfer_cuda_roundtrip_help_test
+            pipeline_worker_cuda_chain_help_test
             PROPERTIES
             LABELS "cuda"
             SKIP_RETURN_CODE 77)

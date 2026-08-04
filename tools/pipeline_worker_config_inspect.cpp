@@ -41,9 +41,16 @@ int main(int argc, char** argv) {
         << geometry.beamformed_frame_bytes << '\n'
         << "BEAMFORMED_BLOCK_BYTES="
         << geometry.beamformed_block_bytes << '\n'
+        << "INTEGRATION_ENABLED="
+        << (config.integration_enabled ? "true" : "false") << '\n'
+        << "INTEGRATION_LENGTH=" << config.integration_length << '\n'
+        << "INTEGRATION_OPERATION=" << config.integration_operation << '\n'
         << "OUTPUT_PRODUCT="
         << rdma_dada::pipeline::WorkerProductName(config.product) << '\n'
         << "OUTPUT_FRAME_BYTES=" << geometry.output_frame_bytes << '\n'
-        << "OUTPUT_BLOCK_BYTES=" << geometry.output_block_bytes << '\n';
+        << "PRODUCT_BLOCK_BYTES=" << geometry.product_block_bytes << '\n'
+        << "OUTPUT_BLOCK_NTIME=" << geometry.output_ntime << '\n'
+        << "OUTPUT_BLOCK_BYTES=" << geometry.output_block_bytes << '\n'
+        << "SCRATCH_BLOCK_BYTES=" << geometry.scratch_block_bytes << '\n';
     return EXIT_SUCCESS;
 }

@@ -18,14 +18,15 @@
 | `STOKES` | Beamform → Stokes | `TFBS/F32`，产物顺序为 `AA,BB,AB_REAL,AB_IMAG` |
 
 Power 和 Stokes 是互斥的兄弟分支，不会串联。Stokes 要求 `NPOL=2` 和两个明确的
-`POL_LABELS`。积分模块尚未接入。
+`POL_LABELS`。`integration.enabled=true` 时，Power 或 Stokes 后追加
+TimeIntegrate；`BEAMFORMED` 不允许直接积分。
 
 ## 参数来源
 
 | 来源 | 参数 |
 | --- | --- |
 | input header block | `NCHAN`、`NPOL`、`NANT`、数据阶段/顺序/类型、内存位置、采样/字节率、`UTC_START` 等观测元数据 |
-| worker JSON | input/output ring key、CPU/CUDA backend、CUDA device、`F/A/P/T` 的 UDP 几何、权重文件/scale/id、`NBEAM`、FP32/TF32、最终 product |
+| worker JSON | input/output ring key、CPU/CUDA backend、CUDA device、`F/A/P/T` 的 UDP 几何、权重文件/scale/id、`NBEAM`、FP32/TF32、最终 product、积分开关/长度/运算 |
 | ring 实例 | input/output header capacity 和 data block capacity |
 
 未知 input header 字段会保留到 output header。worker 更新算法输出的 stage、order、
@@ -52,7 +53,8 @@ header 中的 `NCHAN/NANT/NPOL` 必须与 JSON `input_geometry` 的 F/A/P 完全
 
 Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
 `TRANSFER_SIZE`、`FILE_SIZE` 和 `OBS_OFFSET` 如果存在，必须对一个完整 TFPA 时间帧
-对齐；输出 header 按输入/输出 frame byte 比例缩放这些字段。
+对齐；输出 header 按输入/输出 frame byte 比例缩放这些字段。启用积分时还必须有正数
+有限值 `TSAMP`；所有上述 byte count 在产品变换和除以积分长度 `K` 时都必须能精确表示。
 
 ## JSON
 
@@ -60,7 +62,7 @@ Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "rings": {
     "input_key": "dada",
     "output_key": "dadb"
@@ -88,12 +90,19 @@ Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
   },
   "output": {
     "product": "STOKES"
+  },
+  "integration": {
+    "enabled": true,
+    "length": 128,
+    "operation": "mean"
   }
 }
 ```
 
 ring key 按十六进制解析，可以写 `dada` 或 `0xdada`。相对权重路径以 JSON 所在目录
 为基准。CPU reference 只允许 `compute_mode=FP32`。
+`integration.operation` 允许 `sum` 或 `mean`；`length` 必须大于零。schema v1
+配置仍按“积分关闭、K=1”读取，新增配置应使用 schema v2。
 
 `udp_packets_per_antenna_per_block` 表示每个阵元贡献的 UDP 包数，不是所有阵元合计
 包数；所有阵元合计包数为 `A×udp_packets_per_antenna_per_block`。
@@ -110,8 +119,17 @@ beamformed_frame_bytes  = F * P * B * sizeof(CF32)
 power_frame_bytes       = F * P * B * sizeof(F32)
 stokes_frame_bytes      = F * B * 4 * sizeof(F32)
 
-output_ring_block_bytes = T * selected_output_frame_bytes
+product_block_bytes     = T * selected_output_frame_bytes
+T_out                   = integration.enabled ? T/K : T
+output_ring_block_bytes = T_out * selected_output_frame_bytes
 input_ring_block_bytes % udp_antenna_group_bytes = 0
+```
+
+启用积分时还要求 `T % K = 0`。单进程中间 scratch 为 Beamform block；启用积分时
+还需追加一个未积分 product block：
+
+```text
+scratch_block_bytes = beamformed_block_bytes + product_block_bytes
 ```
 
 `F×A×P×T` 表示维度大小，内存线性顺序仍为 `TFPA`。input/output ring 的 data block
@@ -124,7 +142,7 @@ capacity 必须与配置计算值完全相等，否则 worker 在发布数据前
 cmake -S . -B build-linux \
   -DBUILD_RDMA_PIPELINE=ON \
   -DUSE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=89
+  -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-linux --parallel
 
 ./build-linux/pipeline_worker_config_inspect \
@@ -132,7 +150,8 @@ cmake --build build-linux --parallel
 ./build-linux/pipeline_worker config/pipeline_worker.json
 ```
 
-先用检查工具得到 `INPUT_BLOCK_BYTES` 和 `OUTPUT_BLOCK_BYTES`，再分别使用
+先用检查工具得到 `INPUT_BLOCK_BYTES`、`OUTPUT_BLOCK_BYTES` 和
+`SCRATCH_BLOCK_BYTES`，再分别使用
 `dada_db -k <key> -b <bytes> ...` 创建两个 ring。`run_once=true`
 时完成一个 input transfer/EOD 后退出；为 `false` 时重新获取 input read lock，等待下一次
 transfer。`SIGINT`/`SIGTERM` 会请求在当前 PSRDADA 操作返回后停止。

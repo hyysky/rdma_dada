@@ -20,9 +20,9 @@ The implemented first slice:
   different streams can overlap;
 - supports strict FP32 and TF32 compute modes without silent fallback.
 
-The CUDA source is implemented but still requires compilation, numerical tests
-and performance tests on the target RTX 4090 server. The macOS build never
-includes CUDA headers or libraries.
+The CUDA FP32/TF32 correctness tests have passed on the target server. Combined
+worker/ring lifecycle and performance tests are still required. The macOS build
+never includes CUDA headers or libraries.
 
 Public API:
 

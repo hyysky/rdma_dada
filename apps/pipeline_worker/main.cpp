@@ -35,11 +35,11 @@ void HandleSignal(int) { stop_requested = 1; }
 struct WorkerRuntime {
     WorkerRuntime()
         : log(NULL), output_hdu(NULL), output_locked(false), failed(false),
-          input_block_capacity(0), beamformed_block_capacity(0),
+          input_block_capacity(0), scratch_block_capacity(0),
           output_block_capacity(0), output_block_open(false),
           input_ring_location(rdma_dada::pipeline::MemoryLocation::kHost)
 #if defined(RDMA_DADA_HAVE_CUDA)
-          , stream(NULL), device_input(NULL), device_beamformed(NULL),
+          , stream(NULL), device_input(NULL), device_scratch(NULL),
           device_output(NULL)
 #endif
     {}
@@ -55,7 +55,7 @@ struct WorkerRuntime {
     bool failed;
     std::string error;
     std::uint64_t input_block_capacity;
-    std::uint64_t beamformed_block_capacity;
+    std::uint64_t scratch_block_capacity;
     std::uint64_t output_block_capacity;
     bool output_block_open;
     rdma_dada::pipeline::MemoryLocation input_ring_location;
@@ -63,7 +63,7 @@ struct WorkerRuntime {
 #if defined(RDMA_DADA_HAVE_CUDA)
     cudaStream_t stream;
     std::uint8_t* device_input;
-    std::uint8_t* device_beamformed;
+    std::uint8_t* device_scratch;
     std::uint8_t* device_output;
 #endif
 };
@@ -96,10 +96,10 @@ void ReleaseExecutionBuffers(WorkerRuntime* runtime) {
 #if defined(RDMA_DADA_HAVE_CUDA)
     if (runtime->stream) cudaStreamSynchronize(runtime->stream);
     if (runtime->device_input) cudaFree(runtime->device_input);
-    if (runtime->device_beamformed) cudaFree(runtime->device_beamformed);
+    if (runtime->device_scratch) cudaFree(runtime->device_scratch);
     if (runtime->device_output) cudaFree(runtime->device_output);
     runtime->device_input = NULL;
-    runtime->device_beamformed = NULL;
+    runtime->device_scratch = NULL;
     runtime->device_output = NULL;
     if (runtime->stream) cudaStreamDestroy(runtime->stream);
     runtime->stream = NULL;
@@ -124,16 +124,16 @@ void AbortOpenTransfer(WorkerRuntime* runtime) {
 
 bool PrepareExecutionBuffers(WorkerRuntime* runtime) {
     if (!FitsSizeT(runtime->input_block_capacity) ||
-        !FitsSizeT(runtime->beamformed_block_capacity) ||
+        !FitsSizeT(runtime->scratch_block_capacity) ||
         !FitsSizeT(runtime->output_block_capacity)) {
         SetFailure(runtime, "ring block capacity exceeds addressable size_t");
         return false;
     }
     if (runtime->config.execution_backend == "CPU_REFERENCE") {
-        if (runtime->chain.plan().module_count > 1U) {
+        if (runtime->scratch_block_capacity > 0U) {
             runtime->host_scratch.resize(
                 static_cast<std::size_t>(
-                    runtime->beamformed_block_capacity));
+                    runtime->scratch_block_capacity));
         }
         return true;
     }
@@ -156,14 +156,14 @@ bool PrepareExecutionBuffers(WorkerRuntime* runtime) {
                    "cudaMalloc input block")) {
         return false;
     }
-    if (runtime->chain.plan().module_count > 1U &&
+    if (runtime->scratch_block_capacity > 0U &&
         !CheckCuda(runtime,
                    cudaMalloc(
                        reinterpret_cast<void**>(
-                           &runtime->device_beamformed),
+                           &runtime->device_scratch),
                        static_cast<std::size_t>(
-                           runtime->beamformed_block_capacity)),
-                   "cudaMalloc beamformed block")) {
+                           runtime->scratch_block_capacity)),
+                   "cudaMalloc module-chain scratch block")) {
         return false;
     }
     if (!CheckCuda(runtime,
@@ -286,7 +286,7 @@ int OpenTransfer(dada_client_t* client) {
         rdma_dada::pipeline::StageStatus plan_status =
             runtime->chain.PlanBlock(
                 runtime->input_block_capacity,
-                &runtime->beamformed_block_capacity,
+                &runtime->scratch_block_capacity,
                 &expected_output_capacity);
         if (!plan_status.ok()) {
             SetFailure(runtime,
@@ -305,8 +305,8 @@ int OpenTransfer(dada_client_t* client) {
             AbortOpenTransfer(runtime);
             return -1;
         }
-        if (runtime->beamformed_block_capacity !=
-                runtime->geometry.beamformed_block_bytes ||
+        if (runtime->scratch_block_capacity !=
+                runtime->geometry.scratch_block_bytes ||
             expected_output_capacity != runtime->geometry.output_block_bytes) {
             SetFailure(runtime,
                        "module chain block plan does not match configured "
@@ -323,10 +323,10 @@ int OpenTransfer(dada_client_t* client) {
                 return -1;
             }
             if (transfer_size != 0) {
-                std::uint64_t transfer_beamformed_bytes = 0;
+                std::uint64_t transfer_scratch_bytes = 0;
                 std::uint64_t transfer_output_bytes = 0;
                 plan_status = runtime->chain.PlanBlock(
-                    transfer_size, &transfer_beamformed_bytes,
+                    transfer_size, &transfer_scratch_bytes,
                     &transfer_output_bytes);
                 if (!plan_status.ok()) {
                     SetFailure(runtime,
@@ -419,10 +419,10 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         static_cast<WorkerRuntime*>(client ? client->context : NULL);
     if (!client || !runtime || runtime->failed || !data) return -1;
 
-    std::uint64_t beamformed_bytes = 0;
+    std::uint64_t scratch_bytes = 0;
     std::uint64_t output_bytes = 0;
     rdma_dada::pipeline::StageStatus status = runtime->chain.PlanBlock(
-        data_size, &beamformed_bytes, &output_bytes);
+        data_size, &scratch_bytes, &output_bytes);
     if (!status.ok() || output_bytes > runtime->output_block_capacity) {
         SetFailure(runtime,
                    status.ok() ? "planned output exceeds output ring block" :
@@ -489,8 +489,8 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                 rdma_dada::pipeline::MemoryLocation::kCudaDevice
             };
             status = runtime->chain.ProcessBlock(
-                input, &output, runtime->device_beamformed,
-                beamformed_bytes, cuda_context);
+                input, &output, runtime->device_scratch,
+                scratch_bytes, cuda_context);
             if (status.ok() && output.size != output_bytes) {
                 status = rdma_dada::pipeline::StageStatus::Error(
                     "module chain produced an unexpected output byte count");

@@ -2,9 +2,9 @@
 
 该项目正在重构为独立的 PSRDADA ring-connected pipeline。当前可用部分是 RoCE v2
 数据接收到 raw ring，以及可在 macOS 上开发和测试的配置、DADA header、pipeline
-core、Beamform、Power 和 Stokes reference backend。三个算法的异步 CUDA backend
-均已加入代码，尚待目标服务器验证；`pipeline_worker` 第一版已经实现双 ring、
-header 传播和三种固定模块链。
+core、Beamform、Power、Stokes 和 Time Integration reference backend。四个算法及
+H2D/D2H 的独立 CUDA correctness test 已在目标服务器通过；`pipeline_worker` 第一版
+已经实现双 ring、header 传播，以及 Power/Stokes 后可选的 block-local 时间积分。
 
 ## 当前数据契约
 
@@ -70,8 +70,8 @@ BUILD_RDMA_PIPELINE=OFF USE_CUDA=ON bash scripts/build.sh
 ctest --test-dir build -L cuda --output-on-failure
 ```
 
-RTX 4090 的默认 CUDA architecture 是 `89`，可通过
-`-DCMAKE_CUDA_ARCHITECTURES=89` 显式覆盖。CUDA 构建建议使用 CMake 3.24 或更新
+RTX 3090 的默认 CUDA architecture 是 `86`，可通过
+`-DCMAKE_CUDA_ARCHITECTURES=86` 显式覆盖。CUDA 构建建议使用 CMake 3.24 或更新
 版本；项目最低版本仍为 3.18。
 
 Linux 上构建完成后，worker 使用一个 JSON 文件绑定输入、输出 ring key：
@@ -122,13 +122,15 @@ bash scripts/run_demo.sh start
 
 - Linux RDMA 构建、CQ 错误路径、NIC flow steering 和持续运行需要在目标服务器验证。
 - `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32
-  backend；`power`、`stokes` 已有 host FP32 reference 和异步 CUDA kernel。CUDA
-  路径尚待 RTX 4090 服务器编译、数值和性能验证。
+  backend；`power`、`stokes`、`time_integrate` 已有 host FP32 reference 和异步
+  CUDA kernel。独立 CUDA correctness test 已在目标服务器通过，组合链、真实 ring
+  生命周期和性能仍需继续验证。
 - `host_to_device`、`device_to_host` 已实现为无 buffer 所有权的异步 CUDA 传输
   模块，并已接入 worker；当前 PSRDADA ring block 仍按普通 host 内存处理。
 - 观测流程固定为解析重排后执行 Beamform，再选择 Power 或 Stokes，最后按需执行
-  time integration。当前 worker 已实现 `beamform`、`beamform+power` 和
-  `beamform+stokes`；VDIF 解包、整数复数转 CF32、通用模块注册、积分模块仍待实现。
+  time integration。当前 worker 已实现 `beamform`、`beamform+power`、
+  `beamform+stokes`，以及后两条链的可选积分；VDIF 解包、整数复数转 CF32 和通用
+  模块 registry 仍待实现。
 - 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
 - raw ring 的 payload order 目前可配置为 `UNKNOWN`；在前端格式确定前，不对其做推断。
