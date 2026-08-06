@@ -44,6 +44,7 @@ target_include_directories(rdma_pipeline_config
 
 add_library(rdma_pipeline_core STATIC
     src/pipeline/ascii_metadata.cpp
+    src/pipeline/group_block_writer.cpp
     src/pipeline/metadata.cpp
     src/pipeline/worker_config.cpp)
 target_include_directories(rdma_pipeline_core
@@ -52,10 +53,23 @@ target_include_directories(rdma_pipeline_core
 target_link_libraries(rdma_pipeline_core PUBLIC rdma_pipeline_config)
 
 add_library(rdma_module_vdif_unpack STATIC
-    modules/vdif_unpack/project_vdif_v1.cpp)
+    modules/vdif_unpack/project_vdif_v1.cpp
+    modules/vdif_unpack/vdif_unpack_config.cpp
+    modules/vdif_unpack/vdif_unpack_engine.cpp
+    modules/vdif_unpack/vdif_unpack_header.cpp)
 target_include_directories(rdma_module_vdif_unpack
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rdma_module_vdif_unpack PUBLIC rdma_pipeline_core)
+
+add_library(rdma_vdif_sender_sim STATIC
+    src/simulation/vdif_sender_sim.cpp)
+target_include_directories(rdma_vdif_sender_sim
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rdma_vdif_sender_sim PUBLIC
+    rdma_module_vdif_unpack
+    rdma_pipeline_config)
 
 add_library(rdma_module_beamform STATIC
     modules/beamform/beamform_module.cpp)
@@ -185,10 +199,25 @@ add_executable(pipeline_worker_config_inspect
     tools/pipeline_worker_config_inspect.cpp)
 target_link_libraries(pipeline_worker_config_inspect PRIVATE rdma_pipeline_core)
 
+add_executable(fpga_sender_sim apps/fpga_sender_sim/main.cpp)
+target_link_libraries(fpga_sender_sim PRIVATE rdma_vdif_sender_sim)
+
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     add_executable(project_vdif_v1_test tests/project_vdif_v1_test.cpp)
     target_link_libraries(project_vdif_v1_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(vdif_unpack_config_test tests/vdif_unpack_config_test.cpp)
+    target_link_libraries(vdif_unpack_config_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(vdif_unpack_header_test tests/vdif_unpack_header_test.cpp)
+    target_link_libraries(vdif_unpack_header_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(vdif_unpack_engine_test tests/vdif_unpack_engine_test.cpp)
+    target_link_libraries(vdif_unpack_engine_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(group_block_writer_test tests/group_block_writer_test.cpp)
+    target_link_libraries(group_block_writer_test PRIVATE rdma_pipeline_core)
+    add_executable(vdif_sender_sim_test tests/vdif_sender_sim_test.cpp)
+    target_link_libraries(vdif_sender_sim_test PRIVATE
+        rdma_vdif_sender_sim
+        rdma_module_vdif_unpack)
     add_executable(pipeline_config_test tests/pipeline_config_test.cpp)
     target_link_libraries(pipeline_config_test PRIVATE rdma_pipeline_config)
     add_executable(packet_format_config_test
@@ -254,6 +283,23 @@ if(BUILD_TESTING)
         NAME project_vdif_v1_test
         COMMAND project_vdif_v1_test)
     add_test(
+        NAME vdif_unpack_config_test
+        COMMAND vdif_unpack_config_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/vdif_unpack.example.json)
+    add_test(
+        NAME vdif_unpack_header_test
+        COMMAND vdif_unpack_header_test)
+    add_test(
+        NAME vdif_unpack_engine_test
+        COMMAND vdif_unpack_engine_test)
+    add_test(
+        NAME group_block_writer_test
+        COMMAND group_block_writer_test)
+    add_test(
+        NAME vdif_sender_sim_test
+        COMMAND vdif_sender_sim_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json)
+    add_test(
         NAME pipeline_config_test
         COMMAND pipeline_config_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
@@ -276,6 +322,12 @@ if(BUILD_TESTING)
     set_tests_properties(pipeline_config_rejects_legacy_test
         PROPERTIES WILL_FAIL TRUE)
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME fpga_sender_sim_loopback_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/fpga_sender_sim_loopback_test.py
+                    $<TARGET_FILE:fpga_sender_sim>
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json)
         add_test(
             NAME packet_format_inspect_test
             COMMAND ${Python3_EXECUTABLE}
@@ -501,6 +553,17 @@ if(BUILD_RDMA_PIPELINE)
         target_link_libraries(pipeline_worker PRIVATE CUDA::cudart)
     endif()
 
+    add_executable(vdif_unpack_worker apps/vdif_unpack_worker/main.cpp)
+    target_compile_definitions(vdif_unpack_worker PRIVATE _GNU_SOURCE)
+    target_link_libraries(vdif_unpack_worker
+        PRIVATE
+            rdma_module_vdif_unpack
+            ${PSRDADA_TARGET}
+            Threads::Threads)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(vdif_unpack_worker PRIVATE rt)
+    endif()
+
     if(BUILD_TESTING)
         add_executable(dada_header_roundtrip_test
             tests/dada_header_roundtrip_test.cpp)
@@ -512,6 +575,16 @@ if(BUILD_RDMA_PIPELINE)
             NAME dada_header_roundtrip_test
             COMMAND dada_header_roundtrip_test
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
+        add_test(
+            NAME vdif_unpack_worker_integration_test
+            COMMAND bash
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/vdif_unpack_worker_integration.sh
+                    $<TARGET_FILE:vdif_unpack_worker>
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(vdif_unpack_worker_integration_test PROPERTIES
+            LABELS "psrdada;integration"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 90)
     endif()
 endif()
 

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "rings": {
+    "input_key": "0xdada",
+    "output_key": "0xcaca"
+  },
+  "sources": {
+    "pipeline_config": "vdif_unpack.pipeline.example.json",
+    "packet_format": "packet_formats/frontend.example-v1.json"
+  },
+  "selection": {
+    "first_channel_id": 100,
+    "antenna_map": [10, 11, 12, 13]
+  },
+  "window": {
+    "blocks": 2,
+    "max_bytes": 1048576
+  },
+  "output": {
+    "memory": "HOST"
+  },
+  "runtime": {
+    "run_once": false
+  }
+}

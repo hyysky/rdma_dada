@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "observation": {
+    "nant": 4,
+    "nchan": 24,
+    "npol": 2,
+    "payload_order": "TFP",
+    "utc_start": "2026-08-01-00:00:00"
+  },
+  "packet": {
+    "header_bytes": 32,
+    "payload_bytes": 12288,
+    "samples": 128,
+    "nbit": 16,
+    "sample_interval_us": 1.0
+  },
+  "ring_buffers": {
+    "records_per_block": 16,
+    "raw_blocks": 8,
+    "compute_blocks": 8
+  },
+  "disk": {
+    "enabled": false,
+    "blocks_per_file": 0,
+    "direct_io": false
+  }
+}

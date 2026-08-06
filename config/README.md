@@ -18,6 +18,60 @@ version 1 and has four sections:
 Unknown or missing fields are rejected so a misspelled parameter cannot silently
 fall back to a default. Integer fields must use integer JSON syntax.
 
+## VDIF unpack 配置
+
+`vdif_unpack.example.json` 是 raw ring 到 compute ring 解包进程的严格配置：
+
+- `rings` 使用 `0x` 前缀字符串指定输入、输出 PSRDADA key，两个 key 不能相同；
+- `sources` 指向观测 pipeline 配置和 Project VDIF packet-format profile，相对路径以
+  unpack JSON 所在目录为基准；
+- `selection.first_channel_id` 是该 worker 处理的最小频率编号；
+- `selection.antenna_map[A]` 按 A 轴顺序列出 Station ID，长度必须等于 `NANT`，且不允许重复；
+- `window.blocks` 第一版至少为 2，表示允许跨两个 raw block 重排；
+- `window.max_bytes` 是 payload-only 滑动窗的硬内存上限；
+- `output.memory` 当前固定为 `HOST`，输出继续写入 host PSRDADA ring。
+- `runtime.run_once=false` 时每个 transfer 完成后重新等待下一次 header；功能测试可设为
+  `true`，处理一个 transfer 后正常退出。
+
+第一版 unpack worker 遵循当前已确认的 `PKT_NBIT=16`，即每个复数 sample 为
+`int8 real + int8 imag`（`CI8`）。Project VDIF codec 和 sender 已保留 CI16 能力，但在
+观测侧最终确定位宽并扩展 pipeline block/header 契约前，unpack 配置会明确拒绝 CI16，
+不会静默按错误字节宽度运行。
+
+示例使用 `vdif_unpack.pipeline.example.json`，其 packet 几何与
+`packet_formats/frontend.example-v1.json` 一致。窗口不复制 32-byte VDIF header：
+
+```text
+groups_per_raw_block = records_per_block / NANT
+group_bytes = packet_payload_bytes * NANT
+window_bytes = window.blocks * records_per_block * packet_payload_bytes
+compute_block_bytes = records_per_block * packet_payload_bytes
+```
+
+## FPGA sender simulator 配置
+
+`fpga_sender_sim.example.json` 描述单个 Station 的 UDP/Project VDIF v1 发送实例：
+
+- `destination` 只限定接收端数值 IPv4、UDP 端口和 IPv4 path MTU；程序不限定源地址；
+- `station.station_id` 必须与 unpack 的 `antenna_map[A]` 中某一项一致；
+- `packet` 给出频段、TFP 几何、8/16-bit 分量和十进制字符串 `sample_interval_ps`；
+- 示例测试间隔为 `1000000 ps = 1 us`，每 packet 包含 512 个时间 sample；
+- `time.mode` 是 `BURST` 或 `REALTIME`；多服务器 REALTIME 测试必须使用相同的未来
+  `start_utc`、reference epoch、start seconds 和 group count；
+- `faults` 可确定性注入 drop、duplicate 和 invalid-header group。
+
+IPv4 UDP record 必须满足：
+
+```text
+payload_bytes = T * F * P * 2 * (component_bits / 8)
+record_bytes = 32 + payload_bytes
+record_bytes <= path_mtu - 20 - 8
+record_bytes <= 65507
+```
+
+fault 列表必须严格递增、不重复、不越界且彼此不重叠，避免同一 group 同时定义互相冲突
+的发送行为。
+
 `ring_buffers.records_per_block` 是所有阵元合计的 UDP record 数，必须能被
 `observation.nant` 整除：
 

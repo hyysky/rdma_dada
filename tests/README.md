@@ -48,6 +48,12 @@ ctest --test-dir build-linux --output-on-failure
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
 | `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
+| `vdif_unpack_config_test` | `vdif_unpack_config_test.cpp` | 校验 ring key、Station ID→A 映射、两 block payload-only 窗口几何、profile 冲突、内存上限与溢出错误路径 | `BUILD_TESTING=ON` |
+| `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、未知字段保留、TFPA/无包头几何、零填充策略及输入冲突不发布输出 | `BUILD_TESTING=ON` |
+| `vdif_unpack_engine_test` | `vdif_unpack_engine_test.cpp` | 校验任意 Station 顺序和跨 block 的 TFP→TFPA 重排、完整 group 稳定等待、超时/EOD 零填充、arena 淘汰、坏包/重复/late 统计及 partial-block 契约 | `BUILD_TESTING=ON` |
+| `group_block_writer_test` | `group_block_writer_test.cpp` | 用内存 block sink 验证有序 group 直接填充满 block、EOD 精确提交部分 block、空传输不提交，以及 group/sink 容量错误不发布数据 | `BUILD_TESTING=ON` |
+| `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 sender JSON、整数皮秒跨秒/frame 重置、双 Station 同时间 key、CI8/CI16 确定性 payload、MTU 和 invalid-header 注入 | `BUILD_TESTING=ON` |
+| `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 临时 UDP 端口验证真实发送的 Station ID、drop、byte-identical duplicate、invalid Word 7 和完整 datagram 长度 | 找到 Python 3 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
@@ -72,6 +78,7 @@ ctest --test-dir build-linux --output-on-failure
 | `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→Beamform→Power→TimeIntegrate→D2H、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
 | `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成 RAW/TFP/32-byte 与 COMPUTE/TFPA/无包头双阶段 round-trip，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
+| `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 创建精确 raw/compute rings，经 `dada_diskdb` 输入跨 block Project VDIF transfer，并用 `dada_dbdisk` 验证 full/partial compute block、TFPA 字节、完整 header、EOD 及同一 worker 的连续双 transfer | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
 
 ## 单项调用
 
@@ -99,6 +106,59 @@ ctest --test-dir build \
 
 该 profile 是 Project VDIF v1 的机器可读 wire contract；测试中的 `payload_bytes` 是一组
 CI8/NCHAN=3 几何示例，实际观测仍须与 packet header 逐包交叉校验。
+
+### VDIF unpack 配置与 header 测试
+
+```bash
+./build/vdif_unpack_config_test config/vdif_unpack.example.json
+./build/vdif_unpack_header_test
+./build/vdif_unpack_engine_test
+ctest --test-dir build \
+  -R '^vdif_unpack_(config|header|engine)_test$' --output-on-failure
+```
+
+前者加载 unpack、pipeline 和 packet-format 三份配置并检查 payload-only 窗口；后者验证
+compute header 更新前会先完整检查 raw header 几何，失败时不会覆盖调用者已有 metadata。
+engine 测试使用独立生成的 40-byte 小型 Project VDIF record，以手工已知字节验证 TFPA
+位置和缺失 Station 的零区间，不依赖未来 UDP/RDMA adapter。
+
+Linux 上的真实双 ring 测试：
+
+```bash
+tests/vdif_unpack_worker_integration.sh \
+  build-linux/vdif_unpack_worker "$(pwd)"
+ctest --test-dir build-linux \
+  -R '^vdif_unpack_worker_integration_test$' --output-on-failure
+```
+
+该脚本的测试 sample 间隔固定为 `1 us`，分别验证末尾为完整 compute block、部分
+compute block，以及 `runtime.run_once=false` 时同一 worker 的两个连续 transfer；缺少
+`dada_db`、`dada_diskdb`、`dada_dbdisk` 等工具时返回 CTest skip code 77。
+
+### Compute group block writer 测试
+
+```bash
+./build/group_block_writer_test
+ctest --test-dir build -R '^group_block_writer_test$' --output-on-failure
+```
+
+该测试使用真实内存作为非 owning sink 边界，验证五个 4-byte group 依序形成一个
+12-byte 满 block 和一个 8-byte EOD block。未来 PSRDADA adapter 只需实现相同的
+`Acquire/Commit` 接口，writer 本身不申请或持有 ring block 存储。
+
+### FPGA sender simulator 测试
+
+```bash
+./build/vdif_sender_sim_test config/fpga_sender_sim.example.json
+python3 tests/fpga_sender_sim_loopback_test.py \
+  build/fpga_sender_sim config/fpga_sender_sim.example.json
+ctest --test-dir build \
+  -R '^(vdif_sender_sim|fpga_sender_sim_loopback)_test$' \
+  --output-on-failure
+```
+
+loopback 测试使用操作系统分配的临时端口，不依赖固定端口或外部网络；若执行环境禁止
+创建本地 socket，需要为该测试开放 `127.0.0.1` 回环权限。
 
 ### 配置检查工具测试
 

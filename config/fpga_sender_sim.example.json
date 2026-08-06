@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "destination": {
+    "ip": "127.0.0.1",
+    "port": 4010,
+    "path_mtu": 9000
+  },
+  "station": {
+    "station_id": 101
+  },
+  "packet": {
+    "first_channel_id": 100,
+    "nchan": 2,
+    "npol": 2,
+    "nsamp_per_packet": 512,
+    "component_bits": 8,
+    "sample_interval_ps": "1000000"
+  },
+  "time": {
+    "reference_epoch": 52,
+    "start_seconds": 1000,
+    "group_count": 8,
+    "mode": "BURST",
+    "start_utc": ""
+  },
+  "faults": {
+    "drop_groups": [1],
+    "duplicate_groups": [2],
+    "invalid_header_groups": [3]
+  }
+}
