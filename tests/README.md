@@ -47,6 +47,7 @@ ctest --test-dir build-linux --output-on-failure
 
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
+| `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
@@ -84,6 +85,8 @@ ctest --test-dir build -R '^pipeline_config_test$' --output-on-failure
 ### Packet format profile 测试
 
 ```bash
+./build/project_vdif_v1_test
+
 ./build/packet_format_config_test \
   config/packet_formats/frontend.example-v1.json
 

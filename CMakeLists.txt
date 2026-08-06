@@ -51,6 +51,12 @@ target_include_directories(rdma_pipeline_core
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rdma_pipeline_core PUBLIC rdma_pipeline_config)
 
+add_library(rdma_module_vdif_unpack STATIC
+    modules/vdif_unpack/project_vdif_v1.cpp)
+target_include_directories(rdma_module_vdif_unpack
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(rdma_module_beamform STATIC
     modules/beamform/beamform_module.cpp)
 target_include_directories(rdma_module_beamform
@@ -181,6 +187,8 @@ target_link_libraries(pipeline_worker_config_inspect PRIVATE rdma_pipeline_core)
 
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
+    add_executable(project_vdif_v1_test tests/project_vdif_v1_test.cpp)
+    target_link_libraries(project_vdif_v1_test PRIVATE rdma_module_vdif_unpack)
     add_executable(pipeline_config_test tests/pipeline_config_test.cpp)
     target_link_libraries(pipeline_config_test PRIVATE rdma_pipeline_config)
     add_executable(packet_format_config_test
@@ -242,6 +250,9 @@ if(BUILD_TESTING)
             rdma_module_transfer
             CUDA::cudart)
     endif()
+    add_test(
+        NAME project_vdif_v1_test
+        COMMAND project_vdif_v1_test)
     add_test(
         NAME pipeline_config_test
         COMMAND pipeline_config_test
