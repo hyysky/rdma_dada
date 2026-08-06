@@ -86,11 +86,13 @@ RDMA 数据面和性能仍需要在目标 Linux/RTX 3090 服务器验证。
 目标：将当前 worker 的输入边界从 `CONVERTED/TFPA/CF32` 前移到 raw packet ring。
 
 状态：CI8/CI16 的 CPU reference、CUDA backend、header/frame 几何和独立测试已完成；
-payload order、64-byte application header 字段、丢包策略和 worker 前段串联等待前端格式
-固化后继续。
+独立 packet-format v1 JSON Schema、严格 C++ parser/validator、示例 profile 和 inspect
+工具已完成。Project VDIF v1 已固定为 32-byte/8-word little-endian header、TFP
+Two's-Complement IQ payload，并定义 Station ID→A 映射。binary decoder、丢包策略和
+worker 前段串联仍待实现。
 
-- 固化实际 payload order 和包头字段；
-- 实现 64-byte application header 校验、序号检查、去头和 TFPA 重排；
+- 使用 FPGA binary golden records 验证已固化的 header 和 payload contract；
+- 实现 32-byte Project VDIF header 校验、序号检查、Station-ID 聚合、去头和 TFPA 重排；
 - 定义丢包、乱序、重复包和跨 block 包组处理规则；
 - 实现 `CI8/CI16/... → CF32` CUDA conversion，scale 从配置加载；
 - 验证 `F×A×P×T`、UDP payload 和所有阵元分组关系；

@@ -9,7 +9,7 @@ H2D/D2H 的独立 CUDA correctness test 已在目标服务器通过；`pipeline_
 ## 当前数据契约
 
 - 所有运行时参数由 JSON 配置输入；`NANT`/`NCHAN`/`NPOL`、`PKT_TSAMP`、`UTC_START` 和 ring/file 几何不写死在程序中。
-- raw ring 中的每条 record 是 `64-byte application header + payload`。RoCE 接收缓冲区中额外的 Ethernet/IPv4/UDP 42 字节会在写 ring 前剔除。
+- raw ring 中的每条 record 是 `32-byte Project VDIF v1 header + TFP payload`。RoCE 接收缓冲区中额外的 Ethernet/IPv4/UDP 42 字节会在写 ring 前剔除。
 - PSRDADA 的 header block 描述一次 transfer；数据 block 不会重复前缀 ASCII header。
 - 一个解包/计算 block 包含所有 `A` 个阵元的数据。总 UDP record 数必须是 `A` 的
   整数倍；`T=PKT_NSAMP×每阵元每block的UDP包数`。
@@ -100,6 +100,17 @@ worker 输入、Beamform 中间结果和最终输出 block 大小由 worker JSON
   config/pipeline_worker.example.json
 ```
 
+前端固定 32-byte Project VDIF v1 header 和 TFP payload 轴布局使用独立
+packet-format profile：
+
+```bash
+./build/packet_format_inspect \
+  config/packet_formats/frontend.example-v1.json
+```
+
+wire 字段表见 [doc/PROJECT_VDIF_PROFILE_V1.md](doc/PROJECT_VDIF_PROFILE_V1.md)，配置与轴
+表达式见 [config/packet_formats/README.md](config/packet_formats/README.md)。
+
 将旧的 shell 配置转为 JSON：
 
 ```bash
@@ -129,9 +140,10 @@ bash scripts/run_demo.sh start
   模块，并已接入 worker；当前 PSRDADA ring block 仍按普通 host 内存处理。
 - 观测流程固定为解析重排后执行 Beamform，再选择 Power 或 Stokes，最后按需执行
   time integration。当前 worker 已实现 `beamform`、`beamform+power`、
-  `beamform+stokes`，以及后两条链的可选积分；VDIF 解包、整数复数转 CF32 和通用
-  模块 registry 仍待实现。
+  `beamform+stokes`，以及后两条链的可选积分；整数复数转 CF32 已作为独立模块实现，
+  但尚未接入 worker。VDIF 解包和通用模块 registry 仍待实现。
 - 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
-- raw ring 的 payload order 目前可配置为 `UNKNOWN`；在前端格式确定前，不对其做推断。
+- Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
+  binary decoder、packet-group 状态机和 TFPA scatter 尚未实现。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

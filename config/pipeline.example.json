@@ -4,12 +4,12 @@
     "nant": 4,
     "nchan": 1,
     "npol": 2,
-    "payload_order": "UNKNOWN",
+    "payload_order": "TFP",
     "utc_start": "2026-08-01-00:00:00"
   },
   "packet": {
-    "header_bytes": 64,
-    "payload_bytes": 8192,
+    "header_bytes": 32,
+    "payload_bytes": 2048,
     "samples": 512,
     "nbit": 16,
     "sample_interval_us": 0.001

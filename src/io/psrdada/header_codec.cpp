@@ -79,16 +79,22 @@ int read_dada_header(const char *dada_header_buffer, dada_header_t *dada_header)
     fprintf(stderr, "DADA_HEADER_ERROR: contract version 1 requires NBIT=16\n");
     return EXIT_FAILURE;
   }
+  if (parsed.pkt_header != 32) {
+    fprintf(stderr,
+            "DADA_HEADER_ERROR: Project VDIF v1 requires PKT_HEADER=32\n");
+    return EXIT_FAILURE;
+  }
   if (strcmp(parsed.data_stage, "RAW") == 0) {
-    if (parsed.record_header_bytes != 64 ||
+    if (strcmp(parsed.order, "TFP") != 0 ||
+        parsed.record_header_bytes != 32 ||
         parsed.record_bytes != parsed.pkt_header + parsed.pkt_data ||
         parsed.resolution != parsed.record_bytes) {
       fprintf(stderr, "DADA_HEADER_ERROR: inconsistent RAW record metadata\n");
       return EXIT_FAILURE;
     }
   } else if (strcmp(parsed.data_stage, "COMPUTE") == 0) {
-    if (parsed.record_header_bytes != 0 ||
-        parsed.record_bytes != parsed.pkt_data ||
+    if (strcmp(parsed.order, "TFPA") != 0 ||
+        parsed.record_header_bytes != 0 || parsed.record_bytes == 0 ||
         parsed.resolution != parsed.record_bytes) {
       fprintf(stderr, "DADA_HEADER_ERROR: inconsistent COMPUTE record metadata\n");
       return EXIT_FAILURE;

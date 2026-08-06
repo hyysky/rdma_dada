@@ -2,6 +2,7 @@
 #include "rdma_dada/io/psrdada/header_codec.h"
 #include "rdma_dada/pipeline/dada_header_builder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,19 +68,40 @@ int main(int argc, char** argv) {
     Expect(actual.nchan == config.nchan, "NCHAN round trip");
     Expect(actual.npol == config.npol, "NPOL round trip");
     Expect(actual.nbit == 16, "NBIT=16 bit round trip");
-    Expect(std::string(actual.order) == "UNKNOWN", "ORDER round trip");
-    Expect(actual.record_header_bytes == 64, "raw header retained");
-    Expect(actual.record_bytes == 8256, "raw record size round trip");
-    Expect(actual.resolution == 8256, "RESOLUTION round trip");
+    Expect(std::string(actual.order) == "TFP", "ORDER round trip");
+    Expect(actual.record_header_bytes == 32, "raw header retained");
+    Expect(actual.record_bytes == 2080, "raw record size round trip");
+    Expect(actual.resolution == 2080, "RESOLUTION round trip");
     Expect(actual.bytes_per_second == UINT64_C(16000000000),
            "payload byte rate round trip");
-    Expect(actual.raw_bytes_per_second == UINT64_C(16125000000),
+    Expect(actual.raw_bytes_per_second == UINT64_C(16250000000),
            "raw byte rate round trip");
 
     char obs_id[32];
     Expect(ascii_header_get(buffer.data(), "OBS_ID", "%31s", obs_id) == 1 &&
                std::string(obs_id) == "preserved",
            "unknown template field is preserved");
+
+    dada_header_t compute_expected;
+    Expect(rdma_dada::BuildPipelineDadaHeader(
+               config, layout, rdma_dada::DataStage::kCompute,
+               &compute_expected, &error),
+           "compute header build: " + error);
+    std::fill(buffer.begin(), buffer.end(), '\0');
+    std::snprintf(buffer.data(), buffer.size(),
+                  "HDR_VERSION 1.0\nHDR_SIZE %zu\nOBS_ID preserved\n",
+                  buffer.size());
+    Expect(write_dada_header(compute_expected, buffer.data()) == 0,
+           "compute header serialization");
+    Expect(read_dada_header(buffer.data(), &actual) == 0,
+           "compute header deserialization");
+    Expect(std::string(actual.data_stage) == "COMPUTE",
+           "compute DATA_STAGE round trip");
+    Expect(std::string(actual.order) == "TFPA", "compute ORDER round trip");
+    Expect(actual.record_header_bytes == 0,
+           "compute record excludes packet header");
+    Expect(actual.record_bytes == 16, "compute TFPA frame round trip");
+    Expect(actual.resolution == 16, "compute RESOLUTION round trip");
 
     Expect(ascii_header_set(buffer.data(), "PIPELINE_VERSION", "%d", 2) == 0,
            "test should mutate contract version");

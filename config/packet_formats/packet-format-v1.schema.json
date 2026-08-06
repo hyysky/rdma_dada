@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hyysky/rdma_dada/schemas/packet-format-v1.schema.json",
+  "title": "RDMA/DADA packet format profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "format_id",
+    "record",
+    "application_header",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "format_id": {
+      "const": "project-vdif-v1"
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["application_header_bytes", "payload_bytes"],
+      "properties": {
+        "application_header_bytes": {
+          "const": 32
+        },
+        "payload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 134217688,
+          "multipleOf": 8
+        }
+      }
+    },
+    "application_header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bit_numbering", "fields"],
+      "properties": {
+        "bit_numbering": {
+          "const": "LSB0"
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 22,
+          "maxItems": 22,
+          "prefixItems": [
+            {"const":{"name":"invalid_data","semantic":"INVALID_DATA","offset_bytes":0,"type":"UINT32","endian":"LITTLE","bit_offset":31,"bit_width":1,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"legacy_mode","semantic":"LEGACY_MODE","offset_bytes":0,"type":"UINT32","endian":"LITTLE","bit_offset":30,"bit_width":1,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"seconds_from_reference_epoch","semantic":"SECONDS_FROM_REFERENCE_EPOCH","offset_bytes":0,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":30,"scale":1.0,"unit":"s"}},
+            {"const":{"name":"word1_reserved","semantic":"RESERVED","offset_bytes":4,"type":"UINT32","endian":"LITTLE","bit_offset":30,"bit_width":2,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"reference_epoch","semantic":"REFERENCE_EPOCH","offset_bytes":4,"type":"UINT32","endian":"LITTLE","bit_offset":24,"bit_width":6,"scale":1.0,"unit":"half_year"}},
+            {"const":{"name":"frame_number_within_second","semantic":"FRAME_NUMBER_WITHIN_SECOND","offset_bytes":4,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":24,"scale":1.0,"unit":"frame"}},
+            {"const":{"name":"vdif_version","semantic":"VDIF_VERSION","offset_bytes":8,"type":"UINT32","endian":"LITTLE","bit_offset":29,"bit_width":3,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"channel_count_code","semantic":"PROJECT_CHANNEL_COUNT_SENTINEL","offset_bytes":8,"type":"UINT32","endian":"LITTLE","bit_offset":24,"bit_width":5,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"frame_length_units_8_bytes","semantic":"FRAME_LENGTH_UNITS_8_BYTES","offset_bytes":8,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":24,"scale":8.0,"unit":"byte"}},
+            {"const":{"name":"data_type","semantic":"DATA_TYPE","offset_bytes":12,"type":"UINT32","endian":"LITTLE","bit_offset":31,"bit_width":1,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"component_bits_minus_one","semantic":"COMPONENT_BITS_MINUS_ONE","offset_bytes":12,"type":"UINT32","endian":"LITTLE","bit_offset":26,"bit_width":5,"scale":1.0,"unit":"bit"}},
+            {"const":{"name":"thread_id","semantic":"THREAD_ID","offset_bytes":12,"type":"UINT32","endian":"LITTLE","bit_offset":16,"bit_width":10,"scale":1.0,"unit":"thread"}},
+            {"const":{"name":"station_id","semantic":"STATION_ID","offset_bytes":12,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":16,"scale":1.0,"unit":"station"}},
+            {"const":{"name":"edv","semantic":"EXTENDED_DATA_VERSION","offset_bytes":16,"type":"UINT32","endian":"LITTLE","bit_offset":24,"bit_width":8,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"profile_version","semantic":"PROJECT_PROFILE_VERSION","offset_bytes":16,"type":"UINT32","endian":"LITTLE","bit_offset":16,"bit_width":8,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"sample_encoding","semantic":"SAMPLE_ENCODING_CODE","offset_bytes":16,"type":"UINT32","endian":"LITTLE","bit_offset":8,"bit_width":8,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"flags","semantic":"PROJECT_FLAGS","offset_bytes":16,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":8,"scale":1.0,"unit":"1"}},
+            {"const":{"name":"first_channel_id","semantic":"FIRST_CHANNEL_ID","offset_bytes":20,"type":"UINT32","endian":"LITTLE","bit_offset":16,"bit_width":16,"scale":1.0,"unit":"channel"}},
+            {"const":{"name":"nchan","semantic":"NCHAN","offset_bytes":20,"type":"UINT32","endian":"LITTLE","bit_offset":8,"bit_width":8,"scale":1.0,"unit":"channel"}},
+            {"const":{"name":"npol","semantic":"NPOL","offset_bytes":20,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":8,"scale":1.0,"unit":"polarization"}},
+            {"const":{"name":"nsamp_per_packet","semantic":"NSAMP_PER_PACKET","offset_bytes":24,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":32,"scale":1.0,"unit":"sample"}},
+            {"const":{"name":"word7_reserved","semantic":"RESERVED","offset_bytes":28,"type":"UINT32","endian":"LITTLE","bit_offset":0,"bit_width":32,"scale":1.0,"unit":"1"}}
+          ],
+          "items": false
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_format",
+        "sample_encoding",
+        "component_order",
+        "endian",
+        "packed_order",
+        "output_order",
+        "axes"
+      ],
+      "properties": {
+        "sample_format": {
+          "enum": ["CI8", "CI16"]
+        },
+        "sample_encoding": {
+          "const": "TWOS_COMPLEMENT"
+        },
+        "component_order": {
+          "const": "IQ"
+        },
+        "endian": {
+          "const": "LITTLE"
+        },
+        "packed_order": {
+          "const": ["T", "F", "P"]
+        },
+        "output_order": {
+          "const": ["T", "F", "P", "A"]
+        },
+        "axes": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {"const":{"name":"T","extent":"HEADER:nsamp_per_packet","origin":"DERIVED:vdif_frame_time"}},
+            {"const":{"name":"F","extent":"HEADER:nchan","origin":"HEADER:first_channel_id"}},
+            {"const":{"name":"P","extent":"HEADER:npol","origin":"CONST:0"}},
+            {"const":{"name":"A","extent":"CONST:1","origin":"LOOKUP:antenna_map:station_id"}}
+          ],
+          "items": false
+        }
+      }
+    }
+  },
+  "$defs": {
+    "endian": {
+      "enum": ["LITTLE", "BIG"]
+    },
+    "axis_name": {
+      "enum": ["T", "F", "P", "A"]
+    },
+    "reference": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+    },
+    "extent_expression": {
+      "type": "string",
+      "pattern": "^(CONST:[1-9][0-9]*|CONFIG:[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*|HEADER:[A-Za-z_][A-Za-z0-9_]*)$"
+    },
+    "origin_expression": {
+      "type": "string",
+      "pattern": "^(CONST:(0|[1-9][0-9]*)|CONFIG:[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*|HEADER:[A-Za-z_][A-Za-z0-9_]*|DERIVED:[A-Za-z_][A-Za-z0-9_]*|LOOKUP:[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*)$"
+    },
+    "header_field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "semantic",
+        "offset_bytes",
+        "type",
+        "endian",
+        "bit_offset",
+        "bit_width",
+        "scale",
+        "unit"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "semantic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "offset_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31
+        },
+        "type": {
+          "const": "UINT32"
+        },
+        "endian": {
+          "const": "LITTLE"
+        },
+        "bit_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        },
+        "bit_width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "scale": {
+          "type": "number",
+          "not": {
+            "const": 0
+          }
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "payload_axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "extent", "origin"],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/axis_name"
+        },
+        "extent": {
+          "$ref": "#/$defs/extent_expression"
+        },
+        "origin": {
+          "$ref": "#/$defs/origin_expression"
+        }
+      }
+    }
+  }
+}

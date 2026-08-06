@@ -68,7 +68,8 @@ struct TensorSpec {
 
 ## 4. Raw 复数 sample 格式
 
-前端通常输出固定宽度的复数整数，例如 `8+8 bit`，即实部 8 bit、虚部 8 bit。
+前端通常输出固定宽度的复数整数，例如 `8+8 bit`，即 I 8 bit、Q 8 bit；I 映射
+复数实部，Q 映射复数虚部。
 实际 component 位宽尚未最终确定，因此程序不能将 `CI8`、`CI16` 或 `cuComplex`
 写死。
 
@@ -76,15 +77,15 @@ JSON 必须无歧义地描述 raw sample：
 
 ```json
 {
-  "sample_format": {
-    "kind": "complex_integer",
-    "component_bits": 8,
-    "component_order": "RI",
-    "signed": true,
-    "endianness": "little"
-  }
+  "sample_format": "CI8",
+  "sample_encoding": "TWOS_COMPLEMENT",
+  "component_order": "IQ",
+  "endian": "LITTLE"
 }
 ```
+
+`CI8` 和 `CI16` 按类型定义固定表示有符号复整数，不再通过独立的 `signed` JSON
+字段声明，避免类型与布尔标志互相矛盾。
 
 派生关系：
 
@@ -93,20 +94,21 @@ sample_bits = 2 * component_bits
 sample_bytes = sample_bits / 8
 ```
 
-建议使用以下 header 字段，避免单独的 `NBIT` 产生语义歧义：
+Project VDIF v1 的 raw wire contract 使用以下对应关系，避免单独的 `NBIT` 产生
+语义歧义：
 
 ```text
 SAMPLE_FORMAT=CI8
 COMPONENT_NBIT=8
 SAMPLE_NBIT=16
+SOURCE_COMPONENT_ORDER=IQ
 COMPONENT_ORDER=RI
-COMPONENT_SIGNED=1
 ENDIAN=LITTLE
 ```
 
-现有 contract v1 将 `NBIT=16` 固定在 header codec 中。正式支持可变位宽时，必须
-先明确旧 `NBIT/PKT_NBIT` 是“单个分量位宽”还是“完整复数 sample 位宽”，再升级
-contract version；不能仅删除校验而保留含糊语义。
+wire header 的 `component_bits_minus_one` 对 CI8 为 7、对 CI16 为 15；有符号性由
+`sample_encoding=TWOS_COMPLEMENT` 与 `CI8/CI16` 类型共同决定，不另设 `signed`。
+`vdif_unpack` 将 IQ 语义映射为计算 ring 的 RI 语义，不改变两个分量的存储位置。
 
 ## 5. 模块输入输出总表
 
@@ -127,7 +129,7 @@ contract version；不能仅删除校验而保留含糊语义。
 
 ```text
 Memory: Host 或 PinnedHost
-Layout: 每条 record = 64-byte application header + payload
+Layout: 每条 record = 32-byte Project VDIF v1 header + TFP payload
 Block: records_per_block 条完整 record
 ```
 
@@ -142,12 +144,12 @@ Shape: [T, F, P, A]
 
 ### 职责
 
-- 解析和校验 64-byte application header。
+- 解析和校验固定 32-byte/8-word Project VDIF v1 header。
 - 校验包序号、时间戳、channel、polarization 和 antenna 标识。
 - 检测丢包、重复包和乱序包。
 - 按配置执行零填充、报错或其他丢包策略。
 - 去掉 record header。
-- 将前端 payload order 重排为 `TFPA`。
+- 按 `antenna_map[station_id]` 聚合所有天线并将 `TFP` 重排为 `TFPA`。
 - 保持整数复数表示，不在该模块中转换为 `cuComplex`。
 
 ### Header 更新
@@ -160,7 +162,9 @@ SAMPLE_FORMAT=CI8/CI16/...
 MEMORY=HOST 或 PINNED_HOST
 ```
 
-`RECORD_BYTES`、`RESOLUTION`、block bytes 和 byte rate 按 payload-only 数据重新计算。
+`RECORD_BYTES`、`RESOLUTION` 使用一个完整 TFPA 时间帧
+`F*P*A*complex_sample_bytes`；compute block bytes 等于所有输入 packet payload bytes
+之和。payload/raw byte rate 按同一 packet time 内的全部 A 个天线计算。
 
 ## 7. `host_to_device`
 
@@ -740,9 +744,12 @@ output_block_bytes = output_T * output_frame_bytes
 
 ## 19. 实现前仍需确认的信息
 
-- 64-byte application header 每个字段的偏移、位宽和 endian。
-- raw payload 中 `T/F/P/A/real/imag` 的实际排列。
-- `component_bits` 的实际取值和是否有符号。
+固定 32-byte Project VDIF v1 header、TFP/IQ payload、Two's Complement 编码和
+Station-ID→A 聚合规则已确定，详见
+[`PROJECT_VDIF_PROFILE_V1.md`](PROJECT_VDIF_PROFILE_V1.md)。后续还需要：
+
+- FPGA 生成的 binary golden records 及逐字段、逐 sample expected 值。
 - raw integer 转 `CF32` 的 scale、offset 和饱和规则。
+- 丢包、重复、乱序、invalid-data 和不完整天线 group 的处理策略。
 - 两路偏振的实际标签，以及 `AB_IMAG` 的符号约定。
 - 每个 ring 的目标 `T`、block 数量和 CUDA device。

@@ -3,6 +3,12 @@
 Runtime configuration uses strict JSON. `pipeline.example.json` is schema
 version 1 and has four sections:
 
+前端 packet 的静态 byte/bit 定义与观测配置分开，存放在
+[`packet_formats/`](packet_formats/README.md)。其中包含 v1 JSON Schema、机器可读 profile
+和 `packet_format_inspect` 的调用说明。Project VDIF v1 的 32-byte header 与 TFP payload
+布局是正式 wire contract；profile 中的 `payload_bytes` 是可由具体观测替换的 record
+几何值。
+
 - `observation`: externally supplied observation geometry and start time.
 - `packet`: raw record geometry and per-sample interval in microseconds.
 - `ring_buffers`: current raw/compute block geometry.
@@ -18,8 +24,17 @@ fall back to a default. Integer fields must use integer JSON syntax.
 ```text
 packets_per_antenna_per_block = records_per_block / nant
 T = packet.samples * packets_per_antenna_per_block
+packet.payload_bytes = packet.samples * nchan * npol * (packet.nbit / 8)
 compute_block_bytes = packet.payload_bytes * records_per_block
+compute_resolution = nchan * npol * nant * (packet.nbit / 8)
+payload_bytes_per_second = packet.payload_bytes * nant / packet_duration
+raw_bytes_per_second = (packet.header_bytes + packet.payload_bytes)
+                       * nant / packet_duration
 ```
+
+`packet.nbit` 是完整复数 sample 的 bit 数；当前 Project VDIF/CI8 配置固定为 16。
+`packet.samples`、`nchan`、`npol` 和 `packet.payload_bytes` 必须满足上述等式，否则在
+创建 ring 前拒绝配置。
 
 Convert the former `KEY=VALUE` file with:
 

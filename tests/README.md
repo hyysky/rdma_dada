@@ -48,6 +48,8 @@ ctest --test-dir build-linux --output-on-failure
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
+| `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
+| `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
 | `pipeline_config_inspect_test` | `pipeline_config_inspect` 工具 | 确认示例 JSON 能通过用户侧配置检查工具 | `BUILD_TESTING=ON` |
 | `pipeline_worker_config_inspect_test` | `pipeline_worker_config_inspect` 工具 | 从 F/A/P、UDP 分组、product 和积分参数计算 input/product/scratch/output block bytes | `BUILD_TESTING=ON` |
 | `pipeline_config_rejects_legacy_test` | `pipeline_config_inspect` 工具 | 确认运行时拒绝旧 `.conf`；CTest 将非零退出视为成功 | `BUILD_TESTING=ON` |
@@ -68,7 +70,7 @@ ctest --test-dir build-linux --output-on-failure
 | `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
 | `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→Beamform→Power→TimeIntegrate→D2H、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
-| `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成序列化/反序列化，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
+| `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成 RAW/TFP/32-byte 与 COMPUTE/TFPA/无包头双阶段 round-trip，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
 
 ## 单项调用
 
@@ -78,6 +80,22 @@ ctest --test-dir build-linux --output-on-failure
 ./build/pipeline_config_test config/pipeline.example.json
 ctest --test-dir build -R '^pipeline_config_test$' --output-on-failure
 ```
+
+### Packet format profile 测试
+
+```bash
+./build/packet_format_config_test \
+  config/packet_formats/frontend.example-v1.json
+
+./build/packet_format_inspect \
+  config/packet_formats/frontend.example-v1.json
+
+ctest --test-dir build \
+  -R '^packet_format_(config|inspect)_test$' --output-on-failure
+```
+
+该 profile 是 Project VDIF v1 的机器可读 wire contract；测试中的 `payload_bytes` 是一组
+CI8/NCHAN=3 几何示例，实际观测仍须与 packet header 逐包交叉校验。
 
 ### 配置检查工具测试
 

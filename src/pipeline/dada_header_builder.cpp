@@ -92,8 +92,6 @@ bool BuildPipelineDadaHeader(const PipelineConfig& config,
 
     if (!CopyField(config.utc_start, result.utc_start, sizeof(result.utc_start),
                    "UTC_START", error) ||
-        !CopyField(config.payload_order, result.order, sizeof(result.order),
-                   "ORDER", error) ||
         !UtcToMjd(config.utc_start, &result.mjd, error)) {
         return false;
     }
@@ -101,12 +99,20 @@ bool BuildPipelineDadaHeader(const PipelineConfig& config,
     const char* stage_name = NULL;
     if (stage == DataStage::kRaw) {
         stage_name = "RAW";
+        if (!CopyField(config.payload_order, result.order,
+                       sizeof(result.order), "ORDER", error)) {
+            return false;
+        }
         result.record_header_bytes = config.packet_header_bytes;
         result.record_bytes = layout.raw_record_bytes;
         result.resolution = layout.raw_resolution;
         result.filebytes = layout.raw_file_bytes;
     } else if (stage == DataStage::kCompute) {
         stage_name = "COMPUTE";
+        if (!CopyField("TFPA", result.order, sizeof(result.order), "ORDER",
+                       error)) {
+            return false;
+        }
         result.record_header_bytes = 0;
         result.record_bytes = layout.compute_record_bytes;
         result.resolution = layout.compute_resolution;

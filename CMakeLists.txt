@@ -35,6 +35,7 @@ endif()
 
 add_library(rdma_pipeline_config STATIC
     src/config/json_value.cpp
+    src/config/packet_format_config.cpp
     src/config/pipeline_config.cpp
     src/pipeline/dada_header_builder.cpp)
 target_include_directories(rdma_pipeline_config
@@ -171,6 +172,9 @@ target_link_libraries(rdma_pipeline_worker_core
 add_executable(pipeline_config_inspect tools/pipeline_config_inspect.cpp)
 target_link_libraries(pipeline_config_inspect PRIVATE rdma_pipeline_config)
 
+add_executable(packet_format_inspect tools/packet_format_inspect.cpp)
+target_link_libraries(packet_format_inspect PRIVATE rdma_pipeline_config)
+
 add_executable(pipeline_worker_config_inspect
     tools/pipeline_worker_config_inspect.cpp)
 target_link_libraries(pipeline_worker_config_inspect PRIVATE rdma_pipeline_core)
@@ -179,6 +183,10 @@ if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     add_executable(pipeline_config_test tests/pipeline_config_test.cpp)
     target_link_libraries(pipeline_config_test PRIVATE rdma_pipeline_config)
+    add_executable(packet_format_config_test
+        tests/packet_format_config_test.cpp)
+    target_link_libraries(packet_format_config_test PRIVATE
+        rdma_pipeline_config)
     add_executable(pipeline_core_test tests/pipeline_core_test.cpp)
     target_link_libraries(pipeline_core_test PRIVATE rdma_pipeline_core)
     add_executable(beamform_module_test tests/beamform_module_test.cpp)
@@ -239,6 +247,10 @@ if(BUILD_TESTING)
         COMMAND pipeline_config_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
     add_test(
+        NAME packet_format_config_test
+        COMMAND packet_format_config_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
+    add_test(
         NAME pipeline_config_inspect_test
         COMMAND pipeline_config_inspect
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
@@ -253,6 +265,12 @@ if(BUILD_TESTING)
     set_tests_properties(pipeline_config_rejects_legacy_test
         PROPERTIES WILL_FAIL TRUE)
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME packet_format_inspect_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/packet_format_inspect_test.py
+                    ${CMAKE_CURRENT_BINARY_DIR}/packet_format_inspect
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
         add_test(
             NAME config_conversion_test
             COMMAND ${Python3_EXECUTABLE}

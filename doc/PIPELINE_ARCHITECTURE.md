@@ -73,7 +73,7 @@ header or any output data is published.
 
 | Ring | Memory | Producer | Consumer(s) | Data meaning |
 | --- | --- | --- | --- | --- |
-| A | host/pinned host | RDMA2DADA | VDIF unpack | 64-byte application header plus payload records |
+| A | host/pinned host | RDMA2DADA | VDIF unpack | 32-byte Project VDIF header plus TFP payload records |
 | B | host/pinned host | VDIF unpack | configured worker and optional `dada_dbdisk` | unpacked/reordered samples without packet headers |
 | C | CUDA device | configured worker | configured GPU worker | optional process boundary in GPU memory |
 | D | host/pinned host | configured worker | DADA2RDMA or optional storage | example processed product ring |

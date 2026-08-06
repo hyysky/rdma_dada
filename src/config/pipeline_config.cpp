@@ -286,9 +286,20 @@ bool ComputePipelineLayout(const PipelineConfig& config,
     if (config.nant == 0 || config.nchan == 0 || config.npol == 0) {
         return Fail("NANT, NCHAN, and NPOL must all be greater than zero", error);
     }
-    if (config.payload_order.empty()) return Fail("PAYLOAD_ORDER must not be empty", error);
-    if (config.packet_header_bytes != 64) {
-        return Fail("PKT_HEADER must be 64 for pipeline contract version 1", error);
+    if (config.nchan > 255U) {
+        return Fail("NCHAN must fit the Project VDIF Word 5 UINT8 field", error);
+    }
+    if (config.npol != 1U && config.npol != 2U) {
+        return Fail("NPOL must be 1 or 2 for Project VDIF profile version 1",
+                    error);
+    }
+    if (config.payload_order != "TFP") {
+        return Fail("PAYLOAD_ORDER must be TFP for Project VDIF profile version 1",
+                    error);
+    }
+    if (config.packet_header_bytes != 32) {
+        return Fail("PKT_HEADER must be 32 for Project VDIF profile version 1",
+                    error);
     }
     if (config.packet_nbit != 16) {
         return Fail("PKT_NBIT must be 16 bits for pipeline contract version 1", error);
@@ -297,6 +308,10 @@ bool ComputePipelineLayout(const PipelineConfig& config,
         config.sample_interval_us <= 0.0 || config.records_per_block == 0 ||
         config.raw_ring_blocks == 0 || config.compute_ring_blocks == 0) {
         return Fail("packet, timing, block, and ring sizes must be greater than zero", error);
+    }
+    if (config.packet_samples > std::numeric_limits<std::uint32_t>::max()) {
+        return Fail("PKT_NSAMP must fit the Project VDIF Word 6 UINT32 field",
+                    error);
     }
     if (config.records_per_block % config.nant != 0) {
         return Fail(
@@ -308,6 +323,25 @@ bool ComputePipelineLayout(const PipelineConfig& config,
         return Fail("disk.blocks_per_file must be greater than zero when disk is enabled", error);
     }
     if (config.utc_start.empty()) return Fail("UTC_START must be supplied externally", error);
+
+    const std::uint64_t complex_sample_bytes = config.packet_nbit / 8U;
+    std::uint64_t expected_payload_bytes = 0;
+    if (!CheckedMultiply(config.packet_samples, config.nchan,
+                         "packet T x F elements", &expected_payload_bytes,
+                         error) ||
+        !CheckedMultiply(expected_payload_bytes, config.npol,
+                         "packet T x F x P elements", &expected_payload_bytes,
+                         error) ||
+        !CheckedMultiply(expected_payload_bytes, complex_sample_bytes,
+                         "packet payload bytes", &expected_payload_bytes,
+                         error)) {
+        return false;
+    }
+    if (config.packet_payload_bytes != expected_payload_bytes) {
+        return Fail(
+            "PKT_DATA must equal PKT_NSAMP * NCHAN * NPOL * PKT_NBIT / 8",
+            error);
+    }
 
     PipelineLayout result = PipelineLayout();
     result.packets_per_antenna_per_block =
@@ -323,13 +357,29 @@ bool ComputePipelineLayout(const PipelineConfig& config,
         return Fail("raw record size exceeds uint64 range", error);
     }
     result.raw_record_bytes = config.packet_header_bytes + config.packet_payload_bytes;
-    result.compute_record_bytes = config.packet_payload_bytes;
+    if (result.raw_record_bytes % 8U != 0U ||
+        result.raw_record_bytes / 8U > UINT64_C(0xffffff)) {
+        return Fail(
+            "raw record must fit the 24-bit Project VDIF frame-length field",
+            error);
+    }
     result.raw_resolution = result.raw_record_bytes;
+    if (!CheckedMultiply(config.nchan, config.npol,
+                         "compute F x P elements", &result.compute_record_bytes,
+                         error) ||
+        !CheckedMultiply(result.compute_record_bytes, config.nant,
+                         "compute F x P x A elements",
+                         &result.compute_record_bytes, error) ||
+        !CheckedMultiply(result.compute_record_bytes, complex_sample_bytes,
+                         "compute TFPA frame bytes",
+                         &result.compute_record_bytes, error)) {
+        return false;
+    }
     result.compute_resolution = result.compute_record_bytes;
 
     if (!CheckedMultiply(result.raw_record_bytes, config.records_per_block,
                          "raw block size", &result.raw_block_bytes, error) ||
-        !CheckedMultiply(result.compute_record_bytes, config.records_per_block,
+        !CheckedMultiply(config.packet_payload_bytes, config.records_per_block,
                          "compute block size", &result.compute_block_bytes, error) ||
         !CheckedMultiply(result.raw_block_bytes, config.raw_ring_blocks,
                          "raw ring size", &result.raw_ring_bytes, error) ||
@@ -348,9 +398,17 @@ bool ComputePipelineLayout(const PipelineConfig& config,
     if (!std::isfinite(packet_seconds) || packet_seconds <= 0.0L) {
         return Fail("packet duration is invalid", error);
     }
-    if (!RoundedRate(result.compute_record_bytes, packet_seconds,
+    std::uint64_t aggregate_payload_bytes = 0;
+    std::uint64_t aggregate_raw_bytes = 0;
+    if (!CheckedMultiply(config.packet_payload_bytes, config.nant,
+                         "all-antenna payload bytes per packet time",
+                         &aggregate_payload_bytes, error) ||
+        !CheckedMultiply(result.raw_record_bytes, config.nant,
+                         "all-antenna raw bytes per packet time",
+                         &aggregate_raw_bytes, error) ||
+        !RoundedRate(aggregate_payload_bytes, packet_seconds,
                      "payload byte rate", &result.payload_bytes_per_second, error) ||
-        !RoundedRate(result.raw_record_bytes, packet_seconds,
+        !RoundedRate(aggregate_raw_bytes, packet_seconds,
                      "raw byte rate", &result.raw_bytes_per_second, error)) {
         return false;
     }

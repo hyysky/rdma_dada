@@ -6,7 +6,7 @@
 namespace rdma_dada {
 
 // Pipeline configuration is portable and has no PSRDADA/RDMA dependency.
-// Version 1 describes one raw record as a 64-byte application header followed
+// Version 1 describes one raw record as a 32-byte Project VDIF header followed
 // by one payload. The compute record contains the payload only.
 struct PipelineConfig {
     std::uint32_t nant;
@@ -36,6 +36,7 @@ struct PipelineLayout {
     std::uint64_t packets_per_antenna_per_block;
     std::uint64_t samples_per_block;
     std::uint64_t raw_record_bytes;
+    // One unpacked TFPA time frame, not one raw packet payload.
     std::uint64_t compute_record_bytes;
     std::uint64_t raw_resolution;
     std::uint64_t compute_resolution;
