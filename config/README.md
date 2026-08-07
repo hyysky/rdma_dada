@@ -60,6 +60,15 @@ compute_block_bytes = records_per_block * packet_payload_bytes
   `start_utc`、reference epoch、start seconds 和 group count；
 - `faults` 可确定性注入 drop、duplicate 和 invalid-header group。
 
+`fpga_sender_sim.paced.example.json` 是严格 schema v2 高速 UDP 配置：
+
+- `source.ip/port` 必须显式给出，且每个 Station process 使用不同 source port；
+- `time.mode` 固定为 `PACED`，所有发送端使用共同未来 `start_utc`；
+- `transmit.target_gbps` 表示完整 UDP datagram payload（VDIF header + data）的 Gbps；
+- `batch_packets` 取值 `1..64`，Linux 使用 `sendmmsg()`；
+- `payload_mode` 为 `REPEAT_TEMPLATE` 或 `DETERMINISTIC`；
+- 所有 Station 等速，控制端不支持权重或单 Station override。
+
 IPv4 UDP record 必须满足：
 
 ```text

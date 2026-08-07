@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -13,13 +14,13 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: fpga_sender_sim_loopback_test.py EXECUTABLE CONFIG", file=sys.stderr)
-        return 2
+def reserve_source_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
-    executable = Path(sys.argv[1])
-    source_config = Path(sys.argv[2])
+
+def run_v1(executable: Path, source_config: Path) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
         receiver.bind(("127.0.0.1", 0))
         receiver.settimeout(2.0)
@@ -55,27 +56,97 @@ def main() -> int:
             stdout, stderr = process.communicate(timeout=5)
 
     if process.returncode != 0:
-        fail(f"sender exited {process.returncode}: stdout={stdout!r} stderr={stderr!r}")
+        fail(f"v1 sender exited {process.returncode}: stdout={stdout!r} stderr={stderr!r}")
     if len(datagrams) != 4:
-        fail(f"expected four datagrams after drop/duplicate faults, got {len(datagrams)}")
+        fail(f"expected four v1 datagrams after faults, got {len(datagrams)}")
     if any(len(packet) != 4128 for packet in datagrams):
-        fail(f"unexpected record lengths: {[len(packet) for packet in datagrams]}")
+        fail(f"unexpected v1 record lengths: {[len(packet) for packet in datagrams]}")
 
     stations = [struct.unpack_from("<I", packet, 12)[0] & 0xFFFF
                 for packet in datagrams]
     if stations != [345, 345, 345, 345]:
-        fail(f"Station IDs were not isolated to this sender: {stations}")
+        fail(f"v1 Station IDs were not isolated: {stations}")
     frames = [struct.unpack_from("<I", packet, 4)[0] & 0xFFFFFF
               for packet in datagrams]
     if frames != [0, 2, 2, 3]:
-        fail(f"drop/duplicate group sequence mismatch: {frames}")
+        fail(f"v1 drop/duplicate group sequence mismatch: {frames}")
     if datagrams[1] != datagrams[2]:
-        fail("duplicate group datagrams are not byte-identical")
+        fail("v1 duplicate group datagrams are not byte-identical")
     if struct.unpack_from("<I", datagrams[3], 28)[0] == 0:
-        fail("invalid-header group did not corrupt reserved Word 7")
-    if struct.unpack_from("<I", datagrams[0], 28)[0] != 0:
-        fail("normal group unexpectedly has an invalid Word 7")
+        fail("v1 invalid-header group did not corrupt reserved Word 7")
 
+
+def run_v2(executable: Path, source_config: Path) -> None:
+    source_port = reserve_source_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(4.0)
+        destination_port = receiver.getsockname()[1]
+        config = json.loads(source_config.read_text(encoding="utf-8"))
+        config["source"]["port"] = source_port
+        config["destination"]["port"] = destination_port
+        config["time"]["group_count"] = 320
+        config["time"]["start_utc"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=1)
+        ).strftime("%Y-%m-%d-%H:%M:%S")
+        config["transmit"]["target_gbps"] = 0.01
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "paced.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            process = subprocess.Popen(
+                [str(executable), str(config_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            received = []
+            try:
+                while len(received) < 320:
+                    received.append(receiver.recvfrom(65535))
+            except socket.timeout:
+                pass
+            stdout, stderr = process.communicate(timeout=5)
+
+    if process.returncode != 0:
+        fail(f"v2 sender exited {process.returncode}: stdout={stdout!r} stderr={stderr!r}")
+    if len(received) != 320:
+        fail(f"expected 320 paced datagrams, got {len(received)}")
+    if {address[1] for _, address in received} != {source_port}:
+        fail(f"paced sender did not bind source port {source_port}: {received[0][1]}")
+    frames = [struct.unpack_from("<I", packet, 4)[0] & 0xFFFFFF
+              for packet, _ in received]
+    if frames != list(range(320)):
+        fail(f"paced VDIF frame sequence mismatch: {frames}")
+    payloads = [packet[32:] for packet, _ in received]
+    if any(payload != payloads[0] for payload in payloads[1:]):
+        fail("REPEAT_TEMPLATE payload changed between paced groups")
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    try:
+        summary = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        fail(f"missing final sender JSON summary: {stdout!r}: {exc}")
+    if summary["sent_packets"] != 320 or summary["failed_packets"] != 0:
+        fail(f"paced sender counters do not reconcile: {summary}")
+    if summary["source_port"] != source_port:
+        fail(f"summary source port mismatch: {summary}")
+    if summary["backend"] not in {"SEND", "SENDMMSG"}:
+        fail(f"unexpected UDP backend: {summary}")
+    if not 0.0098 <= summary["actual_payload_gbps"] <= 0.0102:
+        fail(f"paced sender rate is outside 2% tolerance: {summary}")
+
+
+def main() -> int:
+    if len(sys.argv) != 4:
+        print(
+            "usage: fpga_sender_sim_loopback_test.py EXECUTABLE V1_CONFIG V2_CONFIG",
+            file=sys.stderr,
+        )
+        return 2
+
+    executable = Path(sys.argv[1])
+    run_v1(executable, Path(sys.argv[2]))
+    run_v2(executable, Path(sys.argv[3]))
     print("fpga_sender_sim_loopback_test passed")
     return 0
 

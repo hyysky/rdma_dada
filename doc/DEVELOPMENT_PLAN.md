@@ -88,8 +88,10 @@ RDMA 数据面和性能仍需要在目标 Linux/RTX 3090 服务器验证。
 状态：CI8/CI16 的 CPU reference、CUDA backend、header/frame 几何和独立测试已完成；
 独立 packet-format v1 JSON Schema、严格 C++ parser/validator、示例 profile 和 inspect
 工具已完成。Project VDIF v1 已固定为 32-byte/8-word little-endian header、TFP
-Two's-Complement IQ payload，并定义 Station ID→A 映射。binary decoder、丢包策略和
-worker 前段串联仍待实现。
+Two's-Complement IQ payload，并定义 Station ID→A 映射。binary decoder、丢包策略、
+packet-group 状态机、TFPA scatter、PSRDADA unpack worker 和低速双 Station 真实
+RDMA→unpack 基线已经完成。高速 UDP sender 正在增加显式 source port、等速 pacing、
+buffer 复用和 Linux `sendmmsg()`；CI8→CF32 的 worker 前段串联仍待实现。
 
 - 使用 FPGA binary golden records 验证已固化的 header 和 payload contract；
 - 实现 32-byte Project VDIF header 校验、序号检查、Station-ID 聚合、去头和 TFPA 重排；

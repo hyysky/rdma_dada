@@ -24,6 +24,33 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
+std::string ReadText(const char* path) {
+    std::ifstream input(path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
+
+void ExpectInvalidMutation(const std::string& source,
+                           const std::string& before,
+                           const std::string& after,
+                           const std::string& label) {
+    std::string mutated = source;
+    const std::string::size_type position = mutated.find(before);
+    Expect(position != std::string::npos, label + " fixture marker exists");
+    if (position == std::string::npos) return;
+    mutated.replace(position, before.size(), after);
+    std::ostringstream path;
+    path << "/tmp/rdma_dada_vdif_sender_" << static_cast<long>(getpid())
+         << '_' << label << ".json";
+    { std::ofstream output(path.str().c_str()); output << mutated; }
+    sim::VdifSenderSimConfig config = {};
+    std::string error;
+    Expect(!sim::LoadVdifSenderSimConfig(path.str(), &config, &error),
+           label + " is rejected");
+    std::remove(path.str().c_str());
+}
+
 sim::VdifSenderSimConfig MakeConfig(std::uint16_t station,
                                     std::uint8_t component_bits) {
     sim::VdifSenderSimConfig result = {};
@@ -86,6 +113,41 @@ void TestStrictExampleConfig(const char* path) {
                "duplicate group index inside a fault list is rejected");
         std::remove(temp.str().c_str());
     }
+}
+
+void TestStrictPacedConfig(const char* path) {
+    sim::VdifSenderSimConfig config = {};
+    std::string error;
+    Expect(sim::LoadVdifSenderSimConfig(path, &config, &error),
+           "paced sender config loads: " + error);
+    Expect(config.schema_version == 2U,
+           "paced example uses schema v2");
+    Expect(config.source_ip == "127.0.0.1" && config.source_port == 41001U,
+           "schema v2 parses explicit source endpoint");
+    Expect(config.mode == "PACED" &&
+           config.target_payload_bits_per_second == UINT64_C(10000000),
+           "0.01 Gbps parses as an exact paced payload bit rate");
+    Expect(config.batch_packets == 16U &&
+           config.payload_mode == "REPEAT_TEMPLATE",
+           "paced batch and payload mode parse");
+
+    const std::string source = ReadText(path);
+    ExpectInvalidMutation(source, "\"ip\": \"127.0.0.1\"",
+                          "\"ip\": \"0.0.0.0\"", "wildcard_source_ip");
+    ExpectInvalidMutation(source, "\"port\": 41001", "\"port\": 0",
+                          "zero_source_port");
+    ExpectInvalidMutation(source, "\"port\": 41001",
+                          "\"port\": 41001, \"weight\": 1",
+                          "unknown_source_field");
+    ExpectInvalidMutation(source, "\"mode\": \"PACED\"",
+                          "\"mode\": \"BURST\"", "v2_burst_mode");
+    ExpectInvalidMutation(source, "\"target_gbps\": 0.01",
+                          "\"target_gbps\": 0", "zero_target_rate");
+    ExpectInvalidMutation(source, "\"batch_packets\": 16",
+                          "\"batch_packets\": 65", "oversize_batch");
+    ExpectInvalidMutation(source, "\"payload_mode\": \"REPEAT_TEMPLATE\"",
+                          "\"payload_mode\": \"UNKNOWN\"",
+                          "unknown_payload_mode");
 }
 
 void TestDeterministicCi8AndTimeRollover() {
@@ -174,11 +236,12 @@ void TestMtuRangeAndFaultInjection() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "usage: vdif_sender_sim_test CONFIG\n";
+    if (argc != 3) {
+        std::cerr << "usage: vdif_sender_sim_test V1_CONFIG V2_CONFIG\n";
         return 2;
     }
     TestStrictExampleConfig(argv[1]);
+    TestStrictPacedConfig(argv[2]);
     TestDeterministicCi8AndTimeRollover();
     TestCi16LittleEndianPayload();
     TestMtuRangeAndFaultInjection();

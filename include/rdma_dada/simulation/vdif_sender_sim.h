@@ -10,6 +10,9 @@ namespace rdma_dada {
 namespace simulation {
 
 struct VdifSenderSimConfig {
+    std::uint32_t schema_version;
+    std::string source_ip;
+    std::uint16_t source_port;
     std::string destination_ip;
     std::uint16_t destination_port;
     std::uint32_t path_mtu;
@@ -21,6 +24,9 @@ struct VdifSenderSimConfig {
     std::uint64_t group_count;
     std::string mode;
     std::string start_utc;
+    std::uint64_t target_payload_bits_per_second;
+    std::uint32_t batch_packets;
+    std::string payload_mode;
     std::vector<std::uint64_t> drop_groups;
     std::vector<std::uint64_t> duplicate_groups;
     std::vector<std::uint64_t> invalid_header_groups;
@@ -29,6 +35,12 @@ struct VdifSenderSimConfig {
 bool LoadVdifSenderSimConfig(const std::string& path,
                              VdifSenderSimConfig* config,
                              std::string* error);
+
+bool BuildVdifSenderHeader(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error);
 
 bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
                            std::uint64_t group_index,

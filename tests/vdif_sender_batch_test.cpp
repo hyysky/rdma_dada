@@ -1,0 +1,128 @@
+#include "rdma_dada/modules/vdif_unpack/project_vdif_v1.h"
+#include "rdma_dada/simulation/vdif_sender_batch.h"
+#include "rdma_dada/simulation/vdif_sender_sim.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+namespace sim = rdma_dada::simulation;
+namespace unpack = rdma_dada::modules::vdif_unpack;
+int failures = 0;
+
+void Expect(bool condition, const std::string& message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
+}
+
+sim::VdifSenderSimConfig MakeConfig(std::uint16_t station,
+                                    const std::string& payload_mode) {
+    sim::VdifSenderSimConfig config = {};
+    config.schema_version = 2;
+    config.source_ip = "127.0.0.1";
+    config.source_port = static_cast<std::uint16_t>(41000U + station);
+    config.destination_ip = "127.0.0.1";
+    config.destination_port = 4010;
+    config.path_mtu = 1500;
+    config.station_id = station;
+    config.geometry.first_channel_id = 7;
+    config.geometry.nchan = 1;
+    config.geometry.npol = 2;
+    config.geometry.nsamp_per_packet = 2;
+    config.geometry.component_bits = 8;
+    config.geometry.payload_bytes = 8;
+    config.reference_epoch = 52;
+    config.start_seconds = 100;
+    config.sample_interval_ps = UINT64_C(300000000000);
+    config.group_count = 8;
+    config.mode = "PACED";
+    config.start_utc = "2030-01-01-00:00:00";
+    config.target_payload_bits_per_second = UINT64_C(10000000);
+    config.batch_packets = 4;
+    config.payload_mode = payload_mode;
+    return config;
+}
+
+unpack::ProjectVdifHeader Decode(const sim::VdifPacketView& packet) {
+    unpack::ProjectVdifHeader header = {};
+    std::string error;
+    Expect(unpack::DecodeProjectVdifV1(packet.data, packet.bytes,
+                                       &header, &error),
+           "batch packet header decodes: " + error);
+    return header;
+}
+
+void TestStableRepeatBatch() {
+    sim::VdifSenderBatch batch;
+    std::string error;
+    const sim::VdifSenderSimConfig config = MakeConfig(101, "REPEAT_TEMPLATE");
+    Expect(batch.Initialize(config, &error), "repeat batch initializes: " + error);
+    Expect(batch.capacity() == 4U, "batch capacity follows configuration");
+    Expect(batch.Prepare(0, 4, &error), "first batch prepares: " + error);
+    const std::uint8_t* addresses[4] = {};
+    for (std::uint32_t i = 0; i < 4U; ++i) {
+        addresses[i] = batch.packet(i).data;
+        Expect(batch.packet(i).group_index == i, "first batch group index advances");
+        const unpack::ProjectVdifHeader header = Decode(batch.packet(i));
+        Expect(header.station_id == 101U, "Station ID remains fixed in batch");
+    }
+    Expect(std::equal(batch.packet(0).data + 32, batch.packet(0).data + 40,
+                      batch.packet(1).data + 32),
+           "repeat mode reuses identical payload across groups");
+
+    Expect(batch.Prepare(4, 4, &error), "second batch prepares: " + error);
+    for (std::uint32_t i = 0; i < 4U; ++i) {
+        Expect(batch.packet(i).data == addresses[i],
+               "packet storage address remains stable after Prepare");
+        Expect(batch.packet(i).group_index == 4U + i,
+               "second batch group index advances");
+    }
+    Expect(!batch.Prepare(7, 2, &error), "group range beyond transfer is rejected");
+    Expect(!batch.Prepare(0, 5, &error), "packet count above capacity is rejected");
+}
+
+void TestStationTemplatesDiffer() {
+    sim::VdifSenderBatch first;
+    sim::VdifSenderBatch second;
+    std::string error;
+    Expect(first.Initialize(MakeConfig(101, "REPEAT_TEMPLATE"), &error),
+           "Station 101 batch initializes");
+    Expect(second.Initialize(MakeConfig(102, "REPEAT_TEMPLATE"), &error),
+           "Station 102 batch initializes");
+    Expect(first.Prepare(0, 1, &error) && second.Prepare(0, 1, &error),
+           "Station batches prepare");
+    Expect(!std::equal(first.packet(0).data + 32, first.packet(0).data + 40,
+                       second.packet(0).data + 32),
+           "different Stations have distinguishable repeat templates");
+}
+
+void TestDeterministicBatchMatchesReference() {
+    const sim::VdifSenderSimConfig config = MakeConfig(101, "DETERMINISTIC");
+    sim::VdifSenderBatch batch;
+    std::string error;
+    Expect(batch.Initialize(config, &error), "deterministic batch initializes");
+    Expect(batch.Prepare(2, 1, &error), "deterministic batch prepares");
+    std::vector<std::uint8_t> expected;
+    Expect(sim::BuildVdifSenderRecord(config, 2, &expected, &error),
+           "reference record builds");
+    Expect(expected.size() == batch.packet(0).bytes &&
+           std::equal(expected.begin(), expected.end(), batch.packet(0).data),
+           "deterministic batch is byte-identical to reference record");
+}
+
+}  // namespace
+
+int main() {
+    TestStableRepeatBatch();
+    TestStationTemplatesDiffer();
+    TestDeterministicBatchMatchesReference();
+    if (failures) return 1;
+    std::cout << "vdif_sender_batch_test passed\n";
+    return 0;
+}

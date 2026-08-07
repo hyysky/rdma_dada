@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "source": {
+    "ip": "127.0.0.1",
+    "port": 41001
+  },
+  "destination": {
+    "ip": "127.0.0.1",
+    "port": 4010,
+    "path_mtu": 9000
+  },
+  "station": {
+    "station_id": 101
+  },
+  "packet": {
+    "first_channel_id": 100,
+    "nchan": 2,
+    "npol": 2,
+    "nsamp_per_packet": 512,
+    "component_bits": 8,
+    "sample_interval_ps": "1000000"
+  },
+  "time": {
+    "reference_epoch": 52,
+    "start_seconds": 1000,
+    "group_count": 64,
+    "mode": "PACED",
+    "start_utc": "2030-01-01-00:00:00"
+  },
+  "transmit": {
+    "target_gbps": 0.01,
+    "batch_packets": 16,
+    "payload_mode": "REPEAT_TEMPLATE"
+  },
+  "faults": {
+    "drop_groups": [],
+    "duplicate_groups": [],
+    "invalid_header_groups": []
+  }
+}

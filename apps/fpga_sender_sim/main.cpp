@@ -1,4 +1,5 @@
 #include "rdma_dada/simulation/vdif_sender_sim.h"
+#include "rdma_dada/simulation/udp_vdif_sender.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -133,6 +134,17 @@ int main(int argc, char** argv) {
     if (!rdma_dada::simulation::LoadVdifSenderSimConfig(argv[1], &config, &error)) {
         std::cerr << "CONFIG_ERROR: " << error << '\n';
         return 1;
+    }
+
+    if (config.schema_version == 2U) {
+        rdma_dada::simulation::VdifSenderStats stats = {};
+        if (!rdma_dada::simulation::RunUdpVdifSender(config, &stats, &error)) {
+            std::cerr << "SEND_ERROR: " << error << '\n';
+            return 1;
+        }
+        std::cout << rdma_dada::simulation::FormatVdifSenderStatsJson(
+            config, stats);
+        return 0;
     }
 
     SocketHandle socket_fd(socket(AF_INET, SOCK_DGRAM, 0));

@@ -3,6 +3,7 @@
 #include "rdma_dada/config/json_value.h"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
@@ -90,6 +91,41 @@ bool UintField(const json::Value::Object& object, const char* key,
     return ParseUnsignedText(key, value.text(), result, error);
 }
 
+bool PositiveGbpsField(const json::Value::Object& object, const char* key,
+                       std::uint64_t* result, std::string* error) {
+    const json::Value& value = object.find(key)->second;
+    if (value.type() != json::Value::kNumber)
+        return Fail(std::string(key) + " must be a JSON number", error);
+    const std::string& text = value.text();
+    if (text.empty() || text[0] == '-' ||
+        text.find_first_of("eE") != std::string::npos)
+        return Fail(std::string(key) +
+                    " must use positive decimal JSON syntax", error);
+    const std::string::size_type dot = text.find('.');
+    if (dot != std::string::npos && text.find('.', dot + 1U) != std::string::npos)
+        return Fail(std::string(key) + " contains more than one decimal point", error);
+    const std::string whole = dot == std::string::npos ? text : text.substr(0, dot);
+    const std::string fraction = dot == std::string::npos ? "" : text.substr(dot + 1U);
+    if (whole.empty() || fraction.size() > 9U)
+        return Fail(std::string(key) +
+                    " must have an integer part and at most 9 decimals", error);
+    std::uint64_t whole_gbps = 0;
+    if (!ParseUnsignedText(key, whole, &whole_gbps, error)) return false;
+    std::uint64_t fraction_bps = 0;
+    if (!fraction.empty()) {
+        if (!ParseUnsignedText(key, fraction, &fraction_bps, error)) return false;
+        for (std::size_t i = fraction.size(); i < 9U; ++i) fraction_bps *= 10U;
+    }
+    if (whole_gbps >
+        (std::numeric_limits<std::uint64_t>::max() - fraction_bps) /
+            UINT64_C(1000000000))
+        return Fail(std::string(key) + " exceeds uint64 bits/s range", error);
+    *result = whole_gbps * UINT64_C(1000000000) + fraction_bps;
+    if (*result == 0)
+        return Fail(std::string(key) + " must be greater than zero", error);
+    return true;
+}
+
 bool FaultList(const json::Value::Object& object, const char* key,
                std::uint64_t group_count, std::vector<std::uint64_t>* result,
                std::string* error) {
@@ -119,6 +155,28 @@ bool Contains(const std::vector<std::uint64_t>& values, std::uint64_t value) {
 }
 
 bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
+    if (config.schema_version == 2U) {
+        in_addr source = {};
+        if (config.source_ip.empty() ||
+            inet_pton(AF_INET, config.source_ip.c_str(), &source) != 1 ||
+            source.s_addr == htonl(INADDR_ANY))
+            return Fail("source IP must be a numeric non-wildcard IPv4 address",
+                        error);
+        if (config.source_port == 0)
+            return Fail("source port must be positive", error);
+        if (config.mode != "PACED")
+            return Fail("schema v2 mode must be PACED", error);
+        if (config.start_utc.empty())
+            return Fail("PACED mode requires start_utc", error);
+        if (config.target_payload_bits_per_second == 0)
+            return Fail("PACED target payload rate must be positive", error);
+        if (config.batch_packets == 0 || config.batch_packets > 64U)
+            return Fail("batch_packets must be in 1..64", error);
+        if (config.payload_mode != "DETERMINISTIC" &&
+            config.payload_mode != "REPEAT_TEMPLATE")
+            return Fail("payload_mode must be DETERMINISTIC or REPEAT_TEMPLATE",
+                        error);
+    }
     if (config.destination_ip.empty()) return Fail("destination IP must not be empty", error);
     if (config.destination_port == 0) return Fail("destination port must be positive", error);
     if (config.path_mtu < 68) return Fail("IPv4 path MTU must be at least 68 bytes", error);
@@ -131,8 +189,9 @@ bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
         return Fail("VDIF start time exceeds header field width", error);
     if (config.sample_interval_ps == 0 || config.group_count == 0)
         return Fail("sample interval and group count must be positive", error);
-    if (config.mode != "BURST" && config.mode != "REALTIME")
-        return Fail("mode must be BURST or REALTIME", error);
+    if (config.schema_version != 2U &&
+        config.mode != "BURST" && config.mode != "REALTIME")
+        return Fail("schema v1 mode must be BURST or REALTIME", error);
     if (config.mode == "REALTIME" && config.start_utc.empty())
         return Fail("REALTIME mode requires start_utc", error);
 
@@ -201,15 +260,30 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     if (!json::Parse(contents.str(), &root, error)) return false;
     if (root.type() != json::Value::kObject) return Fail("root must be an object", error);
     const json::Value::Object& object = root.object();
-    static const char* const root_keys[] = {
+    static const char* const root_keys_v1[] = {
         "schema_version", "destination", "station", "packet", "time", "faults"
     };
-    if (!ExactKeys(object, root_keys, 6, "root", error)) return false;
+    if (!object.count("schema_version"))
+        return Fail("root is missing: schema_version", error);
     std::uint64_t schema = 0;
-    if (!UintField(object, "schema_version", &schema, error) || schema != 1)
-        return Fail("schema_version must be 1", error);
+    if (!UintField(object, "schema_version", &schema, error) ||
+        (schema != 1U && schema != 2U))
+        return Fail("schema_version must be 1 or 2", error);
+    static const char* const root_keys_v2[] = {
+        "schema_version", "source", "destination", "station", "packet",
+        "time", "transmit", "faults"
+    };
+    if (schema == 1U) {
+        if (!ExactKeys(object, root_keys_v1, 6, "root", error)) return false;
+    } else if (!ExactKeys(object, root_keys_v2, 8, "root", error)) {
+        return false;
+    }
 
+    const json::Value::Object *source = NULL, *transmit = NULL;
     const json::Value::Object *destination, *station, *packet, *time, *faults;
+    if (schema == 2U &&
+        (!ObjectField(object, "source", &source, error) ||
+         !ObjectField(object, "transmit", &transmit, error))) return false;
     if (!ObjectField(object, "destination", &destination, error) ||
         !ObjectField(object, "station", &station, error) ||
         !ObjectField(object, "packet", &packet, error) ||
@@ -227,16 +301,34 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     static const char* const fault_keys[] = {
         "drop_groups", "duplicate_groups", "invalid_header_groups"
     };
-    if (!ExactKeys(*destination, destination_keys, 3, "destination", error) ||
+    static const char* const source_keys[] = {"ip", "port"};
+    static const char* const transmit_keys[] = {
+        "target_gbps", "batch_packets", "payload_mode"
+    };
+    if ((schema == 2U &&
+         (!ExactKeys(*source, source_keys, 2, "source", error) ||
+          !ExactKeys(*transmit, transmit_keys, 3, "transmit", error))) ||
+        !ExactKeys(*destination, destination_keys, 3, "destination", error) ||
         !ExactKeys(*station, station_keys, 1, "station", error) ||
         !ExactKeys(*packet, packet_keys, 6, "packet", error) ||
         !ExactKeys(*time, time_keys, 5, "time", error) ||
         !ExactKeys(*faults, fault_keys, 3, "faults", error)) return false;
 
     VdifSenderSimConfig parsed = {};
+    parsed.schema_version = static_cast<std::uint32_t>(schema);
+    parsed.payload_mode = "DETERMINISTIC";
     std::uint64_t port, mtu, station_id, first_channel, nchan, npol;
     std::uint64_t nsamp, component_bits, epoch, start_seconds;
+    std::uint64_t source_port = 0, batch_packets = 0;
     std::string interval;
+    if (schema == 2U &&
+        (!StringField(*source, "ip", &parsed.source_ip, error) ||
+         !UintField(*source, "port", &source_port, error) ||
+         !PositiveGbpsField(*transmit, "target_gbps",
+                            &parsed.target_payload_bits_per_second, error) ||
+         !UintField(*transmit, "batch_packets", &batch_packets, error) ||
+         !StringField(*transmit, "payload_mode", &parsed.payload_mode,
+                      error))) return false;
     if (!StringField(*destination, "ip", &parsed.destination_ip, error) ||
         !UintField(*destination, "port", &port, error) ||
         !UintField(*destination, "path_mtu", &mtu, error) ||
@@ -252,13 +344,17 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         !UintField(*time, "group_count", &parsed.group_count, error) ||
         !StringField(*time, "mode", &parsed.mode, error) ||
         !StringField(*time, "start_utc", &parsed.start_utc, error)) return false;
-    if (port > 65535U || mtu > std::numeric_limits<std::uint32_t>::max() ||
+    if (port > 65535U || source_port > 65535U ||
+        batch_packets > std::numeric_limits<std::uint32_t>::max() ||
+        mtu > std::numeric_limits<std::uint32_t>::max() ||
         station_id > 65535U || first_channel > 65535U || nchan > 255U ||
         npol > 255U || nsamp > std::numeric_limits<std::uint32_t>::max() ||
         component_bits > 255U || epoch > 255U ||
         start_seconds > std::numeric_limits<std::uint32_t>::max())
         return Fail("sender config integer exceeds destination field width", error);
     parsed.destination_port = static_cast<std::uint16_t>(port);
+    parsed.source_port = static_cast<std::uint16_t>(source_port);
+    parsed.batch_packets = static_cast<std::uint32_t>(batch_packets);
     parsed.path_mtu = static_cast<std::uint32_t>(mtu);
     parsed.station_id = static_cast<std::uint16_t>(station_id);
     parsed.geometry.first_channel_id = static_cast<std::uint16_t>(first_channel);
@@ -287,11 +383,12 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     return true;
 }
 
-bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
-                           std::uint64_t group_index,
-                           std::vector<std::uint8_t>* record,
-                           std::string* error) {
-    if (!record) return Fail("record output pointer is null", error);
+bool BuildVdifSenderHeader(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error) {
+    if (!header) return Fail("header output pointer is null", error);
     if (!ValidateConfig(config, error)) return false;
     if (group_index >= config.group_count)
         return Fail("group index is outside group_count", error);
@@ -306,19 +403,30 @@ bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
     const std::uint64_t within_second = elapsed % kPicosecondsPerSecond;
     const std::uint64_t frame = within_second / packet_duration;
 
-    modules::vdif_unpack::ProjectVdifHeader header = {};
-    header.seconds_from_reference_epoch = static_cast<std::uint32_t>(
+    modules::vdif_unpack::ProjectVdifHeader result = {};
+    result.seconds_from_reference_epoch = static_cast<std::uint32_t>(
         config.start_seconds + second_offset);
-    header.reference_epoch = config.reference_epoch;
-    header.frame_number_within_second = static_cast<std::uint32_t>(frame);
-    header.station_id = config.station_id;
-    header.first_channel_id = config.geometry.first_channel_id;
-    header.nchan = config.geometry.nchan;
-    header.npol = config.geometry.npol;
-    header.nsamp_per_packet = config.geometry.nsamp_per_packet;
-    header.component_bits = config.geometry.component_bits;
-    header.frame_length_units_8_bytes = static_cast<std::uint32_t>(
+    result.reference_epoch = config.reference_epoch;
+    result.frame_number_within_second = static_cast<std::uint32_t>(frame);
+    result.station_id = config.station_id;
+    result.first_channel_id = config.geometry.first_channel_id;
+    result.nchan = config.geometry.nchan;
+    result.npol = config.geometry.npol;
+    result.nsamp_per_packet = config.geometry.nsamp_per_packet;
+    result.component_bits = config.geometry.component_bits;
+    result.frame_length_units_8_bytes = static_cast<std::uint32_t>(
         (32U + config.geometry.payload_bytes) / 8U);
+    *header = result;
+    return true;
+}
+
+bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
+                           std::uint64_t group_index,
+                           std::vector<std::uint8_t>* record,
+                           std::string* error) {
+    if (!record) return Fail("record output pointer is null", error);
+    modules::vdif_unpack::ProjectVdifHeader header = {};
+    if (!BuildVdifSenderHeader(config, group_index, &header, error)) return false;
 
     std::vector<std::uint8_t> result(static_cast<std::size_t>(
         32U + config.geometry.payload_bytes), 0);

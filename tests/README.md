@@ -53,8 +53,12 @@ ctest --test-dir build-linux --output-on-failure
 | `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、未知字段保留、TFPA/无包头几何、零填充策略及输入冲突不发布输出 | `BUILD_TESTING=ON` |
 | `vdif_unpack_engine_test` | `vdif_unpack_engine_test.cpp` | 校验任意 Station 顺序和跨 block 的 TFP→TFPA 重排、完整 group 稳定等待、超时/EOD 零填充、arena 淘汰、坏包/重复/late 统计及 partial-block 契约 | `BUILD_TESTING=ON` |
 | `group_block_writer_test` | `group_block_writer_test.cpp` | 用内存 block sink 验证有序 group 直接填充满 block、EOD 精确提交部分 block、空传输不提交，以及 group/sink 容量错误不发布数据 | `BUILD_TESTING=ON` |
-| `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 sender JSON、整数皮秒跨秒/frame 重置、双 Station 同时间 key、CI8/CI16 确定性 payload、MTU 和 invalid-header 注入 | `BUILD_TESTING=ON` |
-| `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 临时 UDP 端口验证真实发送的 Station ID、drop、byte-identical duplicate、invalid Word 7 和完整 datagram 长度 | 找到 Python 3 |
+| `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 schema v1/v2 sender JSON、显式 source、PACED/batch/payload mode、整数皮秒跨秒/frame 重置、双 Station、CI8/CI16、MTU 和 fault | `BUILD_TESTING=ON` |
+| `vdif_sender_rate_test` | `vdif_sender_rate_test.cpp` | 校验等速 Station 整数分配、固定点累计字节 deadline、零值和 uint64 overflow | `BUILD_TESTING=ON` |
+| `vdif_sender_batch_test` | `vdif_sender_batch_test.cpp` | 校验固定 packet pool 地址、连续 header、Station 模板、repeat payload 和 deterministic reference 一致性 | `BUILD_TESTING=ON` |
+| `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source 字段一致 | `BUILD_TESTING=ON` |
+| `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
+| `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |

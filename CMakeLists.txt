@@ -69,13 +69,19 @@ target_include_directories(rdma_module_vdif_unpack
 target_link_libraries(rdma_module_vdif_unpack PUBLIC rdma_pipeline_core)
 
 add_library(rdma_vdif_sender_sim STATIC
-    src/simulation/vdif_sender_sim.cpp)
+    src/simulation/vdif_sender_sim.cpp
+    src/simulation/vdif_sender_rate.cpp
+    src/simulation/vdif_sender_batch.cpp
+    src/simulation/udp_vdif_sender.cpp)
 target_include_directories(rdma_vdif_sender_sim
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rdma_vdif_sender_sim PUBLIC
     rdma_module_vdif_unpack
     rdma_pipeline_config)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(rdma_vdif_sender_sim PRIVATE _GNU_SOURCE)
+endif()
 
 add_library(rdma_module_beamform STATIC
     modules/beamform/beamform_module.cpp)
@@ -226,6 +232,16 @@ if(BUILD_TESTING)
     target_link_libraries(vdif_sender_sim_test PRIVATE
         rdma_vdif_sender_sim
         rdma_module_vdif_unpack)
+    add_executable(vdif_sender_rate_test tests/vdif_sender_rate_test.cpp)
+    target_link_libraries(vdif_sender_rate_test PRIVATE rdma_vdif_sender_sim)
+    add_executable(vdif_sender_batch_test tests/vdif_sender_batch_test.cpp)
+    target_link_libraries(vdif_sender_batch_test PRIVATE
+        rdma_vdif_sender_sim
+        rdma_module_vdif_unpack)
+    add_executable(udp_vdif_sender_test tests/udp_vdif_sender_test.cpp)
+    target_link_libraries(udp_vdif_sender_test PRIVATE
+        rdma_vdif_sender_sim
+        rdma_pipeline_config)
     add_executable(pipeline_config_test tests/pipeline_config_test.cpp)
     target_link_libraries(pipeline_config_test PRIVATE rdma_pipeline_config)
     add_executable(packet_format_config_test
@@ -309,7 +325,11 @@ if(BUILD_TESTING)
     add_test(
         NAME vdif_sender_sim_test
         COMMAND vdif_sender_sim_test
-                ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json)
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.paced.example.json)
+    add_test(NAME vdif_sender_rate_test COMMAND vdif_sender_rate_test)
+    add_test(NAME vdif_sender_batch_test COMMAND vdif_sender_batch_test)
+    add_test(NAME udp_vdif_sender_test COMMAND udp_vdif_sender_test)
     add_test(
         NAME pipeline_config_test
         COMMAND pipeline_config_test
@@ -338,7 +358,16 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/fpga_sender_sim_loopback_test.py
                     $<TARGET_FILE:fpga_sender_sim>
-                    ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.example.json
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.paced.example.json)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(
+                NAME fpga_sender_sim_linux_batch_test
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fpga_sender_sim_linux_batch_test.py
+                        $<TARGET_FILE:fpga_sender_sim>
+                        ${CMAKE_CURRENT_SOURCE_DIR}/config/fpga_sender_sim.paced.example.json)
+        endif()
         add_test(
             NAME packet_format_inspect_test
             COMMAND ${Python3_EXECUTABLE}

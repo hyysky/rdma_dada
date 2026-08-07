@@ -147,5 +147,6 @@ bash scripts/run_demo.sh start
 - 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
-  binary decoder、packet-group 状态机和 TFPA scatter 尚未实现。
+  binary decoder、packet-group 状态机、TFPA scatter 及低速双 Station 真实 RDMA→unpack
+  基线已通过；接近 40 Gbps 的全正确 UDP 测速和低错误率测试尚未执行。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。
