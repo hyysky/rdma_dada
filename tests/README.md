@@ -47,6 +47,7 @@ ctest --test-dir build-linux --output-on-failure
 
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
+| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类和幂次日志限频 | `BUILD_TESTING=ON` |
 | `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_config_test` | `vdif_unpack_config_test.cpp` | 校验 ring key、Station ID→A 映射、两 block payload-only 窗口几何、profile 冲突、内存上限与溢出错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、未知字段保留、TFPA/无包头几何、零填充策略及输入冲突不发布输出 | `BUILD_TESTING=ON` |
@@ -78,9 +79,44 @@ ctest --test-dir build-linux --output-on-failure
 | `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→Beamform→Power→TimeIntegrate→D2H、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
 | `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成 RAW/TFP/32-byte 与 COMPUTE/TFPA/无包头双阶段 round-trip，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
+| `rdma_receiver_integration_test` | `rdma_receiver_integration.sh` + `rdma_udp_probe.py` | 从两台远端服务器发送不同源 MAC/IP/port 的正常 UDP record，并在正常包之间插入短包；验证 raw ring 只含 8 个完整 record、接收持续运行且统计为 accepted=8/wrong_length=1 | `BUILD_RDMA_PIPELINE=ON`、真实 RDMA NIC/PSRDADA/SSH sender 环境；未配置时 skip 77 |
 | `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 创建精确 raw/compute rings，经 `dada_diskdb` 输入跨 block Project VDIF transfer，并用 `dada_dbdisk` 验证 full/partial compute block、TFPA 字节、完整 header、EOD 及同一 worker 的连续双 transfer | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
 
 ## 单项调用
+
+### RDMA 接收策略与真实多来源测试
+
+可移植策略测试：
+
+```bash
+./build/rdma_receive_policy_test
+ctest --test-dir build -R '^rdma_receive_policy_test$' --output-on-failure
+```
+
+真实 NIC 测试需要接收服务器能够免交互 SSH 到两台已同步本项目的发送服务器：
+
+```bash
+export RDMA_TEST_DEVICE=1
+export RDMA_TEST_DMAC=10:70:fd:11:e2:e3
+export RDMA_TEST_DIP=10.17.16.11
+export RDMA_TEST_DPORT=17201
+export RDMA_TEST_SENDER_A=sender-a
+export RDMA_TEST_SENDER_A_IP=10.17.16.60
+export RDMA_TEST_SENDER_B=sender-b
+export RDMA_TEST_SENDER_B_IP=10.17.16.61
+export RDMA_TEST_REMOTE_SOURCE_DIR=/path/to/rdma_dada
+export RDMA_TEST_SSH_KNOWN_HOSTS=/tmp/rdma-task7-known-hosts
+
+ctest --test-dir build-linux \
+  -R '^rdma_receiver_integration_test$' --output-on-failure
+```
+
+两台发送服务器分别显式绑定 `RDMA_TEST_SENDER_A_IP`/`B_IP` 和 UDP source port
+41001/41002。A 发送端在第 2 个正常
+record 后插入一个少 1 byte 的 record；B 发送端随后补足第二种来源的正常数据。测试
+使用 1056-byte UDP payload，避免依赖 jumbo MTU。未设置上述变量时测试返回 skip 77。
+`RDMA_TEST_SSH_KNOWN_HOSTS` 应是本次测试专用文件；脚本启用严格 host-key 校验，不会
+读取或修改运行账户的永久 `~/.ssh/known_hosts`。
 
 ### `pipeline_config_test`
 

@@ -10,6 +10,7 @@
 #include <stdio.h>
 
 #include "rdma_dada/io/rdma/receiver.h"
+#include "rdma_dada/io/rdma/receive_policy.h"
 #include "rdma_dada/io/rdma/verbs_context.h"
 #include "rdma_dada/io/rdma/packet_builder.h"
 
@@ -31,9 +32,9 @@
 #define MEASURE_BANDWIDTH(size, t) ((double)size * 8.0 / t / 1000)
 #define RX_STRIP_HEADER_BYTES 42
 
-static bool validate_completion(const struct ibv_wc &wc,
-                                const struct ibv_utils_res *ibv_res_ptr,
-                                bool receive)
+static bool validate_send_completion(
+    const struct ibv_wc &wc,
+    const struct ibv_utils_res *ibv_res_ptr)
 {
     if (wc.status != IBV_WC_SUCCESS) {
         fprintf(stderr,
@@ -44,9 +45,7 @@ static bool validate_completion(const struct ibv_wc &wc,
         return false;
     }
 
-    const uint64_t wr_limit = receive
-        ? (uint64_t)ibv_res_ptr->recv_wr_num
-        : (uint64_t)ibv_res_ptr->send_wr_num;
+    const uint64_t wr_limit = (uint64_t)ibv_res_ptr->send_wr_num;
     if (wc.wr_id >= wr_limit) {
         fprintf(stderr,
                 "[ERROR] CQ completion has invalid wr_id=%" PRIu64
@@ -55,22 +54,7 @@ static bool validate_completion(const struct ibv_wc &wc,
         return false;
     }
 
-    if (receive) {
-        if (wc.opcode != IBV_WC_RECV) {
-            fprintf(stderr,
-                    "[ERROR] Receive CQ returned unexpected opcode=%d for "
-                    "wr_id=%" PRIu64 ".\n",
-                    wc.opcode, wc.wr_id);
-            return false;
-        }
-        if (wc.byte_len != ibv_res_ptr->pkt_size) {
-            fprintf(stderr,
-                    "[ERROR] Receive CQ byte_len=%u for wr_id=%" PRIu64
-                    "; expected exactly %u bytes.\n",
-                    wc.byte_len, wc.wr_id, ibv_res_ptr->pkt_size);
-            return false;
-        }
-    } else if (wc.opcode != IBV_WC_SEND) {
+    if (wc.opcode != IBV_WC_SEND) {
         fprintf(stderr,
                 "[ERROR] Send CQ returned unexpected opcode=%d for "
                 "wr_id=%" PRIu64 ".\n",
@@ -81,31 +65,82 @@ static bool validate_completion(const struct ibv_wc &wc,
     return true;
 }
 
+static void log_fatal_receive_completion(
+    const struct ibv_wc &wc,
+    const struct ibv_utils_res *ibv_res_ptr)
+{
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr,
+                "[ERROR] Receive CQ completion failed: wr_id=%" PRIu64
+                ", status=%s (%d), vendor_err=%u\n",
+                wc.wr_id, ibv_wc_status_str(wc.status), wc.status,
+                wc.vendor_err);
+    } else if (wc.wr_id >= (uint64_t)ibv_res_ptr->recv_wr_num) {
+        fprintf(stderr,
+                "[ERROR] Receive CQ completion has invalid wr_id=%" PRIu64
+                " (limit=%d).\n",
+                wc.wr_id, ibv_res_ptr->recv_wr_num);
+    } else {
+        fprintf(stderr,
+                "[ERROR] Receive CQ returned unexpected opcode=%d for "
+                "wr_id=%" PRIu64 ".\n",
+                wc.opcode, wc.wr_id);
+    }
+}
+
+static int repost_receive_wr(struct ibv_utils_res *ibv_res_ptr,
+                             uint64_t wr_id)
+{
+    ibv_res_ptr->recv_wr->wr_id = wr_id;
+    ibv_res_ptr->recv_wr->sg_list =
+        &ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge];
+    ibv_res_ptr->recv_wr->num_sge = ibv_res_ptr->recv_nsge;
+    ibv_res_ptr->recv_wr->next = NULL;
+    const int ret = ibv_post_recv(ibv_res_ptr->qp,
+                                  ibv_res_ptr->recv_wr,
+                                  &ibv_res_ptr->bad_recv_wr);
+    if (ret != 0) {
+        fprintf(stderr,
+                "[ERROR] Failed to repost receive WR wr_id=%" PRIu64
+                ": ret=%d, errno=%d (%s)\n",
+                wr_id, ret, errno, strerror(errno));
+    }
+    return ret;
+}
+
 static int check_send_recv_info(struct ibv_utils_res * ibv_res_ptr, RoCEv2Dada::RdmaParam * Param_ptr)
 {
     printf("**********************************************\n");
     printf("Recv Config Information:\n");
     printf("    device_id: %d\n", Param_ptr->device_id);
-    printf("    src_mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                ibv_res_ptr->pkt_info.src_mac[0], ibv_res_ptr->pkt_info.src_mac[1],
-                ibv_res_ptr->pkt_info.src_mac[2], ibv_res_ptr->pkt_info.src_mac[3],
-                ibv_res_ptr->pkt_info.src_mac[4], ibv_res_ptr->pkt_info.src_mac[5]);
+    if (Param_ptr->SendOrRecv) {
+        printf("    src_mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                    ibv_res_ptr->pkt_info.src_mac[0], ibv_res_ptr->pkt_info.src_mac[1],
+                    ibv_res_ptr->pkt_info.src_mac[2], ibv_res_ptr->pkt_info.src_mac[3],
+                    ibv_res_ptr->pkt_info.src_mac[4], ibv_res_ptr->pkt_info.src_mac[5]);
+    } else {
+        printf("    source_filter: ANY\n");
+    }
     printf("    dst_mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
                 ibv_res_ptr->pkt_info.dst_mac[0], ibv_res_ptr->pkt_info.dst_mac[1],
                 ibv_res_ptr->pkt_info.dst_mac[2], ibv_res_ptr->pkt_info.dst_mac[3],
                 ibv_res_ptr->pkt_info.dst_mac[4], ibv_res_ptr->pkt_info.dst_mac[5]);
     uint8_t tmp[4];
-    tmp[3] = (ibv_res_ptr->pkt_info.src_ip >> 24) & 0xff;
-    tmp[2] = (ibv_res_ptr->pkt_info.src_ip >> 16) & 0xff;
-    tmp[1] = (ibv_res_ptr->pkt_info.src_ip >> 8) & 0xff;
-    tmp[0] = ibv_res_ptr->pkt_info.src_ip & 0xff;
-    printf("    src_ip: %d.%d.%d.%d\n", tmp[0], tmp[1], tmp[2], tmp[3]);
+    if (Param_ptr->SendOrRecv) {
+        tmp[3] = (ibv_res_ptr->pkt_info.src_ip >> 24) & 0xff;
+        tmp[2] = (ibv_res_ptr->pkt_info.src_ip >> 16) & 0xff;
+        tmp[1] = (ibv_res_ptr->pkt_info.src_ip >> 8) & 0xff;
+        tmp[0] = ibv_res_ptr->pkt_info.src_ip & 0xff;
+        printf("    src_ip: %d.%d.%d.%d\n", tmp[0], tmp[1], tmp[2], tmp[3]);
+    }
     tmp[3] = (ibv_res_ptr->pkt_info.dst_ip >> 24) & 0xff;
     tmp[2] = (ibv_res_ptr->pkt_info.dst_ip >> 16) & 0xff;
     tmp[1] = (ibv_res_ptr->pkt_info.dst_ip >> 8) & 0xff;
     tmp[0] = ibv_res_ptr->pkt_info.dst_ip & 0xff;
     printf("    dst_ip: %d.%d.%d.%d\n", tmp[0], tmp[1], tmp[2], tmp[3]);
-    printf("    src_port: %d\n", ibv_res_ptr->pkt_info.src_port);
+    if (Param_ptr->SendOrRecv) {
+        printf("    src_port: %d\n", ibv_res_ptr->pkt_info.src_port);
+    }
     printf("    dst_port: %d\n", ibv_res_ptr->pkt_info.dst_port);
     printf("    RdmaDirectGpu: %d, gpu_id: %d\n", Param_ptr->RdmaDirectGpu, Param_ptr->gpu_id);
     printf("    recv_wr_num: %d send_wr_num: %d send_nsge: %d recv_nsge: %d \n",
@@ -144,7 +179,9 @@ static int ib_send_pkg(struct ibv_utils_res * ibv_res, int send_idx, int send_nu
 }
 
 RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
-    : param(Param), ibv_res(NULL), stop_requested(false), thread_started(false)
+    : param(Param), ibv_res(NULL), stop_requested(false),
+      accepted_receive_packets(0), wrong_length_receive_packets(0),
+      thread_started(false)
 {
     printf("[RoCEv2Dada] Constructor started\n");
     fflush(stdout);
@@ -169,24 +206,39 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
         return;
     }
     
-    sscanf(this->param.SAddr, "%hhd.%hhd.%hhd.%hhd", &tmp[0], &tmp[1], &tmp[2], &tmp[3]);
-    ibv_res_ptr->pkt_info.src_ip = (tmp[3] << 24) | (tmp[2] << 16) | (tmp[1] << 8) | tmp[0];
-    sscanf(this->param.SMacAddr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                               &ibv_res_ptr->pkt_info.src_mac[0], &ibv_res_ptr->pkt_info.src_mac[1],
-                               &ibv_res_ptr->pkt_info.src_mac[2], &ibv_res_ptr->pkt_info.src_mac[3],
-                               &ibv_res_ptr->pkt_info.src_mac[4], &ibv_res_ptr->pkt_info.src_mac[5]);
+    if (this->param.SendOrRecv) {
+        sscanf(this->param.SAddr, "%hhd.%hhd.%hhd.%hhd",
+               &tmp[0], &tmp[1], &tmp[2], &tmp[3]);
+        ibv_res_ptr->pkt_info.src_ip =
+            (tmp[3] << 24) | (tmp[2] << 16) | (tmp[1] << 8) | tmp[0];
+        sscanf(this->param.SMacAddr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &ibv_res_ptr->pkt_info.src_mac[0],
+               &ibv_res_ptr->pkt_info.src_mac[1],
+               &ibv_res_ptr->pkt_info.src_mac[2],
+               &ibv_res_ptr->pkt_info.src_mac[3],
+               &ibv_res_ptr->pkt_info.src_mac[4],
+               &ibv_res_ptr->pkt_info.src_mac[5]);
+        sscanf(this->param.src_port, "%hd", &ibv_res_ptr->pkt_info.src_port);
+    }
     sscanf(this->param.DAddr, "%hhd.%hhd.%hhd.%hhd", &tmp[0], &tmp[1], &tmp[2], &tmp[3]);
     ibv_res_ptr->pkt_info.dst_ip = (tmp[3] << 24) | (tmp[2] << 16) | (tmp[1] << 8) | tmp[0];
     sscanf(this->param.DMacAddr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                                &ibv_res_ptr->pkt_info.dst_mac[0], &ibv_res_ptr->pkt_info.dst_mac[1],
                                &ibv_res_ptr->pkt_info.dst_mac[2], &ibv_res_ptr->pkt_info.dst_mac[3],
                                &ibv_res_ptr->pkt_info.dst_mac[4], &ibv_res_ptr->pkt_info.dst_mac[5]);
-    sscanf(this->param.src_port, "%hd", &ibv_res_ptr->pkt_info.src_port);
     sscanf(this->param.dst_port, "%hd", &ibv_res_ptr->pkt_info.dst_port);
-    
-    printf("[RoCEv2Dada] Network params parsed: %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
-           tmp[0], tmp[1], tmp[2], tmp[3], ibv_res_ptr->pkt_info.src_port,
-           tmp[0], tmp[1], tmp[2], tmp[3], ibv_res_ptr->pkt_info.dst_port);
+
+    if (this->param.SendOrRecv) {
+        printf("[RoCEv2Dada] Network params parsed: source -> "
+               "%d.%d.%d.%d:%d\n",
+               tmp[0], tmp[1], tmp[2], tmp[3],
+               ibv_res_ptr->pkt_info.dst_port);
+    } else {
+        printf("[RoCEv2Dada] Receive filter parsed: ANY source -> "
+               "%d.%d.%d.%d:%d\n",
+               tmp[0], tmp[1], tmp[2], tmp[3],
+               ibv_res_ptr->pkt_info.dst_port);
+    }
     fflush(stdout);
     
     if (!this->param.SendOrRecv) {
@@ -401,8 +453,8 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                     return NULL;
                 }
                 for (int i = 0; i < polled; ++i) {
-                    if (!validate_completion(ibv_res_ptr->wc[i],
-                                             ibv_res_ptr, false)) {
+                    if (!validate_send_completion(ibv_res_ptr->wc[i],
+                                                  ibv_res_ptr)) {
                         return NULL;
                     }
                 }
@@ -492,20 +544,58 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                            this_ptr->param.send_n);
                     fflush(stdout);
                 }
+                int accepted_completed = 0;
                 for (int i = 0; i < ibv_res_ptr->recv_completed; ++i) {
-                    if (!validate_completion(ibv_res_ptr->wc[i],
-                                             ibv_res_ptr, true)) {
+                    const struct ibv_wc completion = ibv_res_ptr->wc[i];
+                    const rdma_dada::io::rdma::ReceiveCompletion policy_input = {
+                        completion.status == IBV_WC_SUCCESS,
+                        completion.opcode == IBV_WC_RECV,
+                        completion.wr_id,
+                        completion.byte_len
+                    };
+                    const rdma_dada::io::rdma::ReceiveDisposition disposition =
+                        rdma_dada::io::rdma::ClassifyReceiveCompletion(
+                            policy_input,
+                            (uint64_t)ibv_res_ptr->recv_wr_num,
+                            ibv_res_ptr->pkt_size);
+                    if (disposition ==
+                        rdma_dada::io::rdma::ReceiveDisposition::kFatal) {
+                        log_fatal_receive_completion(completion, ibv_res_ptr);
                         return NULL;
                     }
+                    if (disposition ==
+                        rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength) {
+                        const uint64_t dropped =
+                            this_ptr->wrong_length_receive_packets.fetch_add(1) + 1;
+                        if (rdma_dada::io::rdma::ShouldLogWrongLengthDrop(
+                                dropped)) {
+                            fprintf(stderr,
+                                    "[WARN] Dropping wrong-length receive: "
+                                    "byte_len=%u, expected=%u, wr_id=%" PRIu64
+                                    ", total_wrong_length=%" PRIu64 ".\n",
+                                    completion.byte_len,
+                                    ibv_res_ptr->pkt_size,
+                                    completion.wr_id,
+                                    dropped);
+                        }
+                        if (repost_receive_wr(ibv_res_ptr,
+                                             completion.wr_id) != 0) {
+                            return NULL;
+                        }
+                        continue;
+                    }
+                    ibv_res_ptr->wc[accepted_completed] = completion;
+                    ++accepted_completed;
+                    this_ptr->accepted_receive_packets.fetch_add(1);
                 }
                 if (ibv_res_ptr->recv_sum_completed +
-                        ibv_res_ptr->recv_completed >
+                        accepted_completed >
                     ibv_res_ptr->recv_wr_num) {
                     fprintf(stderr,
                             "[ERROR] CQ accumulation overflow: buffered=%d, "
                             "new=%d, capacity=%d.\n",
                             ibv_res_ptr->recv_sum_completed,
-                            ibv_res_ptr->recv_completed,
+                            accepted_completed,
                             ibv_res_ptr->recv_wr_num);
                     return NULL;
                 }
@@ -513,8 +603,8 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                 // Accumulate validated completions at the current offset.
                 memcpy(ibv_res_ptr->wc_tmp + ibv_res_ptr->recv_sum_completed,
                        ibv_res_ptr->wc,
-                       sizeof(struct ibv_wc) * ibv_res_ptr->recv_completed);
-                ibv_res_ptr->recv_sum_completed += ibv_res_ptr->recv_completed;
+                       sizeof(struct ibv_wc) * accepted_completed);
+                ibv_res_ptr->recv_sum_completed += accepted_completed;
             if(ibv_res_ptr->recv_sum_completed >= this_ptr->param.send_n) {
                     // Batch complete, process data
                     if (this_ptr->param.debug_mode) {
@@ -564,19 +654,9 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                         block_bufsz = 0;
                     }
                     for(int i = 0; i < this_ptr->param.send_n; i++) {
-                        ibv_res_ptr->recv_wr->wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
-                        ibv_res_ptr->recv_wr->sg_list = &ibv_res_ptr->sge[ibv_res_ptr->wc_tmp[i].wr_id*ibv_res_ptr->recv_nsge];
-                        ibv_res_ptr->recv_wr->num_sge = ibv_res_ptr->recv_nsge;
-                        ibv_res_ptr->recv_wr->next = NULL;
-                        ret = ibv_post_recv(ibv_res_ptr->qp,
-                                            ibv_res_ptr->recv_wr,
-                                            &ibv_res_ptr->bad_recv_wr);
+                        ret = repost_receive_wr(
+                            ibv_res_ptr, ibv_res_ptr->wc_tmp[i].wr_id);
                         if (ret != 0) {
-                            fprintf(stderr,
-                                    "[ERROR] Failed to repost receive WR "
-                                    "wr_id=%" PRIu64 ": ret=%d, errno=%d (%s)\n",
-                                    ibv_res_ptr->wc_tmp[i].wr_id, ret, errno,
-                                    strerror(errno));
                             return NULL;
                         }
                     }
@@ -702,5 +782,27 @@ int RoCEv2Dada::Stop()
         return RDMA_ERROR;
     }
     thread_started = false;
+    if (!this->param.SendOrRecv) {
+        const ReceiveStats stats = GetReceiveStats();
+        const std::uint64_t total =
+            stats.accepted_packets + stats.wrong_length_packets;
+        const double wrong_length_ratio = total == 0 ? 0.0 :
+            static_cast<double>(stats.wrong_length_packets) /
+                static_cast<double>(total);
+        printf("[RDMA] Receive summary: accepted=%" PRIu64
+               ", wrong_length=%" PRIu64
+               ", wrong_length_ratio=%.9f\n",
+               stats.accepted_packets, stats.wrong_length_packets,
+               wrong_length_ratio);
+        fflush(stdout);
+    }
     return RDMA_OK;
+}
+
+RoCEv2Dada::ReceiveStats RoCEv2Dada::GetReceiveStats() const
+{
+    ReceiveStats stats;
+    stats.accepted_packets = accepted_receive_packets.load();
+    stats.wrong_length_packets = wrong_length_receive_packets.load();
+    return stats;
 }

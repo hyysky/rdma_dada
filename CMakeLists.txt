@@ -42,6 +42,12 @@ target_include_directories(rdma_pipeline_config
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+add_library(rdma_receive_policy STATIC
+    src/io/rdma/receive_policy.cpp)
+target_include_directories(rdma_receive_policy
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(rdma_pipeline_core STATIC
     src/pipeline/ascii_metadata.cpp
     src/pipeline/group_block_writer.cpp
@@ -204,6 +210,8 @@ target_link_libraries(fpga_sender_sim PRIVATE rdma_vdif_sender_sim)
 
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
+    add_executable(rdma_receive_policy_test tests/rdma_receive_policy_test.cpp)
+    target_link_libraries(rdma_receive_policy_test PRIVATE rdma_receive_policy)
     add_executable(project_vdif_v1_test tests/project_vdif_v1_test.cpp)
     target_link_libraries(project_vdif_v1_test PRIVATE rdma_module_vdif_unpack)
     add_executable(vdif_unpack_config_test tests/vdif_unpack_config_test.cpp)
@@ -279,6 +287,9 @@ if(BUILD_TESTING)
             rdma_module_transfer
             CUDA::cudart)
     endif()
+    add_test(
+        NAME rdma_receive_policy_test
+        COMMAND rdma_receive_policy_test)
     add_test(
         NAME project_vdif_v1_test
         COMMAND project_vdif_v1_test)
@@ -495,6 +506,7 @@ if(BUILD_RDMA_PIPELINE)
     target_compile_definitions(rdma_dada_rdma_io PUBLIC _GNU_SOURCE)
     target_link_libraries(rdma_dada_rdma_io
         PUBLIC
+            rdma_receive_policy
             ${IBVERBS_TARGET}
             Threads::Threads)
 
@@ -575,6 +587,16 @@ if(BUILD_RDMA_PIPELINE)
             NAME dada_header_roundtrip_test
             COMMAND dada_header_roundtrip_test
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
+        add_test(
+            NAME rdma_receiver_integration_test
+            COMMAND bash
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_receiver_integration.sh
+                    $<TARGET_FILE:rdma2dada>
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(rdma_receiver_integration_test PROPERTIES
+            LABELS "rdma;integration"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120)
         add_test(
             NAME vdif_unpack_worker_integration_test
             COMMAND bash

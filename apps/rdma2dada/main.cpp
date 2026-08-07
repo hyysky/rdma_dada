@@ -172,11 +172,11 @@ void print_helper() {
     printf("    ./rdma2dada [options]\n");
     printf("Options:\n");
     printf("    -d, NIC device number (default: 0)\n");
-    printf("    --smac, source MAC address (required)\n");
+    printf("    --smac, deprecated source MAC option (ignored by receiver)\n");
     printf("    --dmac, destination MAC address (required)\n");
-    printf("    --sip, source IP address (required)\n");
+    printf("    --sip, deprecated source IP option (ignored by receiver)\n");
     printf("    --dip, destination IP address (required)\n");
-    printf("    --sport, source port number (required)\n");
+    printf("    --sport, deprecated source port option (ignored by receiver)\n");
     printf("    --dport, destination port number (required)\n");
     printf("    --config, pipeline JSON config (default: config/pipeline.example.json)\n");
     printf("    --send_n, batch size (default: 64)\n");
@@ -301,10 +301,10 @@ int main(int argc, char *argv[]) {
     g_pkt_size = param.pkt_size;
     g_send_n = param.send_n;
 
-    if (strlen(param.SMacAddr) == 0 || strlen(param.DMacAddr) == 0 ||
-        strlen(param.SAddr) == 0 || strlen(param.DAddr) == 0 ||
-        strlen(param.src_port) == 0 || strlen(param.dst_port) == 0) {
-        fprintf(stderr, "Error: Missing required network parameters\n");
+    if (strlen(param.DMacAddr) == 0 || strlen(param.DAddr) == 0 ||
+        strlen(param.dst_port) == 0) {
+        fprintf(stderr,
+                "Error: Missing required destination network parameters\n");
         print_helper();
         return -1;
     }
@@ -357,7 +357,7 @@ int main(int argc, char *argv[]) {
     printf("  Packet Size: %d\n", param.pkt_size);
     printf("  Batch Size: %d\n", param.send_n);
     printf("  NSGE: %u\n", param.nsge);
-    printf("  Source: %s:%s (%s)\n", param.SAddr, param.src_port, param.SMacAddr);
+    printf("  Source filter: ANY MAC/IP/UDP port\n");
     printf("  Destination: %s:%s (%s)\n", param.DAddr, param.dst_port, param.DMacAddr);
     printf("[Main] Calling: new RoCEv2Dada(param)...\n");
     fflush(stdout);
@@ -380,7 +380,7 @@ int main(int argc, char *argv[]) {
     printf("\n========================================\n");
     printf("RDMA receiver running\n");
     printf("Listening on: %s:%s (%s)\n", param.DAddr, param.dst_port, param.DMacAddr);
-    printf("Expecting packets from: %s:%s (%s)\n", param.SAddr, param.src_port, param.SMacAddr);
+    printf("Accepting packets from: ANY source MAC/IP/UDP port\n");
     printf("\n");
     printf("⚠️  WAITING FOR DATA PACKETS\n");
     printf("   Make sure the sender is running and sending to:\n");

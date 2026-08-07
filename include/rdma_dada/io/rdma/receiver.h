@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 
 #ifdef __cplusplus
@@ -15,6 +16,12 @@ extern "C" {
 class RoCEv2Dada
 {
     public:
+        struct ReceiveStats
+        {
+            std::uint64_t accepted_packets;
+            std::uint64_t wrong_length_packets;
+        };
+
         typedef std::function<int(void)> DataSend;
         typedef std::function<char*(long int &)> GetBuff;
         typedef std::function<int(unsigned char *, long int )> WriteBuff;
@@ -49,6 +56,7 @@ class RoCEv2Dada
         ~RoCEv2Dada();
         int Start();
         int Stop();
+        ReceiveStats GetReceiveStats() const;
     private:
         RoCEv2Dada(const RoCEv2Dada &);
         const RoCEv2Dada &operator=(const RoCEv2Dada &);
@@ -56,6 +64,8 @@ class RoCEv2Dada
         RdmaParam param;
         void * ibv_res;
         std::atomic<bool> stop_requested;
+        std::atomic<std::uint64_t> accepted_receive_packets;
+        std::atomic<std::uint64_t> wrong_length_receive_packets;
         bool thread_started;
 };
 

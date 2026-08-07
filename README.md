@@ -119,7 +119,9 @@ python3 scripts/convert_config_to_json.py old.conf config/pipeline.json
 
 ## 运行当前 demo
 
-先修改 [scripts/run_demo.sh](scripts/run_demo.sh) 顶部的 MAC/IP/port/NIC 参数，以及 JSON 配置。当前 launcher 没有启动下游 worker，所以要求 `disk.enabled=true`，由 `dada_dbdisk` 作为 raw ring 的 reader。
+先修改 [scripts/run_demo.sh](scripts/run_demo.sh) 顶部的接收端 MAC/IP/port、NIC 参数，
+以及 JSON 配置。接收 flow 不限制发送端 MAC/IP/port。当前 launcher 没有启动下游
+worker，所以要求 `disk.enabled=true`，由 `dada_dbdisk` 作为 raw ring 的 reader。
 
 ```bash
 bash scripts/run_demo.sh start

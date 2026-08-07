@@ -1,5 +1,6 @@
 // Adapted from libsrc/udp_rdma/src/ibv_utils.cpp
 #include "rdma_dada/io/rdma/verbs_context.h"
+#include "rdma_dada/io/rdma/receive_policy.h"
 
 void ibv_utils_info(const char *msg) { fprintf(stdout, "IBV-UTILS INFO: %s \n", msg); }
 void ibv_utils_error(const char *msg) { fprintf(stderr, "IBV-UTILS ERROR: %s \n", msg); }
@@ -223,25 +224,31 @@ int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
             .size = sizeof(struct ibv_flow_spec_tcp_udp), 
         } 
     };
-    // Set Ethernet header matching (eth_type REQUIRED for RAW_PACKET)
+    const rdma_dada::io::rdma::DestinationUdpFilter filter =
+        rdma_dada::io::rdma::BuildDestinationUdpFilter(
+            pkt_info->dst_mac, pkt_info->dst_ip, pkt_info->dst_port);
+
+    // Match IPv4 UDP traffic for this destination. All source values and masks
+    // stay zero so every FPGA/Station source is accepted by the same QP.
     flow_attr.spec_eth.val.ether_type = htons(0x0800);  // IPv4
     flow_attr.spec_eth.mask.ether_type = 0xFFFF;        // Must match exactly
-    memcpy(flow_attr.spec_eth.val.dst_mac, pkt_info->dst_mac, 6);
-    memcpy(flow_attr.spec_eth.val.src_mac, pkt_info->src_mac, 6);
-    memset(flow_attr.spec_eth.mask.dst_mac, 0xFF, 6);  // Match all MAC bits
-    memset(flow_attr.spec_eth.mask.src_mac, 0xFF, 6);
+    memcpy(flow_attr.spec_eth.val.dst_mac, filter.destination_mac, 6);
+    memcpy(flow_attr.spec_eth.val.src_mac, filter.source_mac, 6);
+    memcpy(flow_attr.spec_eth.mask.dst_mac,
+           filter.destination_mac_mask, 6);
+    memcpy(flow_attr.spec_eth.mask.src_mac, filter.source_mac_mask, 6);
     
     // Set IPv4 header matching
-    flow_attr.spec_ipv4.val.dst_ip = pkt_info->dst_ip;
-    flow_attr.spec_ipv4.val.src_ip = pkt_info->src_ip;
-    flow_attr.spec_ipv4.mask.dst_ip = 0xFFFFFFFF;       // Match full IP
-    flow_attr.spec_ipv4.mask.src_ip = 0xFFFFFFFF;
+    flow_attr.spec_ipv4.val.dst_ip = filter.destination_ip;
+    flow_attr.spec_ipv4.val.src_ip = filter.source_ip;
+    flow_attr.spec_ipv4.mask.dst_ip = filter.destination_ip_mask;
+    flow_attr.spec_ipv4.mask.src_ip = filter.source_ip_mask;
     
     // Set UDP port matching
-    flow_attr.spec_udp.val.dst_port = htons(pkt_info->dst_port);
-    flow_attr.spec_udp.val.src_port = htons(pkt_info->src_port);
-    flow_attr.spec_udp.mask.dst_port = 0xFFFF;          // Match full port
-    flow_attr.spec_udp.mask.src_port = 0xFFFF;
+    flow_attr.spec_udp.val.dst_port = htons(filter.destination_port);
+    flow_attr.spec_udp.val.src_port = htons(filter.source_port);
+    flow_attr.spec_udp.mask.dst_port = filter.destination_port_mask;
+    flow_attr.spec_udp.mask.src_port = filter.source_port_mask;
     
     // Debug: print flow rule details before creation
     printf("[create_flow] Attempting to create flow steering rule:\n");
@@ -250,17 +257,13 @@ int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
     printf("  ETH: ether_type=0x%04x (IPv4=%s)\n", 
            ntohs(flow_attr.spec_eth.val.ether_type),
            ntohs(flow_attr.spec_eth.val.ether_type) == 0x0800 ? "Yes" : "No");
-    printf("       dst_mac=%02x:%02x:%02x:%02x:%02x:%02x src_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+    printf("       dst_mac=%02x:%02x:%02x:%02x:%02x:%02x src_mac=ANY\n",
            pkt_info->dst_mac[0], pkt_info->dst_mac[1], pkt_info->dst_mac[2],
-           pkt_info->dst_mac[3], pkt_info->dst_mac[4], pkt_info->dst_mac[5],
-           pkt_info->src_mac[0], pkt_info->src_mac[1], pkt_info->src_mac[2],
-           pkt_info->src_mac[3], pkt_info->src_mac[4], pkt_info->src_mac[5]);
-    uint8_t *sip = (uint8_t*)&pkt_info->src_ip;
+           pkt_info->dst_mac[3], pkt_info->dst_mac[4], pkt_info->dst_mac[5]);
     uint8_t *dip = (uint8_t*)&pkt_info->dst_ip;
-    printf("  IPv4: %d.%d.%d.%d -> %d.%d.%d.%d\n",
-           sip[0], sip[1], sip[2], sip[3],
+    printf("  IPv4: ANY -> %d.%d.%d.%d\n",
            dip[0], dip[1], dip[2], dip[3]);
-    printf("  UDP: port %d -> %d\n", pkt_info->src_port, pkt_info->dst_port);
+    printf("  UDP: port ANY -> %d\n", pkt_info->dst_port);
     
     struct ibv_flow *flow = ibv_create_flow(qp, &flow_attr.attr);
     if(!flow){ 

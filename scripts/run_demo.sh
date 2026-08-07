@@ -29,11 +29,8 @@ declare -a keys
 
 # ============= Configuration =============
 # Network parameters
-SMAC="02:a2:02:00:02:fa"
 DMAC="10:70:fd:11:e2:e3"
-SIP="10.17.16.60"
 DIP="10.17.16.11"
-SPORT="60000"
 DPORT="17201"
 
 # Hardware parameters
@@ -111,7 +108,7 @@ fi
     echo_info "RDMA + PSRDADA Ring Buffer Demo"
     echo_info "========================================"
     echo_info "Configuration:"
-    echo_info "  Network: ${SMAC} → ${DMAC}, ${SIP}:${SPORT} → ${DIP}:${DPORT}"
+    echo_info "  Network: ANY source → ${DMAC}, ${DIP}:${DPORT}"
     echo_info "  Data contract: ${PIPELINE_CONFIG}"
     echo_info "  PSRDADA: ${RAW_RECORD_BYTES} bytes/record, ${NBUFS} blocks"
     echo_info "  Block size: ${BLOCK_BYTES} bytes, Ring: ${RING_BYTES} bytes"
@@ -280,8 +277,7 @@ trap cleanup EXIT
 
         # Step 3: Start receiver (run in foreground, but trap will handle cleanup)
         CMD=(./build/rdma2dada
-            --smac "${SMAC}" --dmac "${DMAC}"
-            --sip "${SIP}" --dip "${DIP}" --sport "${SPORT}" --dport "${DPORT}"
+            --dmac "${DMAC}" --dip "${DIP}" --dport "${DPORT}"
             --key "${KEY}" --device "${DEVICE}" --gpu "${GPU}" --cpu "${CPU}"
             --send_n "${SEND_N}" --nsge "${NSGE}"
             --config "${PIPELINE_CONFIG}" --dump-header "${DUMP_HEADER}")
