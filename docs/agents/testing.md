@@ -1,0 +1,214 @@
+# Reproducible Test Policy
+
+This document defines how a test becomes repeatable acceptance evidence for
+`rdma_dada`. It applies to portable unit tests, CUDA modules, PSRDADA rings,
+RDMA/UDP ingest, unpack, pipeline integration and throughput measurements.
+
+## Acceptance is a repeatable procedure
+
+A test is not complete because it passed once. Final acceptance requires a
+versioned runner that can recreate the test from a clean state without relying
+on remembered commands, interactive shell state or manually edited remote
+files.
+
+The runner must provide one documented entry command and accept all variable
+inputs through explicit CLI arguments or a recorded configuration file. It
+must create a unique run ID, persist its state, produce a machine-readable
+result and clean only resources owned by that run.
+
+Finite network fixtures must align their record count to both the sender batch
+and the raw-ring block geometry. With two mandatory Stations and 2,048 records
+per raw block, the group count is a multiple of 1,024 so EOD does not strand an
+unpublished partial raw block. Partial-block behavior is tested separately and
+must not be confused with packet loss or throughput failure.
+
+## Phase 0: target-server environment preflight
+
+Before designing or changing a remote test controller, fixture or script, run
+a read-only preflight on every target host and return its evidence to the
+development task. The test design must use the environment that was actually
+observed, not assumptions copied from macOS, another server or a previous run.
+
+At minimum, record:
+
+- exact paths, versions and supported CLI options for every required binary;
+- dynamic-library resolution and relevant runtime/toolchain versions;
+- required user, device, network and capability permissions;
+- NIC device/link state, addresses, MTU, queue information and NUMA placement;
+- available CPU, memory and disk capacity plus the intended output location;
+- UTC/NTP/PTP state and command/shell behavior that affects argument parsing;
+- SHA256 values for the tested executables and supplied source/config files.
+
+If any required check cannot be completed, or a required facility is missing
+or incompatible, stop before harness implementation or formal execution and
+report `TEST_RESULT=ENV_BLOCKED` with the exact command and output. Propose the
+smallest environment decision needed; do not guess a path, silently install a
+dependency or hide the blocker in a test-script workaround. Repeat Phase 0
+after any approved environment change.
+
+### Minimum repetition
+
+| Test class | Final acceptance requirement |
+| --- | --- |
+| Unit and portable component | Three consecutive clean executions of the relevant test command |
+| GPU numerical module | Three consecutive executions using the same recorded input/seed and tolerance, with every comparison passing |
+| PSRDADA/RDMA integration | Three fresh ring/process lifecycles with reconciled producer, receiver, unpack and consumer counts |
+| Functional multi-Station network | Three complete synchronized transfers with correct Station mapping, headers, TFPA data and EOD |
+| Performance rate point | One warm-up plus at least three measured runs; every measured run must satisfy correctness and stability gates |
+| Fault injection | A recorded seed and manifest, repeated with identical injected records and identical expected counters |
+
+Additional repetitions may be required for timing-sensitive or intermittent
+failures. Reports include every run; do not discard failed runs or select only
+the best result.
+
+## Required run artifacts
+
+Each run directory contains at least:
+
+- `manifest.json`: Git commit, source manifest, binary origin, host names,
+  toolchain versions, configuration hashes, command arguments and run ID;
+- `state.json`: current orchestration phase and owned resource identifiers;
+- `result.json`: immutable test outcome, failure classification, counters,
+  rates and acceptance checks;
+- separate stdout/stderr logs for controller, receiver, worker, consumer and
+  every sender;
+- cleanup evidence showing the disposition of every PID, ring key, capability
+  and temporary path owned by the run.
+
+Git is managed only in the local development worktree. Remote test hosts do not
+need a Git executable and test controllers must not invoke Git there. The
+development task supplies source SHA256 values; remote manifests record and
+compare those values together with generated configuration and binary SHA256.
+
+`result.json` is written before cleanup and augmented with cleanup status; the
+test outcome is never replaced by a final `CLEANED` state. Python controllers
+run unbuffered or explicitly flush logs, and unexpected exceptions retain the
+traceback and the first failed command's argv, exit code, stdout and stderr.
+
+## Outcome classification
+
+Use distinct fields rather than overloading PASS/FAIL:
+
+- `TEST_RESULT=PASS`: all correctness and acceptance gates passed;
+- `TEST_RESULT=PRODUCT_FAIL`: the tested implementation violated its contract;
+- `TEST_RESULT=HARNESS_FAIL`: configuration transfer, quoting, controller,
+  logging or orchestration failed before a valid product measurement;
+- `TEST_RESULT=ENV_BLOCKED`: required hardware, permission, capacity, clock or
+  dependency was unavailable after an attempted and recorded check;
+- `RESULT_NOTIFICATION=PASS|FAIL`: whether the result callback was delivered;
+- `CLEANUP_RESULT=PASS|FAIL`: whether owned resources were removed.
+
+A sender that never started cannot produce a throughput FAIL. A dry-run cannot
+produce a functional PASS. A single-Station result cannot be reported as a
+multi-Station PASS.
+
+## Controller requirements
+
+Long-running server tests use a versioned controller in this repository. The
+controller must:
+
+1. run from one declared control host and avoid recursive control-host SSH;
+2. use argument arrays or transferred wrapper files instead of nested shell
+   quoting;
+3. generate configs deterministically and verify source/target hashes;
+4. derive future launch time at execution time and start Station processes
+   concurrently;
+5. persist state so a Codex turn or SSH client can reconnect without restarting
+   the observation;
+6. assign unique remote directories, PID files and ring keys or explicitly
+   validate exclusive ownership;
+7. use `finally`/trap cleanup scoped to recorded resources, never broad `pkill`;
+8. retain the original failure after cleanup and always write `result.json`;
+9. support `--dry-run` and automated self-tests, including real entry routing,
+   early sender failure, expired start-time regeneration, resume and cleanup;
+10. fail closed when counts, headers, EOD, logs or result artifacts are missing.
+
+The controller itself is reviewed and tested like project code. A controller
+created only in `/tmp` is diagnostic material and cannot authorize final
+acceptance.
+
+## Environment and synchronization lessons
+
+- Compare a shared Git commit and source/config manifest. Independently built
+  binaries are not required to have identical SHA256 because compiler paths,
+  toolchains and build IDs may differ; copy one artifact when byte identity is
+  required.
+- Resolve server-side tools during Phase 0 and generate remote scripts with
+  their verified absolute paths. Non-login SSH does not inherit interactive
+  shell PATH additions; a successful interactive command is not evidence that
+  the same bare command name will resolve inside the acceptance runner.
+- Redirect the file descriptors of an entire background subshell, not only the
+  command nested inside it. A background child that retains the SSH channel's
+  stdout or stderr keeps the remote SSH call open and can deadlock startup when
+  later pipeline stages are responsible for producing its input or EOD.
+- Verify host keys with a dedicated temporary `known_hosts`, then use strict
+  checking. Create and verify every destination directory before transfer.
+- Do not infer clock offset from sequential SSH response timestamps. Use NTP/PTP
+  status or a concurrent measurement method that accounts for round-trip time.
+- A common future start time is generated after preparation, with a minimum
+  margin check immediately before concurrent sender launch. If the margin is
+  insufficient, regenerate and redistribute both Station configs.
+- All enabled Stations participate in the same repetition. Never combine a
+  successful Station from one attempt with another Station from a later run.
+
+## Astronomy observation semantics
+
+Tests must preserve the failure semantics of a continuous astronomical
+observation, not merely exercise isolated commands:
+
+- every configured Station is required to enter the same observation; if any
+  Station sender cannot start, terminate already-started senders and stop the
+  receiver, unpack worker and consumer for that transfer;
+- after the common start, monitor all Station senders concurrently; an early
+  abnormal exit from any sender aborts the whole transfer immediately rather
+  than waiting for the remaining sender to finish;
+- a missing Station process is an observation-level failure and must not be
+  accepted as a lower-antenna-count observation or combined with data from a
+  different attempt;
+- individual late, missing, duplicate or bad packets during an otherwise live
+  observation follow the configured zero-fill and counter policy. They are
+  distinct from a Station that failed to participate, and acceptance uses the
+  configured error-rate thresholds.
+
+## Performance reporting
+
+Use two explicit compute-consumer modes:
+
+- `dbdisk` is the correctness mode. It materializes the compute transfer so the
+  test can inspect the PSRDADA header, exact data byte count and known TFPA
+  sample bytes.
+- `dbnull` is the performance mode. Run `dada_dbnull -k KEY -s -z -q` so the
+  compute ring is drained with direct shared-memory block access and no disk
+  write. Require the consumer to reach EOD and exit zero. In this mode output
+  correctness is established by the preceding `dbdisk` gate plus exact
+  receiver/unpack reconciliation for every measured run.
+
+Do not compare a `dbdisk` throughput result with a `dbnull` result as if they
+measured the same pipeline boundary; always report the consumer mode.
+
+For every measured rate and repetition, record:
+
+- configured and actual payload rate for every sender;
+- scheduled, sent, retried and failed packets plus batch/overrun counters;
+- NIC, CQ and receiver accepted/drop/error deltas;
+- raw-ring and compute-ring throughput/backpressure;
+- unpack complete/incomplete/missing/duplicate/late/bad-header counters;
+- CPU affinity/utilization and NUMA placement;
+- producer→receiver→unpack→consumer count reconciliation;
+- header, Station-to-A mapping, TFPA sample and EOD verification.
+
+Report median, minimum, maximum and spread across measured repetitions. A rate
+is stable only when every repetition satisfies correctness gates and the
+documented rate tolerance. The first saturated component must be supported by
+logs and counters, not inferred from sender rate alone.
+
+## Lessons retained from Task 8C
+
+Task 8C exposed failures in nested SSH quoting, temporary host-key handling,
+missing destination directories, sequential sender launch, premature
+`start_utc`, SSH-based clock inference, unimplemented controller paths, false
+self-test claims, swallowed exceptions and cleanup overwriting failure state.
+
+These are harness failures, not evidence that UDP sender, RDMA ingest or VDIF
+unpack failed. The policy above exists so the same mistakes become automated
+regression cases and cannot recur as undocumented manual knowledge.

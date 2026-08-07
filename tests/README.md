@@ -59,6 +59,7 @@ ctest --test-dir build-linux --output-on-failure
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 Task 8C 控制器的无 Git 测试主机、直接 SSH、配置/二进制 SHA、sender batch 与 raw-block 对齐、共同启动时间刷新、双 sender 并发、dbdisk/dbnull consumer、结果分类、manifest、定向清理和 warm-up+三次测量汇总 | 找到 Python 3；不连接远端服务器 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
@@ -199,6 +200,55 @@ ctest --test-dir build \
 
 loopback 测试使用操作系统分配的临时端口，不依赖固定端口或外部网络；若执行环境禁止
 创建本地 socket，需要为该测试开放 `127.0.0.1` 回环权限。
+
+### Task 8C 双 Station 速率点
+
+控制器自测不访问远端服务器：
+
+```bash
+python3 tests/task8c_rate_point_test.py
+ctest --test-dir build-linux -R '^task8c_rate_point_test$' --output-on-failure
+```
+
+正式测试在 HF 控制机的项目根目录执行。下面一条命令会依次执行一次 warm-up 和三次
+独立测量；每次都重新创建 ring、启动 receiver/unpack/consumer 和两个 sender，最后定向
+清理本次资源。结果保存在项目目录之外的持久路径，不能使用临时手写控制器代替：
+
+```bash
+python3 -u scripts/task8c_rate_point.py \
+  --aggregate-gbps 1 \
+  --duration-seconds 10 \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --result-root /home/user/wy/task8c-results \
+  --execute
+```
+
+每次运行产生 `manifest.json`、`state.json`、`result.json` 和分组件日志；suite 目录的
+`summary.json` 汇总三次实测速率的 median/minimum/maximum/spread。只有四次运行清理均
+完成、三次 measured 均为 `PASS` 且 summary 为 `PASS`，该速率点才通过。
+如果 warm-up 或任一 measured run 的测试结果或清理结果失败，suite 会立即停止，且不会
+创建后续 run 的进程、ring 或结果目录。
+任一 Station 无法启动或提前异常退出时，控制器会立即终止另一 Station，并停止
+receiver、unpack 和 consumer；不会把单 Station 数据当作有效观测继续处理。
+
+1 Gbps correctness gate 保持默认 `--compute-consumer dbdisk`，以检查实际 `.dada` 文件。
+后续高速 rate point 使用：
+
+```bash
+python3 -u scripts/task8c_rate_point.py \
+  --aggregate-gbps 5 \
+  --duration-seconds 10 \
+  --compute-consumer dbnull \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --result-root /home/user/wy/task8c-results \
+  --execute
+```
+
+`dbnull` 模式执行 `dada_dbnull -k 00d4 -s -z -q`，要求 EOD 后退出码为 0，并继续严格
+核对 sender、receiver 和 unpack 的全部计数；它不生成 `.dada` 文件，因此 header/sample
+的文件级检查由先前通过的 `dbdisk` correctness gate 提供。
 
 ### 配置检查工具测试
 

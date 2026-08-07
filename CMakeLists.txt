@@ -387,6 +387,10 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/beamform_test_weights_generator_test.py
                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_beamform_test_weights.py)
+        add_test(
+            NAME task8c_rate_point_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
     endif()
     add_test(NAME pipeline_core_test COMMAND pipeline_core_test)
     add_test(
