@@ -19,21 +19,30 @@ extern "C" {
 
 #include <infiniband/verbs.h>
 #include "rdma_dada/io/psrdada/header_codec.h"
+#include "rdma_dada/pipeline/ascii_metadata.h"
 #include "dada_def.h"
 
 // 注意：data_block和hdu改为成员变量，不再使用全局变量
 
-PsrdadaRingBuf::PsrdadaRingBuf(): hdu(NULL), log(NULL), data_block(NULL), current_ptr(NULL), current_block(0), 
+PsrdadaRingBuf::PsrdadaRingBuf(): hdu(NULL), log(NULL), data_block(NULL), current_ptr(NULL), current_block(0),
+    block_bytes(0), record_bytes(0),
     is_initialized(0), buffer_key(0), 
     registered_pd(NULL), use_block_registration(false) {}
 
 // 初始化 PSRDADA 环形缓冲区
-int PsrdadaRingBuf::Init(key_t key, uint64_t block_bytes, uint64_t nbufs,
-                        const char *header_template_path,
-                        const dada_header_t &runtime_header)
+int PsrdadaRingBuf::Init(key_t key, uint64_t requested_block_bytes,
+                        uint64_t nbufs, uint64_t requested_record_bytes,
+                        const rdma_dada::pipeline::Metadata& runtime_header)
 {
     if (is_initialized) return -1;
+    if (requested_block_bytes == 0 || requested_record_bytes == 0 ||
+        requested_block_bytes % requested_record_bytes != 0) {
+        fprintf(stderr, "Invalid DADA block/record geometry\n");
+        return -1;
+    }
     buffer_key = key;
+    block_bytes = requested_block_bytes;
+    record_bytes = requested_record_bytes;
 
     log = (void *)multilog_open("psrdada_ringbuf", 0);
     if (!log) return -1;
@@ -86,21 +95,11 @@ int PsrdadaRingBuf::Init(key_t key, uint64_t block_bytes, uint64_t nbufs,
     }
     memset(hdrbuf, 0, (size_t)header_size);
 
-    // The template owns only site/observation fields unknown to this module.
-    // All data-contract fields are overlaid from the validated runtime config.
-    if (header_template_path) {
-        // Preserve every field in the template, including fields unknown to
-        // this module, and then overlay runtime values.
-        if (fileread(header_template_path, hdrbuf, (unsigned)header_size) < 0) {
-            fprintf(stderr, "Failed to read DADA header template %s\n", header_template_path);
-            ResetAfterInitFailure(true);
-            return -1;
-        }
-    }
-    if (ascii_header_set(hdrbuf, "HDR_VERSION", "1.0") < 0 ||
-        ascii_header_set(hdrbuf, "HDR_SIZE", "%" PRIu64, header_size) < 0 ||
-        write_dada_header(runtime_header, hdrbuf) < 0) {
-        fprintf(stderr, "Failed to populate runtime DADA header\n");
+    std::string header_error;
+    if (!rdma_dada::pipeline::SerializeAsciiMetadata(
+            runtime_header, hdrbuf, header_size, &header_error)) {
+        fprintf(stderr, "Failed to populate runtime DADA header: %s\n",
+                header_error.c_str());
         ResetAfterInitFailure(true);
         return -1;
     }
@@ -114,9 +113,7 @@ int PsrdadaRingBuf::Init(key_t key, uint64_t block_bytes, uint64_t nbufs,
         ResetAfterInitFailure(true);
         return -1;
     }
-    printf("Published runtime DADA header%s%s\n",
-           header_template_path ? " over template " : "",
-           header_template_path ? header_template_path : "");
+    printf("Published compiler-derived runtime DADA header\n");
     is_initialized = 1;
     printf("PsrdadaRingBuf initialized with key=0x%x, blocks=%lu, block_size=%lu\n", 
            key, (unsigned long)nbufs, (unsigned long)block_bytes);
@@ -136,6 +133,8 @@ void PsrdadaRingBuf::ResetAfterInitFailure(bool write_locked)
     log = NULL;
     data_block = NULL;
     current_ptr = NULL;
+    block_bytes = 0;
+    record_bytes = 0;
     is_initialized = 0;
 }
 
@@ -174,6 +173,13 @@ int PsrdadaRingBuf::MarkWritten(uint64_t bytes)
     if (!is_initialized) return -1;
     if (!current_ptr) {
         fprintf(stderr, "MarkWritten called but no current block\n");
+        return -1;
+    }
+    if (bytes == 0 || bytes > block_bytes || bytes % record_bytes != 0) {
+        fprintf(stderr,
+                "MarkWritten requires 1..%" PRIu64
+                " bytes aligned to %" PRIu64 "-byte records; got %" PRIu64
+                "\n", block_bytes, record_bytes, bytes);
         return -1;
     }
     
@@ -311,7 +317,9 @@ void PsrdadaRingBuf::Cleanup()
         multilog_close((multilog_t *)log); 
         log = NULL; 
     }
-    
+
+    block_bytes = 0;
+    record_bytes = 0;
     is_initialized = 0;
     printf("[Cleanup] \u2713 Cleanup complete - ring buffer can now be safely destroyed\n");
 }
@@ -512,6 +520,8 @@ int PsrdadaRingBuf::SendEODAndDisconnect()
     }
     
     is_initialized = 0;
+    block_bytes = 0;
+    record_bytes = 0;
     printf("[SendEODAndDisconnect] ✓ Complete\n");
     return 0;
 }

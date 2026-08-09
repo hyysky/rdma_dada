@@ -109,6 +109,48 @@ void TestWrongLengthLogIsRateLimited() {
            "non-power-of-two drop count is rate limited");
 }
 
+void TestRawBlockTailAccounting() {
+    namespace rdma = rdma_dada::io::rdma;
+    const std::uint64_t record_bytes = 1056;
+    const std::uint64_t block_bytes = 16U * record_bytes;
+
+    rdma::RawBlockTail tail =
+        rdma::ClassifyRawBlockTail(block_bytes, record_bytes, 0);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kNoData &&
+               tail.valid_records == 0 && tail.valid_bytes == 0,
+           "zero-byte tail does not publish a block");
+
+    tail = rdma::ClassifyRawBlockTail(
+        block_bytes, record_bytes, record_bytes);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kPublish &&
+               tail.valid_records == 1 && tail.valid_bytes == record_bytes,
+           "one complete record is publishable");
+
+    tail = rdma::ClassifyRawBlockTail(
+        block_bytes, record_bytes, 4U * record_bytes);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kPublish &&
+               tail.valid_records == 4,
+           "one work batch of complete records is publishable");
+
+    tail = rdma::ClassifyRawBlockTail(
+        block_bytes, record_bytes, 15U * record_bytes);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kPublish &&
+               tail.valid_records == 15,
+           "one record below a full block is publishable");
+
+    tail = rdma::ClassifyRawBlockTail(
+        block_bytes, record_bytes, record_bytes + 1U);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kInvalid,
+           "partial record byte count is rejected");
+    tail = rdma::ClassifyRawBlockTail(
+        block_bytes, record_bytes, block_bytes + record_bytes);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kInvalid,
+           "tail larger than a block is rejected");
+    tail = rdma::ClassifyRawBlockTail(block_bytes, 0, 0);
+    Expect(tail.disposition == rdma::RawBlockTailDisposition::kInvalid,
+           "zero record geometry is rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -116,6 +158,7 @@ int main() {
     TestWrongLengthIsRecoverable();
     TestTransportErrorsRemainFatal();
     TestWrongLengthLogIsRateLimited();
+    TestRawBlockTailAccounting();
     if (failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", failures);
         return 1;

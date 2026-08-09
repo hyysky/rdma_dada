@@ -12,21 +12,21 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <string>
+#include <limits>
+#include <climits>
 
-#include "rdma_dada/config/pipeline_config.h"
+#include <infiniband/verbs.h>
+
+#include "rdma_dada/config/observation_artifacts.h"
+#include "rdma_dada/config/resolved_plan_json.h"
 #include "rdma_dada/io/psrdada/ring_writer.h"
+#include "rdma_dada/io/rdma/receive_policy.h"
 #include "rdma_dada/io/rdma/receiver.h"
-#include "rdma_dada/pipeline/dada_header_builder.h"
-
-#define PSRDADA_BUFFER_KEY 0xdada
 
 PsrdadaRingBuf *g_ringbuf = NULL;
 volatile sig_atomic_t g_thread_exit = 0;
 static bool g_debug_mode = false;  // Debug mode flag
 static uint32_t g_pkt_size = PKT_DATA_SIZE;
-static uint32_t g_send_n = 64;
-static uint64_t g_current_block_remaining_writes = 0;  // 当前block剩余可写入次数
-static uint64_t g_bytes_per_write = 0;  // 每次写入的字节数
 static uint64_t g_block_size = 0;  // 完整block的大小（固定值）
 
 void signal_handler(int sig) {
@@ -51,31 +51,6 @@ char* GetBuffPtr(long int& buf_size) {
         }
     }
     
-    // g_pkt_size is payload bytes written into ring buffer per packet.
-    g_bytes_per_write = (uint64_t)g_pkt_size * g_send_n;
-    
-    // 计算这个block可以接收多少次：N = block_size / (pkt_size * send_n)
-    g_current_block_remaining_writes = g_block_size / g_bytes_per_write;
-    uint64_t remainder = g_block_size % g_bytes_per_write;
-    
-    if (g_debug_mode) {
-        printf("[GetBuffPtr] Block calculation: block_size=%" PRIu64
-               ", bytes_per_write=%" PRIu64 "\n",
-               g_block_size, g_bytes_per_write);
-        printf("[GetBuffPtr] This block can receive %" PRIu64 " times",
-               g_current_block_remaining_writes);
-        if (remainder > 0) {
-            printf(" (with %" PRIu64 " bytes remainder)\n", remainder);
-            fprintf(stderr, "[GetBuffPtr] WARNING: block_size is not exact multiple!\n");
-        } else {
-            printf(" (exact fit)\n");
-        }
-        fflush(stdout);
-    } else if (remainder > 0) {
-        fprintf(stderr, "[WARN] Block size not exact multiple, %" PRIu64
-                        " bytes wasted per block\n", remainder);
-    }
-    
     // 直接调用 GetWriteBuffer 获取下一个可写的block
     // GetWriteBuffer 内部会调用 ipcbuf_get_next_write()
     if (g_debug_mode) {
@@ -93,41 +68,12 @@ char* GetBuffPtr(long int& buf_size) {
     if (g_debug_mode) {
         printf("[GetBuffPtr] ✓ Got next block: ptr=%p, size=%ld bytes (%.2f MB)\n", 
                ptr, buf_size, buf_size / 1024.0 / 1024.0);
-        printf("[GetBuffPtr] ✓ Ready to receive %" PRIu64
-               " times (%" PRIu64 " bytes each)\n",
-               g_current_block_remaining_writes, g_bytes_per_write);
         fflush(stdout);
     }
     return ptr;
 }
 
-// 递减当前block的剩余写入次数
-void DecrementWriteCount() {
-    if (g_current_block_remaining_writes > 0) {
-        g_current_block_remaining_writes--;
-        
-        if (g_debug_mode) {
-            // Debug模式：每10次或最后几次打印
-            static int print_counter = 0;
-            print_counter++;
-            if (print_counter % 10 == 0 || g_current_block_remaining_writes < 5) {
-                printf("[DecrementWriteCount] Remaining writes: %" PRIu64
-                       " / %" PRIu64 "\n",
-                       g_current_block_remaining_writes, g_block_size / g_bytes_per_write);
-                fflush(stdout);
-            }
-        }
-    } else {
-        fprintf(stderr, "[WARN] Write counter already at 0!\n");
-    }
-}
-
-// 检查当前block是否已满
-bool IsBlockFull() {
-    return g_current_block_remaining_writes == 0;
-}
-
-int SendBuffPtr(void) {
+int SendBuffPtr(std::uint64_t valid_bytes) {
     if (!g_ringbuf) {
         fprintf(stderr, "[ERROR] g_ringbuf is NULL!\n");
         return -1;
@@ -138,15 +84,23 @@ int SendBuffPtr(void) {
         return -1;
     }
     
-    // 使用完整block的大小（固定值），不是剩余空间
+    const rdma_dada::io::rdma::RawBlockTail tail =
+        rdma_dada::io::rdma::ClassifyRawBlockTail(
+            g_block_size, g_pkt_size, valid_bytes);
+    if (tail.disposition !=
+        rdma_dada::io::rdma::RawBlockTailDisposition::kPublish) {
+        fprintf(stderr, "[ERROR] Invalid raw block publication: %" PRIu64
+                        " bytes\n", valid_bytes);
+        return -1;
+    }
     if (g_debug_mode) {
         printf("[SendBuffPtr] Marking block as written: %" PRIu64
-               " bytes (%.2f MB)\n",
-               g_block_size, g_block_size / 1024.0 / 1024.0);
+               " bytes (%" PRIu64 " records)\n",
+               valid_bytes, tail.valid_records);
         fflush(stdout);
     }
     
-    if (g_ringbuf->MarkWritten(g_block_size) < 0) {
+    if (g_ringbuf->MarkWritten(valid_bytes) < 0) {
         fprintf(stderr, "[ERROR] MarkWritten() failed!\n");
         return -1;
     }
@@ -171,48 +125,27 @@ void print_helper() {
     printf("Usage:\n");
     printf("    ./rdma2dada [options]\n");
     printf("Options:\n");
-    printf("    -d, NIC device number (default: 0)\n");
-    printf("    --smac, deprecated source MAC option (ignored by receiver)\n");
-    printf("    --dmac, destination MAC address (required)\n");
-    printf("    --sip, deprecated source IP option (ignored by receiver)\n");
-    printf("    --dip, destination IP address (required)\n");
-    printf("    --sport, deprecated source port option (ignored by receiver)\n");
-    printf("    --dport, destination port number (required)\n");
-    printf("    --config, pipeline JSON config (default: config/pipeline.example.json)\n");
+    printf("    --plan, compiler-generated resolved_observation.json (required)\n");
     printf("    --send_n, batch size (default: 64)\n");
     printf("    --nsge, scatter/gather entries per work request (default: 4)\n");
-    printf("    --key, psrdada buffer key in hex (default: 0x%x)\n", PSRDADA_BUFFER_KEY);
-    printf("    --gpu, GPU device ID (default: 0)\n");
     printf("    --cpu, CPU ID for thread affinity (default: -1)\n");
     printf("    --debug, enable debug mode with verbose logging\n");
     printf("    --help, -h\n");
-    printf("    --dump-dir, directory for dada_dbdisk output (runs in background)\n");
-    printf("    --dump-header, path to header template file (default: header/array_GZNU.header)\n");
+    printf("    --preflight-only, validate plan/device and exit before ring access\n");
 }
 
-static int parse_args(RoCEv2Dada::RdmaParam &param, key_t &psrdada_key,
-                      char *dump_dir, size_t dump_dir_len,
-                      char *header_path, size_t header_path_len,
-                      char *config_path, size_t config_path_len,
+static int parse_args(RoCEv2Dada::RdmaParam &param,
+                      char *plan_path, size_t plan_path_len,
+                      bool *preflight_only,
                       int argc, char *argv[]) {
     int c;
     struct option long_options[] = {
-        {"smac", required_argument, NULL, 256},
-        {"dmac", required_argument, NULL, 257},
-        {"sip", required_argument, NULL, 258},
-        {"dip", required_argument, NULL, 259},
-        {"sport", required_argument, NULL, 260},
-        {"dport", required_argument, NULL, 261},
         {"send_n", required_argument, NULL, 265},
-        {"key", required_argument, NULL, 266},
-        {"dump-dir", required_argument, NULL, 267},
-        {"dump-header", required_argument, NULL, 268},
         {"debug", no_argument, NULL, 271},
         {"nsge", required_argument, NULL, 272},
-        {"config", required_argument, NULL, 273},
-        {"gpu", required_argument, NULL, 'g'},
+        {"plan", required_argument, NULL, 273},
+        {"preflight-only", no_argument, NULL, 274},
         {"cpu", required_argument, NULL, 'c'},
-        {"device", required_argument, NULL, 'd'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -224,63 +157,97 @@ static int parse_args(RoCEv2Dada::RdmaParam &param, key_t &psrdada_key,
     param.RdmaDirectGpu = 0;
     param.send_n = 64;
     param.nsge = 4;
-    psrdada_key = PSRDADA_BUFFER_KEY;
     while (1) {
-        c = getopt_long(argc, argv, "d:g:c:h", long_options, NULL);
+        c = getopt_long(argc, argv, "c:h", long_options, NULL);
         switch (c) {
-            case 'd': param.device_id = atoi(optarg); break;
-            case 256: snprintf(param.SMacAddr, sizeof(param.SMacAddr), "%s", optarg); break;
-            case 257: snprintf(param.DMacAddr, sizeof(param.DMacAddr), "%s", optarg); break;
-            case 258: snprintf(param.SAddr, sizeof(param.SAddr), "%s", optarg); break;
-            case 259: snprintf(param.DAddr, sizeof(param.DAddr), "%s", optarg); break;
-            case 260: snprintf(param.src_port, sizeof(param.src_port), "%s", optarg); break;
-            case 261: snprintf(param.dst_port, sizeof(param.dst_port), "%s", optarg); break;
             case 265: param.send_n = atoi(optarg); break;
-            case 266: sscanf(optarg, "%x", &psrdada_key); break;
-            case 267: strncpy(dump_dir, optarg, dump_dir_len - 1); dump_dir[dump_dir_len - 1] = '\0'; break;
-            case 268: strncpy(header_path, optarg, header_path_len - 1); header_path[header_path_len - 1] = '\0'; break;
             case 271: g_debug_mode = true; break;
             case 272: param.nsge = (unsigned int)strtoul(optarg, NULL, 10); break;
-            case 273: strncpy(config_path, optarg, config_path_len - 1); config_path[config_path_len - 1] = '\0'; break;
-            case 'g': param.gpu_id = atoi(optarg); break;
+            case 273: strncpy(plan_path, optarg, plan_path_len - 1); plan_path[plan_path_len - 1] = '\0'; break;
+            case 274: *preflight_only = true; break;
             case 'c': param.bind_cpu_id = atoi(optarg); break;
             case 'h': print_helper(); return -1;
-            case -1: return 0;
+            case -1: return optind == argc ? 0 : -1;
             default: print_helper(); return -1;
         }
     }
     return 0;
 }
 
+static bool resolve_device_index(const std::string& name,
+                                 unsigned char *device_id,
+                                 std::string *error) {
+    int count = 0;
+    ibv_device **devices = ibv_get_device_list(&count);
+    if (!devices) {
+        *error = "cannot enumerate ibverbs devices";
+        return false;
+    }
+    bool found = false;
+    for (int index = 0; index < count; ++index) {
+        const char *candidate = ibv_get_device_name(devices[index]);
+        if (candidate && name == candidate && index <= UCHAR_MAX) {
+            *device_id = static_cast<unsigned char>(index);
+            found = true;
+            break;
+        }
+    }
+    ibv_free_device_list(devices);
+    if (!found) *error = "configured ibverbs device was not found: " + name;
+    return found;
+}
+
 int main(int argc, char *argv[]) {
     int ret = 0;
-    key_t psrdada_key = PSRDADA_BUFFER_KEY;
-    char dump_dir[256] = "./data_out";
-    char header_path[256] = "header/array_GZNU.header";
-    char config_path[256] = "config/pipeline.example.json";
+    key_t psrdada_key = 0;
+    char plan_path[1024] = "";
+    bool preflight_only = false;
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     RoCEv2Dada::RdmaParam param = {};
-    ret = parse_args(param, psrdada_key, dump_dir, sizeof(dump_dir),
-                     header_path, sizeof(header_path), config_path,
-                     sizeof(config_path), argc, argv);
+    ret = parse_args(param, plan_path, sizeof(plan_path), &preflight_only,
+                     argc, argv);
     if (ret < 0) return -1;
-
-    rdma_dada::PipelineConfig pipeline_config;
-    rdma_dada::PipelineLayout pipeline_layout;
-    dada_header_t raw_header;
-    std::string config_error;
-    if (!rdma_dada::LoadPipelineConfig(config_path, &pipeline_config,
-                                       &config_error) ||
-        !rdma_dada::ComputePipelineLayout(pipeline_config, &pipeline_layout,
-                                          &config_error) ||
-        !rdma_dada::BuildPipelineDadaHeader(
-            pipeline_config, pipeline_layout, rdma_dada::DataStage::kRaw,
-            &raw_header, &config_error)) {
-        fprintf(stderr, "Error: Invalid pipeline config %s: %s\n",
-                config_path, config_error.c_str());
+    if (plan_path[0] == '\0') {
+        fprintf(stderr, "Error: --plan is required\n");
         return -1;
     }
+
+    rdma_dada::ResolvedObservationPlan resolved_plan;
+    rdma_dada::ObservationArtifacts artifacts;
+    rdma_dada::PipelineConfig pipeline_config;
+    rdma_dada::PipelineLayout pipeline_layout;
+    std::string config_error;
+    if (!rdma_dada::LoadResolvedObservationPlan(
+            plan_path, &resolved_plan, &config_error) ||
+        !rdma_dada::BuildPipelineRuntimeFromResolvedPlan(
+            resolved_plan, &pipeline_config, &pipeline_layout,
+            &config_error) ||
+        !rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+            resolved_plan, &artifacts, &config_error)) {
+        fprintf(stderr, "Error: Invalid resolved plan %s: %s\n",
+                plan_path, config_error.c_str());
+        return -1;
+    }
+    psrdada_key = static_cast<key_t>(resolved_plan.source.raw_key);
+    snprintf(param.DMacAddr, sizeof(param.DMacAddr), "%s",
+             resolved_plan.source.destination_mac.c_str());
+    snprintf(param.DAddr, sizeof(param.DAddr), "%s",
+             resolved_plan.source.destination_ip.c_str());
+    snprintf(param.dst_port, sizeof(param.dst_port), "%u",
+             resolved_plan.source.destination_port);
+    if (!resolve_device_index(resolved_plan.source.receiver_device,
+                              &param.device_id, &config_error)) {
+        fprintf(stderr, "Error: %s\n", config_error.c_str());
+        return -1;
+    }
+    if (resolved_plan.source.cuda_device < 0 ||
+        resolved_plan.source.cuda_device > UCHAR_MAX) {
+        fprintf(stderr, "Error: CUDA device index exceeds runtime range\n");
+        return -1;
+    }
+    param.gpu_id = static_cast<unsigned char>(
+        resolved_plan.source.cuda_device);
     if (pipeline_layout.raw_record_bytes > UINT32_MAX) {
         fprintf(stderr, "Error: Raw record size exceeds RDMA uint32 limit\n");
         return -1;
@@ -299,14 +266,15 @@ int main(int argc, char *argv[]) {
         param.nsge = 4;
     }
     g_pkt_size = param.pkt_size;
-    g_send_n = param.send_n;
 
-    if (strlen(param.DMacAddr) == 0 || strlen(param.DAddr) == 0 ||
-        strlen(param.dst_port) == 0) {
-        fprintf(stderr,
-                "Error: Missing required destination network parameters\n");
-        print_helper();
-        return -1;
+    if (preflight_only) {
+        printf("PLAN %s\nCONFIG_ID %s\nGEOMETRY_ID %s\n"
+               "RAW_KEY 0x%x\nRAW_BLOCK_BYTES %lu\nDEVICE %s\n",
+               plan_path, resolved_plan.config_id.c_str(),
+               resolved_plan.geometry_id.c_str(), resolved_plan.source.raw_key,
+               (unsigned long)resolved_plan.raw_block_bytes,
+               resolved_plan.source.receiver_device.c_str());
+        return 0;
     }
     g_ringbuf = new PsrdadaRingBuf();
     if (!g_ringbuf) { fprintf(stderr, "Error: Failed to create PsrdadaRingBuf\n"); return -1; }
@@ -316,7 +284,7 @@ int main(int argc, char *argv[]) {
     }
     
     uint64_t receive_bytes_per_time = (uint64_t)param.pkt_size * param.send_n;
-    printf("  Pipeline config: %s\n", config_path);
+    printf("  Resolved plan: %s\n", plan_path);
     printf("  Raw record: %lu bytes (%lu-byte app header + %lu-byte payload)\n",
            (unsigned long)pipeline_layout.raw_record_bytes,
            (unsigned long)pipeline_config.packet_header_bytes,
@@ -332,8 +300,9 @@ int main(int argc, char *argv[]) {
     printf("  Output file size: %lu bytes\n",
            (unsigned long)pipeline_layout.raw_file_bytes);
     ret = g_ringbuf->Init(psrdada_key, pipeline_layout.raw_block_bytes,
-                          pipeline_config.raw_ring_blocks, header_path,
-                          raw_header);
+                          pipeline_config.raw_ring_blocks,
+                          pipeline_layout.raw_record_bytes,
+                          artifacts.raw_header);
     if (ret < 0) { 
         fprintf(stderr, "Error: Failed to initialize psrdada ring buffer\n"); delete g_ringbuf; return -1; 
     } else { 
@@ -349,8 +318,6 @@ int main(int argc, char *argv[]) {
     // Exact divisibility was validated before connecting to the ring.
     param.DataSendBuff = &SendBuffPtr;
     param.GetBuffPtr = &GetBuffPtr;
-    param.DecrementWriteCount = &DecrementWriteCount;
-    param.IsBlockFull = &IsBlockFull;
     printf("[Main] Creating RDMA receiver...\n");
     printf("  Device: %d\n", param.device_id);
     printf("  GPU: %d\n", param.gpu_id);
@@ -366,10 +333,6 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     if (!rdma_dada) { fprintf(stderr, "Error: Failed to create RoCEv2Dada\n"); delete g_ringbuf; return -1; }
     printf("[Main] RDMA uses registered receive buffers and copies records into the ring\n");
-    if (mkdir(dump_dir, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr, "[Demo] Warning: failed to create dump dir %s\n", dump_dir);
-    }
-    
     // Note: dada_dbdisk is started externally by run_demo.sh
     // Do NOT start it here to avoid conflicts
     

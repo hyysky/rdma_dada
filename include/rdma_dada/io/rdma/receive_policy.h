@@ -46,6 +46,22 @@ ReceiveDisposition ClassifyReceiveCompletion(
 
 bool ShouldLogWrongLengthDrop(std::uint64_t drop_count);
 
+enum class RawBlockTailDisposition {
+    kNoData,
+    kPublish,
+    kInvalid
+};
+
+struct RawBlockTail {
+    RawBlockTailDisposition disposition;
+    std::uint64_t valid_bytes;
+    std::uint64_t valid_records;
+};
+
+RawBlockTail ClassifyRawBlockTail(std::uint64_t block_bytes,
+                                  std::uint64_t record_bytes,
+                                  std::uint64_t valid_bytes);
+
 }  // namespace rdma
 }  // namespace io
 }  // namespace rdma_dada

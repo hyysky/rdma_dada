@@ -63,7 +63,9 @@ target_include_directories(rdma_pipeline_core
 target_link_libraries(rdma_pipeline_core PUBLIC rdma_pipeline_config)
 
 add_library(rdma_module_vdif_unpack STATIC
+    modules/vdif_unpack/atfp_block_writer.cpp
     modules/vdif_unpack/project_vdif_v1.cpp
+    modules/vdif_unpack/vdif_atfp_engine.cpp
     modules/vdif_unpack/vdif_unpack_config.cpp
     modules/vdif_unpack/vdif_unpack_engine.cpp
     modules/vdif_unpack/vdif_unpack_header.cpp
@@ -247,6 +249,10 @@ if(BUILD_TESTING)
     target_link_libraries(vdif_timeline_test PRIVATE rdma_module_vdif_unpack)
     add_executable(vdif_unpack_engine_test tests/vdif_unpack_engine_test.cpp)
     target_link_libraries(vdif_unpack_engine_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(vdif_atfp_engine_test tests/vdif_atfp_engine_test.cpp)
+    target_link_libraries(vdif_atfp_engine_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(atfp_block_writer_test tests/atfp_block_writer_test.cpp)
+    target_link_libraries(atfp_block_writer_test PRIVATE rdma_module_vdif_unpack)
     add_executable(group_block_writer_test tests/group_block_writer_test.cpp)
     target_link_libraries(group_block_writer_test PRIVATE rdma_pipeline_core)
     add_executable(vdif_sender_sim_test tests/vdif_sender_sim_test.cpp)
@@ -357,6 +363,12 @@ if(BUILD_TESTING)
     add_test(
         NAME vdif_unpack_engine_test
         COMMAND vdif_unpack_engine_test)
+    add_test(
+        NAME vdif_atfp_engine_test
+        COMMAND vdif_atfp_engine_test)
+    add_test(
+        NAME atfp_block_writer_test
+        COMMAND atfp_block_writer_test)
     add_test(
         NAME group_block_writer_test
         COMMAND group_block_writer_test)
@@ -614,6 +626,7 @@ if(BUILD_RDMA_PIPELINE)
     # adapter temporarily depends on libibverbs as well as PSRDADA.
     target_link_libraries(rdma_dada_psrdada_io
         PUBLIC
+            rdma_pipeline_core
             ${PSRDADA_TARGET}
             ${IBVERBS_TARGET}
             Threads::Threads)
@@ -641,7 +654,9 @@ if(BUILD_RDMA_PIPELINE)
             rdma_dada_psrdada_io)
 
     add_executable(rdma2dada apps/rdma2dada/main.cpp)
-    target_link_libraries(rdma2dada PRIVATE rdma_dada_core)
+    target_link_libraries(rdma2dada PRIVATE
+        rdma_dada_core
+        rdma_observation_compiler)
 
     add_executable(pipeline_worker apps/pipeline_worker/main.cpp)
     target_compile_definitions(pipeline_worker PRIVATE _GNU_SOURCE)
@@ -665,6 +680,7 @@ if(BUILD_RDMA_PIPELINE)
     target_link_libraries(vdif_unpack_worker
         PRIVATE
             rdma_module_vdif_unpack
+            rdma_pipeline_config
             ${PSRDADA_TARGET}
             Threads::Threads)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -676,12 +692,12 @@ if(BUILD_RDMA_PIPELINE)
             tests/dada_header_roundtrip_test.cpp)
         target_link_libraries(dada_header_roundtrip_test
             PRIVATE
-                rdma_pipeline_config
+                rdma_observation_compiler
                 rdma_dada_psrdada_io)
         add_test(
             NAME dada_header_roundtrip_test
             COMMAND dada_header_roundtrip_test
-                    ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
         add_test(
             NAME rdma_receiver_integration_test
             COMMAND bash
@@ -697,6 +713,7 @@ if(BUILD_RDMA_PIPELINE)
             COMMAND bash
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/vdif_unpack_worker_integration.sh
                     $<TARGET_FILE:vdif_unpack_worker>
+                    $<TARGET_FILE:observation_config_compile>
                     ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(vdif_unpack_worker_integration_test PROPERTIES
             LABELS "psrdada;integration"

@@ -20,13 +20,15 @@ class RoCEv2Dada
         {
             std::uint64_t accepted_packets;
             std::uint64_t wrong_length_packets;
+            std::uint64_t published_packets;
+            std::uint64_t published_blocks;
+            std::uint64_t partial_blocks;
+            std::uint64_t cq_tail_records;
         };
 
-        typedef std::function<int(void)> DataSend;
+        typedef std::function<int(std::uint64_t)> DataSend;
         typedef std::function<char*(long int &)> GetBuff;
         typedef std::function<int(unsigned char *, long int )> WriteBuff;
-        typedef std::function<void(void)> DecrementWriteCount;  // 递减写入计数
-        typedef std::function<bool(void)> IsBlockFull;  // 检查block是否已满
 
         struct RdmaParam
         {
@@ -48,8 +50,6 @@ class RoCEv2Dada
             DataSend DataSendBuff;
             GetBuff GetBuffPtr;
             WriteBuff WritSendBuff;
-            DecrementWriteCount DecrementWriteCount;
-            IsBlockFull IsBlockFull;
         };
 
         explicit RoCEv2Dada(const RdmaParam & Param);
@@ -66,6 +66,10 @@ class RoCEv2Dada
         std::atomic<bool> stop_requested;
         std::atomic<std::uint64_t> accepted_receive_packets;
         std::atomic<std::uint64_t> wrong_length_receive_packets;
+        std::atomic<std::uint64_t> published_receive_packets;
+        std::atomic<std::uint64_t> published_receive_blocks;
+        std::atomic<std::uint64_t> partial_receive_blocks;
+        std::atomic<std::uint64_t> cq_tail_receive_records;
         bool thread_started;
 };
 

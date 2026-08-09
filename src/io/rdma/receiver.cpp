@@ -181,6 +181,8 @@ static int ib_send_pkg(struct ibv_utils_res * ibv_res, int send_idx, int send_nu
 RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     : param(Param), ibv_res(NULL), stop_requested(false),
       accepted_receive_packets(0), wrong_length_receive_packets(0),
+      published_receive_packets(0), published_receive_blocks(0),
+      partial_receive_blocks(0), cq_tail_receive_records(0),
       thread_started(false)
 {
     printf("[RoCEv2Dada] Constructor started\n");
@@ -420,7 +422,6 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
     long int block_bufsz = 0;
     long int write_bufsz = 0;
     char * gpu_ibuf = NULL;
-    char * cpu_data = NULL;
     // pkt_size already includes header (passed from run_demo.sh as PKT_HEADER+PKT_DATA)
     int pkt_len = ibv_res_ptr->pkt_size;
     int ring_pkt_len = this_ptr->param.pkt_size;
@@ -473,204 +474,208 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
             ret = ib_send_pkg(ibv_res_ptr, send_idx, this_ptr->param.send_n);
             if (ret < 0) { printf("Failed to send pkts.\n"); return NULL; }
         } else {
-            // Receive into registered buffers, then strip L2/L3/L4 headers and
-            // copy each application record into the ring block.
             static bool first_normal_path_log = true;
             if (first_normal_path_log) {
                 printf("[RDMA] Using normal receive mode (with copy to ring buffer)\n");
                 fflush(stdout);
                 first_normal_path_log = false;
             }
-            
+
             clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
             ns_elapsed = ELAPSED_US(ts_start, ts_now);
-            if((ns_elapsed) > 1000 * 1000 * 1) {
+            if (ns_elapsed > 1000 * 1000) {
                 ts_start = ts_now;
-                if(total_recv != total_recv_pre) {
-                    double bandwidth = MEASURE_BANDWIDTH(((total_recv - total_recv_pre) * ring_pkt_len), ns_elapsed);
+                if (total_recv != total_recv_pre) {
+                    const double bandwidth = MEASURE_BANDWIDTH(
+                        ((total_recv - total_recv_pre) * ring_pkt_len),
+                        ns_elapsed);
                     time(&rawtime);
                     timeinfo = localtime(&rawtime);
                     timeinfo->tm_hour += 8;
-                    strftime(time_buffer, sizeof(time_buffer), "year:%Y,month:%m,day:%d,hours:%H,minites:%M,second:%S", timeinfo);
+                    strftime(time_buffer, sizeof(time_buffer),
+                             "year:%Y,month:%m,day:%d,hours:%H,minites:%M,second:%S",
+                             timeinfo);
                     printf("NowTime:%s,gpu_id:%d,total_recv:%-8luKB,Process Bandwidth:%6.3f Gbps,cost time:%lums\n",
-                           time_buffer, this_ptr->param.gpu_id, (unsigned long)(total_recv * ring_pkt_len / 1024), bandwidth, (unsigned long)(ns_elapsed / 1000));
+                           time_buffer, this_ptr->param.gpu_id,
+                           (unsigned long)(total_recv * ring_pkt_len / 1024),
+                           bandwidth, (unsigned long)(ns_elapsed / 1000));
                     total_recv_pre = total_recv;
                 }
             }
-            
-            // Calculate space needed for next batch
-            long int bytes_needed = (long int)(this_ptr->param.send_n * ring_pkt_len);
-            
-            // Get new buffer if current buffer is empty OR insufficient for next batch
-            if(block_bufsz <= 0 || block_bufsz < bytes_needed) {
-                if (this_ptr->param.debug_mode && block_bufsz > 0 && block_bufsz < bytes_needed) {
-                    printf("[DEBUG] Insufficient space (%ld < %ld), getting new block\n", 
-                           block_bufsz, bytes_needed);
-                    fflush(stdout);
-                }
-                gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
-                cpu_data = gpu_ibuf;
-                write_bufsz = block_bufsz;
-                if(!gpu_ibuf || !block_bufsz) {
-                    printf("ERROR: SendRecvThread Failed to GetBuffPtr.gpu_ibuf: %p, block_bufsz:%ld\n", (void*)gpu_ibuf, block_bufsz);
-                    return NULL;
-                }
-            }
-            ibv_res_ptr->recv_completed = ibv_poll_cq(ibv_res_ptr->cq, ibv_res_ptr->poll_n, ibv_res_ptr->wc);
-            
-            // Debug polling info (only in debug mode)
-            if (this_ptr->param.debug_mode) {
-                static int poll_count = 0;
-                static int no_data_count = 0;
-                poll_count++;
-                
-                if (ibv_res_ptr->recv_completed == 0) {
-                    no_data_count++;
-                } else {
-                    no_data_count = 0;
-                }
-                
-                if (poll_count % 100000 == 0) {
-                    printf("[DEBUG] Polled %d times, last result: %d completions, sum=%d\n", 
-                           poll_count, ibv_res_ptr->recv_completed, ibv_res_ptr->recv_sum_completed);
-                    fflush(stdout);
-                }
-            }
-            
-            if(ibv_res_ptr->recv_completed > 0) {
-                if (this_ptr->param.debug_mode) {
-                    printf("[DEBUG] Received %d completions (sum=%d/%d)\n", 
-                           ibv_res_ptr->recv_completed, ibv_res_ptr->recv_sum_completed, 
-                           this_ptr->param.send_n);
-                    fflush(stdout);
-                }
-                int accepted_completed = 0;
-                for (int i = 0; i < ibv_res_ptr->recv_completed; ++i) {
-                    const struct ibv_wc completion = ibv_res_ptr->wc[i];
-                    const rdma_dada::io::rdma::ReceiveCompletion policy_input = {
-                        completion.status == IBV_WC_SUCCESS,
-                        completion.opcode == IBV_WC_RECV,
-                        completion.wr_id,
-                        completion.byte_len
-                    };
-                    const rdma_dada::io::rdma::ReceiveDisposition disposition =
-                        rdma_dada::io::rdma::ClassifyReceiveCompletion(
-                            policy_input,
-                            (uint64_t)ibv_res_ptr->recv_wr_num,
-                            ibv_res_ptr->pkt_size);
-                    if (disposition ==
-                        rdma_dada::io::rdma::ReceiveDisposition::kFatal) {
-                        log_fatal_receive_completion(completion, ibv_res_ptr);
-                        return NULL;
-                    }
-                    if (disposition ==
-                        rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength) {
-                        const uint64_t dropped =
-                            this_ptr->wrong_length_receive_packets.fetch_add(1) + 1;
-                        if (rdma_dada::io::rdma::ShouldLogWrongLengthDrop(
-                                dropped)) {
-                            fprintf(stderr,
-                                    "[WARN] Dropping wrong-length receive: "
-                                    "byte_len=%u, expected=%u, wr_id=%" PRIu64
-                                    ", total_wrong_length=%" PRIu64 ".\n",
-                                    completion.byte_len,
-                                    ibv_res_ptr->pkt_size,
-                                    completion.wr_id,
-                                    dropped);
-                        }
-                        if (repost_receive_wr(ibv_res_ptr,
-                                             completion.wr_id) != 0) {
-                            return NULL;
-                        }
-                        continue;
-                    }
-                    ibv_res_ptr->wc[accepted_completed] = completion;
-                    ++accepted_completed;
-                    this_ptr->accepted_receive_packets.fetch_add(1);
-                }
-                if (ibv_res_ptr->recv_sum_completed +
-                        accepted_completed >
-                    ibv_res_ptr->recv_wr_num) {
-                    fprintf(stderr,
-                            "[ERROR] CQ accumulation overflow: buffered=%d, "
-                            "new=%d, capacity=%d.\n",
-                            ibv_res_ptr->recv_sum_completed,
-                            accepted_completed,
-                            ibv_res_ptr->recv_wr_num);
-                    return NULL;
-                }
 
-                // Accumulate validated completions at the current offset.
-                memcpy(ibv_res_ptr->wc_tmp + ibv_res_ptr->recv_sum_completed,
-                       ibv_res_ptr->wc,
-                       sizeof(struct ibv_wc) * accepted_completed);
-                ibv_res_ptr->recv_sum_completed += accepted_completed;
-            if(ibv_res_ptr->recv_sum_completed >= this_ptr->param.send_n) {
-                    // Batch complete, process data
-                    if (this_ptr->param.debug_mode) {
-                        printf("[DEBUG] Processing batch: %d completions\n", this_ptr->param.send_n);
-                        fflush(stdout);
-                    }
-
-                    for (int i = 0; i < this_ptr->param.send_n; i++) {
-                        uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
-                        unsigned char *src = (unsigned char *)ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge].addr;
-                        if (this_ptr->param.RdmaDirectGpu != 0) {
-                            CUDA_CALL(cudaMemcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
-                                                 src + RX_STRIP_HEADER_BYTES,
-                                                 ring_pkt_len,
-                                                 cudaMemcpyDeviceToDevice));
-                        } else {
-                            memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
-                                   src + RX_STRIP_HEADER_BYTES,
-                                   ring_pkt_len);
-                        }
-                    }
-                    
-                    uint64_t bytes_written = this_ptr->param.send_n * ring_pkt_len;
-                    
-                    gpu_ibuf += bytes_written;
-                    block_bufsz -= (long int)bytes_written;
-                    
-                    // 递减写入计数
-                    if (this_ptr->param.DecrementWriteCount) {
-                        this_ptr->param.DecrementWriteCount();
-                    }
-                    
-                    // 检查block是否已满
-                    bool is_full = false;
-                    if (this_ptr->param.IsBlockFull) {
-                        is_full = this_ptr->param.IsBlockFull();
-                    }
-                    
-                    if(is_full) {
-                        ret = this_ptr->param.DataSendBuff();
-                        if(ret < 0) { 
-                            fprintf(stderr, "[ERROR] Failed to mark block as written\n"); 
-                            return NULL; 
-                        }
-                        
-                        // Reset block_bufsz to 0 to force getting a new block next iteration
-                        block_bufsz = 0;
-                    }
-                    for(int i = 0; i < this_ptr->param.send_n; i++) {
-                        ret = repost_receive_wr(
-                            ibv_res_ptr, ibv_res_ptr->wc_tmp[i].wr_id);
-                        if (ret != 0) {
-                            return NULL;
-                        }
-                    }
-                    ibv_res_ptr->recv_sum_completed -= this_ptr->param.send_n;
-                    memcpy(ibv_res_ptr->wc, ibv_res_ptr->wc_tmp + this_ptr->param.send_n,
-                           sizeof(struct ibv_wc) * (ibv_res_ptr->recv_sum_completed));
-                    memcpy(ibv_res_ptr->wc_tmp, ibv_res_ptr->wc,
-                           sizeof(struct ibv_wc) * (ibv_res_ptr->recv_sum_completed));
-                    total_recv += this_ptr->param.send_n;
-                }
-            } else if (ibv_res_ptr->recv_completed < 0) {
-                printf("ERROR: SendRecvThread Failed to recv.\n");
+            ibv_res_ptr->recv_completed = ibv_poll_cq(
+                ibv_res_ptr->cq, ibv_res_ptr->poll_n, ibv_res_ptr->wc);
+            if (ibv_res_ptr->recv_completed < 0) {
+                fprintf(stderr, "ERROR: SendRecvThread failed to poll receive CQ.\n");
                 return NULL;
             }
+            if (ibv_res_ptr->recv_completed == 0) continue;
+
+            int accepted_completed = 0;
+            for (int i = 0; i < ibv_res_ptr->recv_completed; ++i) {
+                const struct ibv_wc completion = ibv_res_ptr->wc[i];
+                const rdma_dada::io::rdma::ReceiveCompletion policy_input = {
+                    completion.status == IBV_WC_SUCCESS,
+                    completion.opcode == IBV_WC_RECV,
+                    completion.wr_id,
+                    completion.byte_len
+                };
+                const rdma_dada::io::rdma::ReceiveDisposition disposition =
+                    rdma_dada::io::rdma::ClassifyReceiveCompletion(
+                        policy_input, (uint64_t)ibv_res_ptr->recv_wr_num,
+                        ibv_res_ptr->pkt_size);
+                if (disposition ==
+                    rdma_dada::io::rdma::ReceiveDisposition::kFatal) {
+                    log_fatal_receive_completion(completion, ibv_res_ptr);
+                    return NULL;
+                }
+                if (disposition ==
+                    rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength) {
+                    const uint64_t dropped =
+                        this_ptr->wrong_length_receive_packets.fetch_add(1) + 1;
+                    if (rdma_dada::io::rdma::ShouldLogWrongLengthDrop(dropped)) {
+                        fprintf(stderr,
+                                "[WARN] Dropping wrong-length receive: "
+                                "byte_len=%u, expected=%u, wr_id=%" PRIu64
+                                ", total_wrong_length=%" PRIu64 ".\n",
+                                completion.byte_len, ibv_res_ptr->pkt_size,
+                                completion.wr_id, dropped);
+                    }
+                    if (repost_receive_wr(ibv_res_ptr, completion.wr_id) != 0)
+                        return NULL;
+                    continue;
+                }
+                ibv_res_ptr->wc[accepted_completed++] = completion;
+                this_ptr->accepted_receive_packets.fetch_add(1);
+            }
+            if (ibv_res_ptr->recv_sum_completed + accepted_completed >
+                ibv_res_ptr->recv_wr_num) {
+                fprintf(stderr,
+                        "[ERROR] CQ accumulation overflow: buffered=%d, "
+                        "new=%d, capacity=%d.\n",
+                        ibv_res_ptr->recv_sum_completed, accepted_completed,
+                        ibv_res_ptr->recv_wr_num);
+                return NULL;
+            }
+            memcpy(ibv_res_ptr->wc_tmp + ibv_res_ptr->recv_sum_completed,
+                   ibv_res_ptr->wc,
+                   sizeof(struct ibv_wc) * accepted_completed);
+            ibv_res_ptr->recv_sum_completed += accepted_completed;
+
+            while (ibv_res_ptr->recv_sum_completed >=
+                   (int)this_ptr->param.send_n) {
+                const int count = (int)this_ptr->param.send_n;
+                const uint64_t bytes = (uint64_t)count * ring_pkt_len;
+                if (!gpu_ibuf) {
+                    gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
+                    write_bufsz = block_bufsz;
+                    if (!gpu_ibuf || block_bufsz <= 0) {
+                        fprintf(stderr, "ERROR: failed to acquire raw ring block.\n");
+                        return NULL;
+                    }
+                }
+                if ((uint64_t)block_bufsz < bytes) {
+                    fprintf(stderr,
+                            "ERROR: complete receive batch does not fit raw block.\n");
+                    return NULL;
+                }
+                for (int i = 0; i < count; ++i) {
+                    const uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
+                    unsigned char *src = (unsigned char *)
+                        ibv_res_ptr->sge[
+                            wr_id * ibv_res_ptr->recv_nsge].addr;
+                    if (this_ptr->param.RdmaDirectGpu != 0) {
+                        CUDA_CALL(cudaMemcpy(
+                            gpu_ibuf + ((size_t)i * ring_pkt_len),
+                            src + RX_STRIP_HEADER_BYTES, ring_pkt_len,
+                            cudaMemcpyDeviceToDevice));
+                    } else {
+                        memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
+                               src + RX_STRIP_HEADER_BYTES, ring_pkt_len);
+                    }
+                    if (repost_receive_wr(ibv_res_ptr, wr_id) != 0)
+                        return NULL;
+                }
+                gpu_ibuf += bytes;
+                block_bufsz -= (long int)bytes;
+                total_recv += count;
+                ibv_res_ptr->recv_sum_completed -= count;
+                memmove(ibv_res_ptr->wc_tmp,
+                        ibv_res_ptr->wc_tmp + count,
+                        sizeof(struct ibv_wc) *
+                            ibv_res_ptr->recv_sum_completed);
+                if (block_bufsz == 0) {
+                    if (this_ptr->param.DataSendBuff(
+                            (uint64_t)write_bufsz) < 0) {
+                        fprintf(stderr,
+                                "[ERROR] Failed to publish full raw block.\n");
+                        return NULL;
+                    }
+                    this_ptr->published_receive_packets.fetch_add(
+                        (uint64_t)write_bufsz / ring_pkt_len);
+                    this_ptr->published_receive_blocks.fetch_add(1);
+                    gpu_ibuf = NULL;
+                    write_bufsz = 0;
+                }
+            }
+        }
+    }
+
+    if (!this_ptr->param.SendOrRecv) {
+        const int tail_count = ibv_res_ptr->recv_sum_completed;
+        if (tail_count > 0) {
+            const uint64_t tail_bytes = (uint64_t)tail_count * ring_pkt_len;
+            if (!gpu_ibuf) {
+                gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
+                write_bufsz = block_bufsz;
+                if (!gpu_ibuf || block_bufsz <= 0) {
+                    fprintf(stderr,
+                            "ERROR: failed to acquire raw ring block for CQ tail.\n");
+                    return NULL;
+                }
+            }
+            if ((uint64_t)block_bufsz < tail_bytes) {
+                fprintf(stderr, "ERROR: CQ tail does not fit raw ring block.\n");
+                return NULL;
+            }
+            for (int i = 0; i < tail_count; ++i) {
+                const uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
+                unsigned char *src = (unsigned char *)
+                    ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge].addr;
+                if (this_ptr->param.RdmaDirectGpu != 0) {
+                    CUDA_CALL(cudaMemcpy(
+                        gpu_ibuf + ((size_t)i * ring_pkt_len),
+                        src + RX_STRIP_HEADER_BYTES, ring_pkt_len,
+                        cudaMemcpyDeviceToDevice));
+                } else {
+                    memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
+                           src + RX_STRIP_HEADER_BYTES, ring_pkt_len);
+                }
+            }
+            gpu_ibuf += tail_bytes;
+            block_bufsz -= (long int)tail_bytes;
+            total_recv += tail_count;
+            this_ptr->cq_tail_receive_records.fetch_add(tail_count);
+            ibv_res_ptr->recv_sum_completed = 0;
+        }
+
+        if (gpu_ibuf && write_bufsz > block_bufsz) {
+            const uint64_t valid_bytes =
+                (uint64_t)(write_bufsz - block_bufsz);
+            if (this_ptr->param.DataSendBuff(valid_bytes) < 0) {
+                fprintf(stderr,
+                        "[ERROR] Failed to publish final raw block tail.\n");
+                return NULL;
+            }
+            this_ptr->published_receive_packets.fetch_add(
+                valid_bytes / ring_pkt_len);
+            this_ptr->published_receive_blocks.fetch_add(1);
+            if (valid_bytes < (uint64_t)write_bufsz)
+                this_ptr->partial_receive_blocks.fetch_add(1);
+            printf("[RDMA] Published final raw block: bytes=%" PRIu64
+                   ", records=%" PRIu64 "\n",
+                   valid_bytes, valid_bytes / ring_pkt_len);
+            fflush(stdout);
         }
     }
     return NULL;
@@ -725,8 +730,7 @@ int RoCEv2Dada::Start()
     }
 
     if ((!this->param.SendOrRecv &&
-         (!this->param.GetBuffPtr || !this->param.DataSendBuff ||
-          !this->param.DecrementWriteCount || !this->param.IsBlockFull)) ||
+         (!this->param.GetBuffPtr || !this->param.DataSendBuff)) ||
         (this->param.SendOrRecv && !this->param.WritSendBuff)) {
         fprintf(stderr,
                 "RoCEv2Dada::Start error: required data callback is missing.\n");
@@ -790,9 +794,13 @@ int RoCEv2Dada::Stop()
             static_cast<double>(stats.wrong_length_packets) /
                 static_cast<double>(total);
         printf("[RDMA] Receive summary: accepted=%" PRIu64
-               ", wrong_length=%" PRIu64
+               ", wrong_length=%" PRIu64 ", published=%" PRIu64
+               ", blocks=%" PRIu64 ", partial_blocks=%" PRIu64
+               ", cq_tail_records=%" PRIu64
                ", wrong_length_ratio=%.9f\n",
                stats.accepted_packets, stats.wrong_length_packets,
+               stats.published_packets, stats.published_blocks,
+               stats.partial_blocks, stats.cq_tail_records,
                wrong_length_ratio);
         fflush(stdout);
     }
@@ -804,5 +812,9 @@ RoCEv2Dada::ReceiveStats RoCEv2Dada::GetReceiveStats() const
     ReceiveStats stats;
     stats.accepted_packets = accepted_receive_packets.load();
     stats.wrong_length_packets = wrong_length_receive_packets.load();
+    stats.published_packets = published_receive_packets.load();
+    stats.published_blocks = published_receive_blocks.load();
+    stats.partial_blocks = partial_receive_blocks.load();
+    stats.cq_tail_records = cq_tail_receive_records.load();
     return stats;
 }

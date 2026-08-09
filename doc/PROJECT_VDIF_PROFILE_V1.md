@@ -74,22 +74,26 @@ NPOL 和 frame length 必须与加载的 profile 及实际 UDP record 一致。�
 出现一次。`antenna_map` 将数值 Station ID 映射为 Beamform 权重 `[F,P,A,B]` 的 A 索引：
 
 ```text
-raw src[t,f,p] -> unpacked dst[t,f,p,antenna_map[station_id]]
+raw src[t,f,p] -> unpack window[antenna_map[station_id],group,t,f,p]
 ```
 
-未知 Station ID、重复 packet、geometry 不一致或 group 不完整均视为错误；零填充或跳过等
-容错行为必须等后续丢包策略明确后才能启用。
+未知 Station ID、重复 packet、geometry 不一致、invalid-data、late 和 observation 边界外
+packet 均分类计数且不停止进程。配置内 Station 缺失或完全缺失的 group 按
+`EXPECTED_GROUPS` 时间轴补零；控制层若任一必需 Station sender 启动失败，则终止整个
+transfer。
 
 ## PSRDADA 边界
 
 raw PSRDADA ring 的 data block 保留每个 record 的 32-byte header。`vdif_unpack` 校验、
-聚合和去头后，计算 ring 只保存 TFPA payload；每个 transfer 的 PSRDADA ASCII header
-则更新为 `ORDER=TFPA`、正确的 sample format、block geometry 和 byte rate。
+聚合和去头后，计算 ring 每个 block 独立保存 ATFP payload；每个 transfer 的 PSRDADA
+ASCII header 更新为 `ORDER=ATFP`、`LAYOUT_SCOPE=BLOCK`、正确的 sample format、
+timeline、block geometry 和 byte rate。GPU H2D 后再融合完成 `[A,TFP]→[TFP,A]`
+物理转置、复数类型转换和 scale。
 
 机器可读 profile 位于
 [`config/packet_formats/frontend.example-v1.json`](../config/packet_formats/frontend.example-v1.json)。
-当前已实现 profile parser/validator 和 inspect 工具；binary decoder、packet-group 状态机
-及 TFPA scatter 尚未实现。
+当前已实现 profile parser/validator、inspect 工具、binary decoder、严格 observation
+timeline、固定环形 packet-group 状态机及 ATFP block 输出。
 
 当前顶层 pipeline 示例使用 `T=512, F=1, P=2, CI8`，所以每个天线 packet 的
 payload 为 2048 bytes。该值属于观测几何，不是 wire profile 的全局常量；运行时必须

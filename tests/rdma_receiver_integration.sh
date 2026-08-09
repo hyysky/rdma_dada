@@ -94,7 +94,7 @@ document = {
         "sample_interval_us": 1.0,
     },
     "ring_buffers": {
-        "records_per_block": 8,
+        "records_per_block": 16,
         "raw_blocks": 2,
         "compute_blocks": 2,
     },
@@ -107,7 +107,7 @@ document = {
 path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 PY
 
-dada_db -k "${ring_key}" -b 8448 -a 4096 -n 2 -r 1 -p -w -l \
+dada_db -k "${ring_key}" -b 16896 -a 4096 -n 2 -r 1 -p -w -l \
     >"${test_root}/dada_db.log" 2>&1 &
 ring_pid=$!
 sleep 1
@@ -126,7 +126,7 @@ reader_pid=$!
     --dport "${RDMA_TEST_DPORT}" \
     --device "${RDMA_TEST_DEVICE}" \
     --key "${ring_key}" \
-    --send_n 8 \
+    --send_n 4 \
     --nsge 4 \
     --config "${test_root}/pipeline.json" \
     --dump-header "${source_dir}/header/array_GZNU.header" \
@@ -164,7 +164,7 @@ timeout 20 ssh "${ssh_options[@]}" -- \
     --source-ip "${RDMA_TEST_SENDER_A_IP}" \
     --source-port 41001 \
     --record-bytes 1056 \
-    --valid-count 4 \
+    --valid-count 6 \
     --fill 17 \
     --wrong-after 2
 timeout 20 ssh "${ssh_options[@]}" -- \
@@ -174,25 +174,12 @@ timeout 20 ssh "${ssh_options[@]}" -- \
     --source-ip "${RDMA_TEST_SENDER_B_IP}" \
     --source-port 41002 \
     --record-bytes 1056 \
-    --valid-count 4 \
+    --valid-count 5 \
     --fill 34
 
-for _ in $(seq 1 100); do
-    if grep -q "Blocks written: 1" "${test_root}/receiver.log"; then
-        break
-    fi
-    if ! kill -0 "${receiver_pid}" 2>/dev/null; then
-        cat "${test_root}/receiver.log" >&2
-        echo "rdma2dada exited while receiving mixed-source traffic" >&2
-        exit 1
-    fi
-    sleep 0.1
-done
-if ! grep -q "Blocks written: 1" "${test_root}/receiver.log"; then
-    cat "${test_root}/receiver.log" >&2
-    echo "timed out waiting for one complete raw ring block" >&2
-    exit 1
-fi
+# Allow the final three completions to reach the CQ. No full raw block should
+# be published before stop: shutdown must flush 2 complete batches + 3 records.
+sleep 1
 
 kill -TERM "${receiver_pid}"
 timeout 20 tail --pid="${receiver_pid}" -f /dev/null
@@ -202,7 +189,9 @@ timeout 20 tail --pid="${reader_pid}" -f /dev/null
 wait "${reader_pid}"
 reader_pid=
 
-grep -q "Receive summary: accepted=8, wrong_length=1" \
+grep -q "Receive summary: accepted=11, wrong_length=1, published=11" \
+    "${test_root}/receiver.log"
+grep -q "partial_blocks=1, cq_tail_records=3" \
     "${test_root}/receiver.log"
 
 python3 - "${test_root}/output" <<'PY'
@@ -214,7 +203,7 @@ files = list(output_dir.glob("*.dada"))
 if len(files) != 1:
     raise SystemExit(f"expected one output DADA file, found {files}")
 content = files[0].read_bytes()
-if len(content) != 4096 + 8448:
+if len(content) != 4096 + 11 * 1056:
     raise SystemExit(f"unexpected DADA file size: {len(content)}")
 records = [
     content[offset : offset + 1056]
@@ -223,10 +212,10 @@ records = [
 fill_values = [record[0] for record in records]
 if any(record != bytes([record[0]]) * 1056 for record in records):
     raise SystemExit("raw ring contains a truncated or mixed record")
-if fill_values.count(17) != 4 or fill_values.count(34) != 4:
+if fill_values.count(17) != 6 or fill_values.count(34) != 5:
     raise SystemExit(f"unexpected source record counts: {fill_values}")
 if 0x7E in fill_values:
     raise SystemExit("wrong-length record reached the raw ring")
 PY
 
-echo "RDMA receiver mixed-source/wrong-length integration passed"
+echo "RDMA receiver finite-transfer tail integration passed"

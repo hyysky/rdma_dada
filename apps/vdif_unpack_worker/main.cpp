@@ -1,10 +1,10 @@
-#include "rdma_dada/config/packet_format_config.h"
-#include "rdma_dada/config/pipeline_config.h"
+#include "rdma_dada/config/resolved_plan_json.h"
+#include "rdma_dada/modules/vdif_unpack/atfp_block_writer.h"
+#include "rdma_dada/modules/vdif_unpack/vdif_atfp_engine.h"
+#include "rdma_dada/modules/vdif_unpack/vdif_timeline.h"
 #include "rdma_dada/modules/vdif_unpack/vdif_unpack_config.h"
-#include "rdma_dada/modules/vdif_unpack/vdif_unpack_engine.h"
 #include "rdma_dada/modules/vdif_unpack/vdif_unpack_header.h"
 #include "rdma_dada/pipeline/ascii_metadata.h"
-#include "rdma_dada/pipeline/group_block_writer.h"
 
 #include <dada_client.h>
 #include <dada_hdu.h>
@@ -121,8 +121,9 @@ struct WorkerRuntime {
     rdma_dada::PipelineConfig pipeline_config;
     rdma_dada::PipelineLayout pipeline_layout;
     unpack::VdifUnpackLayout unpack_layout;
-    unpack::VdifUnpackEngine engine;
-    rdma_dada::pipeline::GroupBlockWriter writer;
+    unpack::VdifTimeline timeline;
+    unpack::VdifAtfpUnpackEngine engine;
+    unpack::AtfpBlockWriter writer;
     PsrdadaBlockSink sink;
     multilog_t* log;
     dada_hdu_t* output_hdu;
@@ -165,10 +166,10 @@ bool EndOutputTransfer(WorkerRuntime* runtime) {
     return ok;
 }
 
-bool EmitGroup(WorkerRuntime* runtime, const unpack::VdifGroupKey&,
-               const std::uint8_t* data, std::uint64_t bytes,
-               std::string* error) {
-    return runtime->writer.Append(data, bytes, error);
+bool EmitAtfpBlock(WorkerRuntime* runtime,
+                   const unpack::AtfpBlockView& view,
+                   std::string* error) {
+    return runtime->writer.Write(view, error);
 }
 
 int OpenTransfer(dada_client_t* client) {
@@ -212,6 +213,14 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
+        if (!unpack::ParseVdifTimeline(
+                input_header, runtime->pipeline_config,
+                &runtime->timeline, &error)) {
+            SetFailure(runtime, "cannot parse VDIF observation timeline: " +
+                                    error);
+            return -1;
+        }
+
         rdma_dada::pipeline::Metadata output_header;
         if (!unpack::BuildVdifUnpackOutputHeader(
                 input_header, runtime->config, runtime->pipeline_config,
@@ -242,14 +251,13 @@ int OpenTransfer(dada_client_t* client) {
 
         if (!runtime->engine.Configure(
                 runtime->config, runtime->pipeline_config,
-                runtime->unpack_layout, &error)) {
+                runtime->unpack_layout, runtime->timeline, &error)) {
             SetFailure(runtime, "cannot configure VDIF unpack engine: " + error);
             return -1;
         }
         runtime->sink.Configure(runtime->output_hdu->data_block,
                                 runtime->output_block_capacity);
         if (!runtime->writer.Configure(
-                runtime->unpack_layout.group_bytes,
                 runtime->output_block_capacity, &runtime->sink, &error)) {
             SetFailure(runtime, "cannot configure compute block writer: " + error);
             return -1;
@@ -282,14 +290,17 @@ int OpenTransfer(dada_client_t* client) {
         client->header_transfer = 0;
         multilog(runtime->log, LOG_INFO,
                  "VDIF unpack transfer opened: input=%#x output=%#x "
-                 "raw_block=%llu compute_block=%llu group=%llu\n",
+                 "raw_block=%llu compute_block=%llu group=%llu "
+                 "expected_groups=%llu order=ATFP\n",
                  runtime->config.input_key, runtime->config.output_key,
                  static_cast<unsigned long long>(
                      runtime->input_block_capacity),
                  static_cast<unsigned long long>(
                      runtime->output_block_capacity),
                  static_cast<unsigned long long>(
-                     runtime->unpack_layout.group_bytes));
+                     runtime->unpack_layout.group_bytes),
+                 static_cast<unsigned long long>(
+                     runtime->timeline.expected_groups));
         return 0;
     } catch (const std::exception& exception) {
         SetFailure(runtime, std::string("exception while opening transfer: ") +
@@ -315,11 +326,10 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
     }
     try {
         std::string error;
-        const unpack::VdifGroupEmitter emitter =
-            [runtime](const unpack::VdifGroupKey& key,
-                      const std::uint8_t* group, std::uint64_t bytes,
+        const unpack::VdifAtfpBlockEmitter emitter =
+            [runtime](const unpack::AtfpBlockView& view,
                       std::string* emit_error) {
-                return EmitGroup(runtime, key, group, bytes, emit_error);
+                return EmitAtfpBlock(runtime, view, emit_error);
             };
         if (!runtime->engine.ConsumeRawBlock(
                 static_cast<const std::uint8_t*>(data), data_size,
@@ -345,11 +355,10 @@ int CloseTransferBody(dada_client_t* client) {
 
     std::string error;
     if (!runtime->failed) {
-        const unpack::VdifGroupEmitter emitter =
-            [runtime](const unpack::VdifGroupKey& key,
-                      const std::uint8_t* group, std::uint64_t bytes,
+        const unpack::VdifAtfpBlockEmitter emitter =
+            [runtime](const unpack::AtfpBlockView& view,
                       std::string* emit_error) {
-                return EmitGroup(runtime, key, group, bytes, emit_error);
+                return EmitAtfpBlock(runtime, view, emit_error);
             };
         if (!runtime->engine.Finish(emitter, &error)) {
             SetFailure(runtime, "cannot flush VDIF reorder window: " + error);
@@ -358,19 +367,25 @@ int CloseTransferBody(dada_client_t* client) {
         }
     }
 
-    const unpack::VdifUnpackStatistics& statistics =
+    const unpack::VdifAtfpStatistics& statistics =
         runtime->engine.statistics();
+    const unpack::AtfpBlockWriterStatistics& writer_statistics =
+        runtime->writer.statistics();
     const double loss_percent =
-        statistics.expected_station_packets_for_observed_groups == 0
+        statistics.expected_station_packets == 0
             ? 0.0
             : 100.0 * static_cast<double>(statistics.missing_station_packets) /
-                  static_cast<double>(
-                      statistics.expected_station_packets_for_observed_groups);
+                  static_cast<double>(statistics.expected_station_packets);
     multilog(runtime->log, LOG_INFO,
              "VDIF unpack statistics: records=%llu accepted=%llu "
              "bad_header=%llu invalid_data=%llu unknown_station=%llu "
-             "duplicate=%llu late=%llu complete_groups=%llu "
-             "incomplete_groups=%llu missing_station=%llu/%llu (%.6f%%)\n",
+             "duplicate=%llu late=%llu out_of_range=%llu "
+             "complete_groups=%llu incomplete_groups=%llu "
+             "fully_missing_groups=%llu missing_station=%llu/%llu "
+             "(%.6f%%) large_gap_advances=%llu payload_copies=%llu/%llu "
+             "emitted_blocks=%llu emitted_bytes=%llu "
+             "writer_acquire=%llu commit=%llu blocks=%llu bytes=%llu "
+             "acquire_wait_ns=%llu\n",
              static_cast<unsigned long long>(statistics.received_records),
              static_cast<unsigned long long>(statistics.accepted_packets),
              static_cast<unsigned long long>(
@@ -381,12 +396,23 @@ int CloseTransferBody(dada_client_t* client) {
                  statistics.unknown_station_packets),
              static_cast<unsigned long long>(statistics.duplicate_packets),
              static_cast<unsigned long long>(statistics.late_packets),
+             static_cast<unsigned long long>(statistics.out_of_range_packets),
              static_cast<unsigned long long>(statistics.completed_groups),
              static_cast<unsigned long long>(statistics.incomplete_groups),
+             static_cast<unsigned long long>(statistics.fully_missing_groups),
              static_cast<unsigned long long>(statistics.missing_station_packets),
-             static_cast<unsigned long long>(
-                 statistics.expected_station_packets_for_observed_groups),
-             loss_percent);
+             static_cast<unsigned long long>(statistics.expected_station_packets),
+             loss_percent,
+             static_cast<unsigned long long>(statistics.large_gap_advances),
+             static_cast<unsigned long long>(statistics.payload_copy_calls),
+             static_cast<unsigned long long>(statistics.payload_copy_bytes),
+             static_cast<unsigned long long>(statistics.emitted_blocks),
+             static_cast<unsigned long long>(statistics.emitted_bytes),
+             static_cast<unsigned long long>(writer_statistics.acquire_calls),
+             static_cast<unsigned long long>(writer_statistics.commit_calls),
+             static_cast<unsigned long long>(writer_statistics.committed_blocks),
+             static_cast<unsigned long long>(writer_statistics.committed_bytes),
+             static_cast<unsigned long long>(writer_statistics.acquire_wait_ns));
 
     if (!EndOutputTransfer(runtime)) return -1;
     if (!runtime->failed) {
@@ -413,31 +439,26 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
 }
 
 void PrintUsage(const char* program) {
-    std::cerr << "Usage: " << program << " CONFIG.json\n";
+    std::cerr << "Usage: " << program
+              << " --plan resolved_observation.json\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc != 3 || std::string(argv[1]) != "--plan") {
         PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
 
     WorkerRuntime runtime;
-    rdma_dada::PacketFormatConfig packet_config;
+    rdma_dada::ResolvedObservationPlan resolved_plan;
     std::string error;
-    if (!unpack::LoadVdifUnpackConfig(argv[1], &runtime.config, &error) ||
-        !rdma_dada::LoadPipelineConfig(
-            runtime.config.pipeline_config_path,
-            &runtime.pipeline_config, &error) ||
-        !rdma_dada::LoadPacketFormatConfig(
-            runtime.config.packet_format_path, &packet_config, &error) ||
-        !rdma_dada::ComputePipelineLayout(
-            runtime.pipeline_config, &runtime.pipeline_layout, &error) ||
-        !unpack::ComputeVdifUnpackLayout(
-            runtime.config, runtime.pipeline_config, packet_config,
-            &runtime.unpack_layout, &error)) {
+    if (!rdma_dada::LoadResolvedObservationPlan(
+            argv[2], &resolved_plan, &error) ||
+        !unpack::BuildVdifUnpackRuntimeFromResolvedPlan(
+            resolved_plan, &runtime.config, &runtime.pipeline_config,
+            &runtime.pipeline_layout, &runtime.unpack_layout, &error)) {
         std::cerr << "vdif_unpack_worker: " << error << '\n';
         return EXIT_FAILURE;
     }

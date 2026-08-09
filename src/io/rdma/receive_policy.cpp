@@ -43,6 +43,25 @@ bool ShouldLogWrongLengthDrop(std::uint64_t drop_count) {
     return drop_count != 0 && (drop_count & (drop_count - 1)) == 0;
 }
 
+RawBlockTail ClassifyRawBlockTail(std::uint64_t block_bytes,
+                                  std::uint64_t record_bytes,
+                                  std::uint64_t valid_bytes) {
+    RawBlockTail result;
+    result.disposition = RawBlockTailDisposition::kInvalid;
+    result.valid_bytes = valid_bytes;
+    result.valid_records = 0;
+    if (block_bytes == 0U || record_bytes == 0U ||
+        block_bytes % record_bytes != 0U || valid_bytes > block_bytes ||
+        valid_bytes % record_bytes != 0U) {
+        return result;
+    }
+    result.valid_records = valid_bytes / record_bytes;
+    result.disposition = valid_bytes == 0U
+        ? RawBlockTailDisposition::kNoData
+        : RawBlockTailDisposition::kPublish;
+    return result;
+}
+
 }  // namespace rdma
 }  // namespace io
 }  // namespace rdma_dada

@@ -6,7 +6,7 @@
 #include <vector>
 #include <mutex>
 
-#include "rdma_dada/pipeline/dada_header.h"
+#include "rdma_dada/pipeline/metadata.h"
 
 struct ibv_pd;
 struct ibv_mr;
@@ -24,8 +24,8 @@ class PsrdadaRingBuf {
 public:
     PsrdadaRingBuf();
     int Init(key_t key, uint64_t block_bytes, uint64_t nbufs,
-             const char *header_template_path,
-             const dada_header_t &runtime_header);
+             uint64_t record_bytes,
+             const rdma_dada::pipeline::Metadata& runtime_header);
     char* GetWriteBuffer(uint64_t bytes);
     int MarkWritten(uint64_t bytes);
     int StartBlock();
@@ -59,6 +59,8 @@ private:
     void *data_block;  // ipcio_t* (ת����void*����)
     char *current_ptr;
     uint64_t current_block;
+    uint64_t block_bytes;
+    uint64_t record_bytes;
     int is_initialized;
     uint32_t buffer_key;
     

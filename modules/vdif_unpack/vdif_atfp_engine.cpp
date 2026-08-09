@@ -1,0 +1,419 @@
+#include "rdma_dada/modules/vdif_unpack/vdif_atfp_engine.h"
+
+#include "rdma_dada/modules/vdif_unpack/project_vdif_v1.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+namespace rdma_dada {
+namespace modules {
+namespace vdif_unpack {
+namespace {
+
+bool Fail(const std::string& message, std::string* error) {
+    if (error) *error = message;
+    return false;
+}
+
+bool CheckedMultiply(std::uint64_t left, std::uint64_t right,
+                     std::uint64_t* result) {
+    if (!result ||
+        (left != 0U &&
+         right > std::numeric_limits<std::uint64_t>::max() / left)) {
+        return false;
+    }
+    *result = left * right;
+    return true;
+}
+
+}  // namespace
+
+struct VdifAtfpUnpackEngine::Impl {
+    struct GroupSlot {
+        std::uint64_t owned_ordinal;
+        std::uint32_t seen_count;
+        bool active;
+    };
+
+    VdifUnpackConfig config;
+    PipelineConfig pipeline;
+    VdifUnpackLayout layout;
+    VdifTimeline timeline;
+    ProjectVdifGeometry geometry;
+    VdifAtfpStatistics statistics;
+    std::vector<std::uint8_t> payload_window;
+    std::vector<std::uint8_t> station_seen;
+    std::vector<GroupSlot> slots;
+    std::vector<std::int32_t> station_to_antenna;
+    std::uint64_t groups_per_compute_block;
+    std::uint64_t reorder_horizon_groups;
+    std::uint64_t next_emit_ordinal;
+    std::uint64_t highest_seen_ordinal;
+    std::uint64_t raw_block_bytes;
+    std::uint64_t last_raw_block_sequence;
+    bool has_highest_seen;
+    bool has_raw_block_sequence;
+    bool configured;
+    bool finished;
+
+    Impl()
+        : statistics(), groups_per_compute_block(0),
+          reorder_horizon_groups(0), next_emit_ordinal(0),
+          highest_seen_ordinal(0), raw_block_bytes(0),
+          last_raw_block_sequence(0), has_highest_seen(false),
+          has_raw_block_sequence(false), configured(false), finished(false) {}
+
+    std::uint64_t SlotIndex(std::uint64_t ordinal) const {
+        return ordinal % layout.window_capacity_groups;
+    }
+
+    std::uint8_t* Seen(std::uint64_t slot, std::uint32_t antenna) {
+        return &station_seen[static_cast<std::size_t>(
+            slot * pipeline.nant + antenna)];
+    }
+
+    std::uint8_t* Payload(std::uint64_t slot, std::uint32_t antenna) {
+        const std::uint64_t element =
+            static_cast<std::uint64_t>(antenna) *
+                layout.window_capacity_groups + slot;
+        return payload_window.data() + static_cast<std::size_t>(
+            element * pipeline.packet_payload_bytes);
+    }
+
+    const GroupSlot* ActiveSlot(std::uint64_t ordinal) const {
+        const GroupSlot& slot = slots[static_cast<std::size_t>(
+            ordinal % layout.window_capacity_groups)];
+        return slot.active && slot.owned_ordinal == ordinal ? &slot : NULL;
+    }
+
+    bool IsFinal(std::uint64_t ordinal) const {
+        const GroupSlot* slot = ActiveSlot(ordinal);
+        if (slot && slot->seen_count == pipeline.nant) return true;
+        return has_highest_seen && highest_seen_ordinal >= ordinal &&
+               highest_seen_ordinal - ordinal >= reorder_horizon_groups;
+    }
+
+    bool RangeIsFinal(std::uint64_t first, std::uint64_t count) const {
+        for (std::uint64_t offset = 0; offset < count; ++offset) {
+            if (!IsFinal(first + offset)) return false;
+        }
+        return true;
+    }
+
+    void PrepareMissing(std::uint64_t first, std::uint64_t count) {
+        for (std::uint64_t offset = 0; offset < count; ++offset) {
+            const std::uint64_t ordinal = first + offset;
+            const std::uint64_t slot_index = SlotIndex(ordinal);
+            const GroupSlot* active = ActiveSlot(ordinal);
+            for (std::uint32_t antenna = 0; antenna < pipeline.nant;
+                 ++antenna) {
+                const bool present = active && *Seen(slot_index, antenna) != 0U;
+                if (!present) {
+                    std::memset(Payload(slot_index, antenna), 0,
+                    static_cast<std::size_t>(
+                                    pipeline.packet_payload_bytes));
+                }
+            }
+        }
+    }
+
+    void CountPublishedGroups(std::uint64_t first, std::uint64_t count) {
+        for (std::uint64_t offset = 0; offset < count; ++offset) {
+            const std::uint64_t ordinal = first + offset;
+            const GroupSlot* active = ActiveSlot(ordinal);
+            const std::uint64_t seen_count = active ? active->seen_count : 0U;
+            statistics.expected_station_packets += pipeline.nant;
+            statistics.missing_station_packets += pipeline.nant - seen_count;
+            if (seen_count == pipeline.nant) {
+                ++statistics.completed_groups;
+            } else {
+                ++statistics.incomplete_groups;
+                if (seen_count == 0U) ++statistics.fully_missing_groups;
+            }
+        }
+    }
+
+    bool Publish(std::uint64_t count, const VdifAtfpBlockEmitter& emit,
+                 std::string* error) {
+        if (count == 0U || count > groups_per_compute_block ||
+            count > timeline.expected_groups - next_emit_ordinal) {
+            return Fail("invalid ATFP publication range", error);
+        }
+        PrepareMissing(next_emit_ordinal, count);
+        AtfpBlockView view = {};
+        view.window_data = payload_window.data();
+        view.window_capacity_groups = layout.window_capacity_groups;
+        view.first_group_ordinal = next_emit_ordinal;
+        view.first_slot = SlotIndex(next_emit_ordinal);
+        view.group_count = count;
+        view.nant = pipeline.nant;
+        view.packet_payload_bytes = pipeline.packet_payload_bytes;
+        if (!emit(view, error)) return false;
+
+        CountPublishedGroups(next_emit_ordinal, count);
+        std::uint64_t emitted_bytes = 0;
+        if (!CheckedMultiply(count, layout.group_bytes, &emitted_bytes))
+            return Fail("emitted ATFP byte count overflows", error);
+        statistics.emitted_bytes += emitted_bytes;
+        ++statistics.emitted_blocks;
+        for (std::uint64_t offset = 0; offset < count; ++offset) {
+            const std::uint64_t ordinal = next_emit_ordinal + offset;
+            GroupSlot& slot = slots[static_cast<std::size_t>(SlotIndex(ordinal))];
+            if (slot.active && slot.owned_ordinal == ordinal) {
+                slot.active = false;
+                slot.seen_count = 0;
+            }
+        }
+        next_emit_ordinal += count;
+        return true;
+    }
+
+    bool EmitReadyFullBlocks(const VdifAtfpBlockEmitter& emit,
+                             std::string* error) {
+        while (timeline.expected_groups - next_emit_ordinal >=
+                   groups_per_compute_block &&
+               RangeIsFinal(next_emit_ordinal,
+                            groups_per_compute_block)) {
+            if (!Publish(groups_per_compute_block, emit, error)) return false;
+        }
+        return true;
+    }
+
+    bool EnsureFits(std::uint64_t ordinal,
+                    const VdifAtfpBlockEmitter& emit,
+                    std::string* error) {
+        if (!has_highest_seen || ordinal > highest_seen_ordinal) {
+            highest_seen_ordinal = ordinal;
+            has_highest_seen = true;
+        }
+        while (ordinal >= next_emit_ordinal &&
+               ordinal - next_emit_ordinal >=
+                   layout.window_capacity_groups) {
+            if (timeline.expected_groups - next_emit_ordinal <
+                groups_per_compute_block) {
+                return Fail("far-future packet cannot fit before final partial "
+                            "range", error);
+            }
+            if (!RangeIsFinal(next_emit_ordinal,
+                              groups_per_compute_block)) {
+                return Fail("window pressure reached a non-final output range",
+                            error);
+            }
+            if (!Publish(groups_per_compute_block, emit, error)) return false;
+            ++statistics.large_gap_advances;
+        }
+        return true;
+    }
+};
+
+VdifAtfpUnpackEngine::VdifAtfpUnpackEngine() : impl_(new Impl) {}
+VdifAtfpUnpackEngine::~VdifAtfpUnpackEngine() {}
+
+bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
+                                     const PipelineConfig& pipeline,
+                                     const VdifUnpackLayout& layout,
+                                     const VdifTimeline& timeline,
+                                     std::string* error) {
+    PipelineLayout pipeline_layout = {};
+    if (!ComputePipelineLayout(pipeline, &pipeline_layout, error)) return false;
+    if (config.window_blocks < 2U)
+        return Fail("window_blocks must be at least two", error);
+    if (pipeline.nant == 0U || config.antenna_map.size() != pipeline.nant)
+        return Fail("antenna_map length must equal positive NANT", error);
+    std::uint64_t expected_group_bytes = 0;
+    std::uint64_t expected_window_groups = 0;
+    std::uint64_t expected_window_bytes = 0;
+    if (!CheckedMultiply(pipeline.packet_payload_bytes, pipeline.nant,
+                         &expected_group_bytes) ||
+        !CheckedMultiply(pipeline_layout.packets_per_antenna_per_block,
+                         config.window_blocks, &expected_window_groups) ||
+        !CheckedMultiply(pipeline_layout.compute_block_bytes,
+                         config.window_blocks, &expected_window_bytes)) {
+        return Fail("ATFP layout arithmetic overflows uint64", error);
+    }
+    if (layout.raw_record_bytes != pipeline_layout.raw_record_bytes ||
+        layout.records_per_raw_block != pipeline.records_per_block ||
+        layout.group_bytes != expected_group_bytes ||
+        layout.compute_block_bytes != pipeline_layout.compute_block_bytes ||
+        layout.window_capacity_groups != expected_window_groups ||
+        layout.window_bytes != expected_window_bytes) {
+        return Fail("ATFP layout conflicts with pipeline geometry", error);
+    }
+    if (layout.window_capacity_groups == 0U || layout.group_bytes == 0U ||
+        layout.compute_block_bytes % layout.group_bytes != 0U)
+        return Fail("ATFP compute block must contain complete groups", error);
+    const std::uint64_t groups_per_block =
+        layout.compute_block_bytes / layout.group_bytes;
+    std::uint64_t minimum_window_groups = 0;
+    if (!CheckedMultiply(groups_per_block, 2U, &minimum_window_groups) ||
+        layout.window_capacity_groups < minimum_window_groups)
+        return Fail("ATFP window must hold at least two compute blocks", error);
+    if (layout.window_bytes > config.max_window_bytes ||
+        layout.window_bytes > std::numeric_limits<std::size_t>::max() ||
+        layout.window_capacity_groups > std::numeric_limits<std::size_t>::max() ||
+        layout.window_capacity_groups >
+            std::numeric_limits<std::size_t>::max() / pipeline.nant) {
+        return Fail("ATFP window exceeds configured host memory limits", error);
+    }
+    if (timeline.group_period_ps == 0U || timeline.start_frame != 0U ||
+        timeline.expected_groups == 0U)
+        return Fail("ATFP timeline is invalid", error);
+    std::uint64_t expected_transfer_bytes = 0;
+    std::uint64_t expected_station_packets = 0;
+    if (!CheckedMultiply(timeline.expected_groups, layout.group_bytes,
+                         &expected_transfer_bytes) ||
+        !CheckedMultiply(timeline.expected_groups, pipeline.nant,
+                         &expected_station_packets)) {
+        return Fail("ATFP expected transfer geometry overflows uint64", error);
+    }
+
+    std::unique_ptr<Impl> next(new Impl);
+    next->config = config;
+    next->pipeline = pipeline;
+    next->layout = layout;
+    next->timeline = timeline;
+    next->raw_block_bytes = pipeline_layout.raw_block_bytes;
+    next->groups_per_compute_block = groups_per_block;
+    next->reorder_horizon_groups =
+        layout.window_capacity_groups - groups_per_block;
+    next->geometry.first_channel_id = config.first_channel_id;
+    next->geometry.nchan = static_cast<std::uint8_t>(pipeline.nchan);
+    next->geometry.npol = static_cast<std::uint8_t>(pipeline.npol);
+    next->geometry.nsamp_per_packet =
+        static_cast<std::uint32_t>(pipeline.packet_samples);
+    next->geometry.component_bits =
+        static_cast<std::uint8_t>(pipeline.packet_nbit / 2U);
+    next->geometry.payload_bytes = pipeline.packet_payload_bytes;
+    next->payload_window.resize(static_cast<std::size_t>(layout.window_bytes));
+    next->station_seen.resize(static_cast<std::size_t>(
+        layout.window_capacity_groups * pipeline.nant));
+    next->slots.resize(static_cast<std::size_t>(layout.window_capacity_groups));
+    next->station_to_antenna.assign(65536U, -1);
+    for (std::size_t antenna = 0; antenna < config.antenna_map.size();
+         ++antenna) {
+        const std::uint16_t station = config.antenna_map[antenna];
+        if (next->station_to_antenna[station] >= 0)
+            return Fail("antenna_map contains duplicate Station IDs", error);
+        next->station_to_antenna[station] =
+            static_cast<std::int32_t>(antenna);
+    }
+    next->configured = true;
+    impl_.swap(next);
+    return true;
+}
+
+bool VdifAtfpUnpackEngine::ConsumeRawBlock(
+    const std::uint8_t* data, std::uint64_t size,
+    std::uint64_t raw_block_sequence, const VdifAtfpBlockEmitter& emit,
+    std::string* error) {
+    if (!impl_->configured || impl_->finished)
+        return Fail("ATFP engine is not configured for an active transfer",
+                    error);
+    if (!emit) return Fail("ATFP block emitter is empty", error);
+    if (!data && size != 0U) return Fail("raw block data pointer is null", error);
+    if (size == 0U) return Fail("raw block must contain at least one record", error);
+    if (size > impl_->raw_block_bytes)
+        return Fail("input exceeds configured raw block size", error);
+    if (size % impl_->layout.raw_record_bytes != 0U)
+        return Fail("raw block ends with a partial Project VDIF record", error);
+    if (impl_->has_raw_block_sequence &&
+        raw_block_sequence <= impl_->last_raw_block_sequence)
+        return Fail("raw block sequence must increase", error);
+    impl_->has_raw_block_sequence = true;
+    impl_->last_raw_block_sequence = raw_block_sequence;
+
+    for (std::uint64_t offset = 0; offset < size;
+         offset += impl_->layout.raw_record_bytes) {
+        ++impl_->statistics.received_records;
+        const std::uint8_t* record = data + offset;
+        ProjectVdifHeader header = {};
+        std::string ignored;
+        if (!DecodeProjectVdifV1(record, 32U, &header, &ignored) ||
+            !ValidateProjectVdifV1(header, impl_->geometry,
+                                   impl_->layout.raw_record_bytes, &ignored)) {
+            ++impl_->statistics.invalid_header_packets;
+            continue;
+        }
+
+        const std::int32_t antenna = impl_->station_to_antenna[header.station_id];
+        if (antenna < 0) {
+            ++impl_->statistics.unknown_station_packets;
+            continue;
+        }
+        std::uint64_t ordinal = 0;
+        if (!VdifTimeToOrdinal(impl_->timeline, header.reference_epoch,
+                               header.seconds_from_reference_epoch,
+                               header.frame_number_within_second, &ordinal,
+                               &ignored)) {
+            ++impl_->statistics.out_of_range_packets;
+            continue;
+        }
+        if (ordinal < impl_->next_emit_ordinal) {
+            ++impl_->statistics.late_packets;
+            continue;
+        }
+        if (!impl_->EnsureFits(ordinal, emit, error)) return false;
+        if (header.invalid_data) {
+            ++impl_->statistics.invalid_data_packets;
+            continue;
+        }
+
+        const std::uint64_t slot_index = impl_->SlotIndex(ordinal);
+        Impl::GroupSlot& slot =
+            impl_->slots[static_cast<std::size_t>(slot_index)];
+        if (slot.active && slot.owned_ordinal != ordinal) {
+            return Fail("circular slot alias would overwrite a live ordinal",
+                        error);
+        }
+        if (!slot.active) {
+            slot.active = true;
+            slot.owned_ordinal = ordinal;
+            slot.seen_count = 0;
+            std::memset(&impl_->station_seen[static_cast<std::size_t>(
+                            slot_index * impl_->pipeline.nant)],
+                        0, static_cast<std::size_t>(impl_->pipeline.nant));
+        }
+        if (*impl_->Seen(slot_index, static_cast<std::uint32_t>(antenna)) != 0U) {
+            ++impl_->statistics.duplicate_packets;
+            continue;
+        }
+        std::memcpy(
+            impl_->Payload(slot_index, static_cast<std::uint32_t>(antenna)),
+            record + impl_->pipeline.packet_header_bytes,
+            static_cast<std::size_t>(impl_->pipeline.packet_payload_bytes));
+        *impl_->Seen(slot_index, static_cast<std::uint32_t>(antenna)) = 1U;
+        ++slot.seen_count;
+        ++impl_->statistics.accepted_packets;
+        ++impl_->statistics.payload_copy_calls;
+        impl_->statistics.payload_copy_bytes +=
+            impl_->pipeline.packet_payload_bytes;
+    }
+    return impl_->EmitReadyFullBlocks(emit, error);
+}
+
+bool VdifAtfpUnpackEngine::Finish(const VdifAtfpBlockEmitter& emit,
+                                  std::string* error) {
+    if (!impl_->configured || impl_->finished)
+        return Fail("ATFP engine is not configured for an active transfer",
+                    error);
+    if (!emit) return Fail("ATFP block emitter is empty", error);
+    while (impl_->next_emit_ordinal < impl_->timeline.expected_groups) {
+        const std::uint64_t remaining =
+            impl_->timeline.expected_groups - impl_->next_emit_ordinal;
+        const std::uint64_t count = std::min(
+            remaining, impl_->groups_per_compute_block);
+        if (!impl_->Publish(count, emit, error)) return false;
+    }
+    impl_->finished = true;
+    return true;
+}
+
+const VdifAtfpStatistics& VdifAtfpUnpackEngine::statistics() const {
+    return impl_->statistics;
+}
+
+}  // namespace vdif_unpack
+}  // namespace modules
+}  // namespace rdma_dada
