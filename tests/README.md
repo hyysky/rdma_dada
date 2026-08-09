@@ -64,9 +64,10 @@ ctest --test-dir build-linux --output-on-failure
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
 | `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证控制器只消费统一 observation/compiler artifacts，并覆盖 preflight-only、配置/二进制 SHA、有限 observation stop、计数守恒、CONFIG_ID/GEOMETRY_ID、双 sender、ATFP/dbdisk/dbnull、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
 | `observation_config_test` | `observation_config_test.cpp` | 校验统一观测 JSON、精确皮秒时长、Station/A 轴顺序、metadata、ring/receiver 参数、相对路径、算法顺序及严格缺失/未知字段拒绝 | `BUILD_TESTING=ON` |
-| `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置和固定 wire profile 精确派生 payload、timeline、block/window/ring/file/rate，并校验溢出、duration 整除、VDIF 和 direct-I/O 边界 | `BUILD_TESTING=ON` |
-| `config_identity_test` | `config_identity_test.cpp` | 校验标准 SHA256、配置规范化、路径无关的 CONFIG_ID/GEOMETRY_ID、权重内容摘要、resolved plan 往返及派生值/ID 篡改拒绝 | `BUILD_TESTING=ON` |
-| `observation_artifacts_test` | `observation_artifacts_test.cpp` | 校验统一观测配置生成 RAW/ATFP DADA header、resolved/ring/report 内容、4096-byte header、manifest 和原子拒绝覆盖 | `BUILD_TESTING=ON` |
+| `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置、wire profile 和 `[F,P,A,B,2]` 权重精确派生 ingest 及 Beamform/Power/Stokes/Integration 的 block/output-ring 几何，并校验溢出、整除和权重 F/P/A 边界 | `BUILD_TESTING=ON` |
+| `beamform_weight_metadata_test` | `beamform_weight_metadata_test.cpp` | 校验 NPY v1/v2、C-order、`|i1`/`<i2`、严格 `[F,P,A,B,2]`、B/NBEAM 推导及 payload/trailing byte 检查 | `BUILD_TESTING=ON` |
+| `config_identity_test` | `config_identity_test.cpp` | 校验标准 SHA256、配置规范化、路径无关的 CONFIG_ID/GEOMETRY_ID、权重内容摘要、resolved plan 往返，以及派生几何、最终输出契约和 ID 篡改拒绝 | `BUILD_TESTING=ON` |
+| `observation_artifacts_test` | `observation_artifacts_test.cpp` | 校验统一观测配置调用生产 header transform 生成 RAW、UNPACKED、CONVERTED、BEAMFORMED、最终产品 header，校验 manifest/resolved/ring/report 内容及单个 output ring 几何 | `BUILD_TESTING=ON` |
 | `observation_config_compile_test` | `observation_config_compile_test.py` | 验证 compiler preflight、无输出副作用、原子 artifact 目录、SHA256 manifest、无覆盖和无效配置拒绝 | 找到 Python 3 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载 schema-v2、固定 32-byte/8-word Project VDIF wire profile，逐字段校验 bit layout、TFP axis、HEADER/DERIVED/LOOKUP 引用，并拒绝 schema-v1 `payload_bytes`、观测轴常量和 downstream `output_order` | `BUILD_TESTING=ON` |
@@ -80,8 +81,8 @@ ctest --test-dir build-linux --output-on-failure
 | `beamform_test_weights_generator_test` | `beamform_test_weights_generator_test.py` | 验证 CUDA Beamform 测试权重生成器输出的 NPY 版本、shape、dtype、order、scale 和已知系数 | 找到 Python 3 |
 | `beamform_cuda_fp32_test` | `beamform_cuda_test.cpp` | 在 CUDA stream 上验证异步 FP32 batched complex GEMM，以及 T/F batch stride | `USE_CUDA=ON` |
 | `beamform_cuda_tf32_test` | `beamform_cuda_test.cpp` | 使用相同已知结果验证 TF32/Tensor Core 配置路径 | `USE_CUDA=ON`，GPU CC ≥ 8.0 |
-| `complex_convert_module_test` | `complex_convert_module_test.cpp` | 验证 CPU reference 的 CI8/CI16→CF32、scale、header/byte 几何、signed 和非重叠约束 | `BUILD_TESTING=ON` |
-| `complex_convert_cuda_test` | `complex_convert_cuda_test.cpp` | 在 non-blocking stream 上验证 CI8/CI16 边界值、scale、size 和 sequence | `USE_CUDA=ON` |
+| `complex_convert_module_test` | `complex_convert_module_test.cpp` | 验证 CPU reference 的块级 ATFP CI8/CI16→物理 TFPA CF32 转置、partial T、scale、header/byte 几何、非法格式、容量及非重叠约束 | `BUILD_TESTING=ON` |
+| `complex_convert_cuda_test` | `complex_convert_cuda_test.cpp` | 在 caller-owned non-default stream 上验证融合 ATFP→TFPA 转置、CI8/CI16→CF32、scale、partial/non-tile/大矩阵、CPU oracle 精确一致及错误 context | `USE_CUDA=ON` |
 | `power_module_test` | `power_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFPB/F32`、header/byte rate、两帧数值结果和错误路径 | `BUILD_TESTING=ON` |
 | `power_cuda_test` | `power_cuda_test.cpp` | 在 worker 风格 non-blocking stream 上验证异步 Power kernel 与 CPU 已知结果一致 | `USE_CUDA=ON` |
 | `stokes_module_test` | `stokes_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFBS/F32`、四个相关产物、双偏振约束、header 和错误路径 | `BUILD_TESTING=ON` |
@@ -89,8 +90,11 @@ ctest --test-dir build-linux --output-on-failure
 | `time_integrate_module_test` | `time_integrate_module_test.cpp` | 验证 TFPB/TFBS 的 SUM/MEAN、累计积分 header、block 缩短、容量/整除/重叠等错误路径 | `BUILD_TESTING=ON` |
 | `time_integrate_cuda_test` | `time_integrate_cuda_test.cpp` | 在 worker 风格 non-blocking stream 上验证异步时间积分与已知结果一致 | `USE_CUDA=ON` |
 | `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
-| `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→Beamform→Power→TimeIntegrate→D2H、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
+| `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→ATFP 转置/转换→Beamform→Power→TimeIntegrate→D2H、独立 buffer、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
+| `pipeline_worker_cuda_products_test` | `pipeline_worker_cuda_products_test.cpp` | 使用非对称 `T=2,F=2,P=2,A=2,B=2` CI8 ATFP 输入，逐项验证 H2D→转换→Beamform-only/Power/Stokes→D2H 的轴顺序、header、size、sequence 和手算数值 | `USE_CUDA=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
+| `worker_resolved_plan_test` | `worker_resolved_plan_test.cpp` | 验证 worker 只从 Resolved Plan 获得 ring key、F/A/P/T、可配置 conversion scale、NPY B/NBEAM、Beamform-only/Power/Stokes/积分链和最终 block 几何，并拒绝 stale geometry 与变更后的权重 digest | `BUILD_TESTING=ON` |
+| `pipeline_worker_resolved_integration_test` | `pipeline_worker_resolved_integration.sh` | 从 Observation 编译 plan，使用每次运行独立的受控 ring key，运行 compute ring→CUDA worker→output ring，验证完整编译 header、Power+Integration 数值、EOD、错误 input header、ring capacity 门禁和定向清理 | Linux、`BUILD_RDMA_PIPELINE=ON`、`USE_CUDA=ON`、PSRDADA CLI；缺少时 skip 77 |
 | `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 从统一 observation 配置生成 RAW header，经 PSRDADA ASCII codec 验证 Project VDIF 几何、CONFIG_ID、GEOMETRY_ID 及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
 | `rdma_receiver_integration_test` | `rdma_receiver_integration.sh` + `rdma_udp_probe.py` | 两台远端发送 11 个正常 record 与 1 个短包；以 `records_per_block=16/send_n=4` 验证 2 个完整 batch + 3-record CQ tail 在停止时发布为一个无截断 partial raw block，并满足 accepted=published=11、wrong_length=1 | `BUILD_RDMA_PIPELINE=ON`、真实 RDMA NIC/PSRDADA/SSH sender 环境；未配置时 skip 77 |
 | `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 从统一 observation 编译 plan/header/ring 几何，验证 full/partial/完全缺失 group、连续双 transfer、ATFP 字节及 EOD，并拒绝错误 CONFIG_ID 和 raw/compute ring block capacity | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
@@ -458,6 +462,13 @@ ctest --test-dir build-cuda \
   -R '^complex_convert_cuda_test$' --output-on-failure
 ```
 
+CUDA 融合转置的诊断 benchmark（H2D 与 kernel 分开计时）：
+
+```bash
+./build-cuda/complex_convert_transpose_cuda_benchmark \
+  CI8 256 65536 200 1.0 0
+```
+
 两者使用独立写死的 CI8/CI16 输入与 CF32 expected 值，覆盖有符号边界、显式 scale、
 frame 扩展和 sequence。CUDA 测试通过同一条 non-blocking stream 完成 H2D、转换和
 D2H，仅在读取结果前同步；没有 CUDA device 时返回 77。
@@ -522,18 +533,52 @@ non-blocking stream 依次调用 `HostToDeviceModule` 和 `DeviceToHostModule`�
   tests/data/beamform_cuda_weights_f2_p1_a2_b2_i8.npy
 
 ctest --test-dir build-cuda \
-  -R '^pipeline_worker_cuda_chain_test$' --output-on-failure
+  -R '^pipeline_worker_cuda_(chain|products)_test$' --output-on-failure
+
+./build-cuda/pipeline_worker_cuda_products_test \
+  build-cuda/manual_pipeline_worker_p2_weights.npy
 ```
 
 该测试不连接 PSRDADA，直接按 worker 的真实调用顺序执行：
 
 ```text
-Host -> H2D -> Beamform -> Power -> TimeIntegrate(K=2,MEAN) -> D2H -> Host
+Host -> H2D -> ComplexConvert -> Beamform -> Power
+     -> TimeIntegrate(K=2,MEAN) -> D2H -> Host
 ```
 
 输入为 `T=2,F=2,P=1,A=2`，输出为 `T=1,F=2,P=1,B=2`，手算结果固定为
 `[17.5,66,175,9]`。测试检查 96-byte scratch、16-byte output、最终 header 和
 sequence，并且只在完整链末尾同步一次 stream。没有可用 CUDA device 时返回 77。
+
+`pipeline_worker_cuda_products_test` 使用 block-scoped `ATFP/CI8` 输入和
+`FPAB2` 单位选通权重，在同一 worker-owned stream 上分别运行 Beamform-only、Power
+和 Stokes 三种链。输入的每个 T/F/P/A 复数值均不对称，输出按手算的 TFPB/TFBS
+字面量逐项比较，因此任一 T/F/P/A/B 轴错位都会失败。测试生成并清理自己的 P=2 NPY
+fixture，不连接 PSRDADA ring。
+
+### Resolved Plan + PSRDADA + CUDA worker 集成测试
+
+该测试已注册为 `pipeline_worker_resolved_integration_test`。它必须使用配置时发现并记录的
+PSRDADA 绝对安装目录，不能依赖非登录 shell 的 `PATH`：
+
+```bash
+PKG_CONFIG_PATH=/home/user/psrdada/bin \
+/home/user/wy/tools/cmake-3.31.12/bin/cmake \
+  -S . -B build-worker-acceptance \
+  -DBUILD_TESTING=ON -DBUILD_RDMA_PIPELINE=ON -DUSE_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DPSRDADA_RUNTIME_BIN_DIR=/home/user/psrdada/bin
+
+PIPELINE_TEST_RESULT_ROOT=/home/user/wy/pipeline-worker-results \
+/home/user/wy/tools/cmake-3.31.12/bin/ctest \
+  --test-dir build-worker-acceptance \
+  -R '^pipeline_worker_resolved_integration_test$' --output-on-failure
+```
+
+设置 `PIPELINE_TEST_RESULT_ROOT` 时，每次运行会保存独立目录，其中含配置、编译 artifact、
+ring/worker/reader 日志、`run_manifest.json` 和 `result.json`；不设置时仅使用并清理本轮
+`mktemp` 目录。脚本只销毁已确认由本轮 `dada_db` 进程创建的动态 key，不清理固定 key
+或其他测试资源。最终验收连续运行三次，并逐次保留结果。
 
 ### Time integration 测试
 

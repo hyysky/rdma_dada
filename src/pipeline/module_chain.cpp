@@ -154,10 +154,8 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
     if (!status.ok()) return status;
 
     std::string input_memory;
-    if (!ring_input_header.GetString("MEMORY", &input_memory) ||
-        (input_memory != "HOST" && input_memory != "PINNED_HOST")) {
-        return StageStatus::Error(
-            "pipeline_worker input ring requires MEMORY=HOST or PINNED_HOST");
+    if (!ring_input_header.GetString("MEMORY", &input_memory)) {
+        return MissingOrInvalid("MEMORY");
     }
 
     std::uint64_t nchan = 0;
@@ -187,7 +185,7 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
                          &input_frame_bytes)) {
         return StageStatus::Error("input TFPA frame geometry overflows");
     }
-    if (input_frame_bytes != configured_geometry.input_frame_bytes) {
+    if (input_frame_bytes != configured_geometry.converted_frame_bytes) {
         return StageStatus::Error(
             "configured input frame bytes do not match TFPA header geometry");
     }
@@ -217,17 +215,25 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
     if (config.execution_backend == "CUDA" && config.cuda_device < 0) {
         return StageStatus::Error("CUDA_DEVICE must be non-negative");
     }
+    if (config.execution_backend == "CUDA") {
+        std::uint64_t header_device = 0;
+        if (input_memory != "CUDA_DEVICE" ||
+            !ring_input_header.GetUint64("CUDA_DEVICE", &header_device) ||
+            header_device !=
+                static_cast<std::uint64_t>(config.cuda_device)) {
+            return StageStatus::Error(
+                "CUDA module chain requires matching CUDA_DEVICE input");
+        }
+    } else if (input_memory != "HOST" && input_memory != "PINNED_HOST") {
+        return StageStatus::Error(
+            "CPU module chain requires MEMORY=HOST or PINNED_HOST");
+    }
 
     Metadata module_input_header = ring_input_header;
     if (config.execution_backend == "CUDA") {
-        module_input_header.SetString("MEMORY", "CUDA_DEVICE");
-        module_input_header.SetUint64(
-            "CUDA_DEVICE", static_cast<std::uint64_t>(config.cuda_device));
         impl_->plan.execution_location = MemoryLocation::kCudaDevice;
     } else {
         impl_->plan.execution_location = MemoryLocation::kHost;
-        module_input_header.SetString("MEMORY", "HOST");
-        module_input_header.Erase("CUDA_DEVICE");
     }
 
     const StageParameters parameters = MakeModuleParameters(config);
@@ -350,7 +356,7 @@ StageStatus ModuleChain::Configure(const Metadata& ring_input_header,
     published_header.SetUint64(
         "UDP_GROUP_MULTIPLE", configured_geometry.udp_group_multiple);
     published_header.SetUint64(
-        "INPUT_BLOCK_BYTES", configured_geometry.input_block_bytes);
+        "INPUT_BLOCK_BYTES", configured_geometry.converted_block_bytes);
     published_header.SetUint64(
         "OUTPUT_BLOCK_BYTES", configured_geometry.output_block_bytes);
 

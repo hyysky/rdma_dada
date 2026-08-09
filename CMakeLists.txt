@@ -34,6 +34,7 @@ if(USE_CUDA)
 endif()
 
 add_library(rdma_pipeline_config STATIC
+    src/config/beamform_weight_metadata.cpp
     src/config/json_value.cpp
     src/config/observation_config.cpp
     src/config/packet_format_config.cpp
@@ -216,6 +217,9 @@ target_link_libraries(rdma_pipeline_worker_core
         rdma_module_power
         rdma_module_stokes
         rdma_module_time_integrate)
+target_link_libraries(rdma_observation_compiler PUBLIC
+    rdma_module_complex_convert
+    rdma_pipeline_worker_core)
 
 add_executable(pipeline_config_inspect tools/pipeline_config_inspect.cpp)
 target_link_libraries(pipeline_config_inspect PRIVATE rdma_pipeline_config)
@@ -279,6 +283,10 @@ if(BUILD_TESTING)
         rdma_pipeline_config)
     add_executable(config_identity_test tests/config_identity_test.cpp)
     target_link_libraries(config_identity_test PRIVATE rdma_pipeline_config)
+    add_executable(beamform_weight_metadata_test
+        tests/beamform_weight_metadata_test.cpp)
+    target_link_libraries(beamform_weight_metadata_test PRIVATE
+        rdma_pipeline_config)
     add_executable(observation_artifacts_test
         tests/observation_artifacts_test.cpp)
     target_link_libraries(observation_artifacts_test PRIVATE
@@ -307,6 +315,10 @@ if(BUILD_TESTING)
         tests/pipeline_worker_core_test.cpp)
     target_link_libraries(pipeline_worker_core_test
         PRIVATE rdma_pipeline_worker_core)
+    add_executable(worker_resolved_plan_test
+        tests/worker_resolved_plan_test.cpp)
+    target_link_libraries(worker_resolved_plan_test PRIVATE
+        rdma_pipeline_core)
     if(USE_CUDA)
         add_executable(beamform_cuda_test tests/beamform_cuda_test.cpp)
         target_link_libraries(beamform_cuda_test PRIVATE
@@ -315,6 +327,11 @@ if(BUILD_TESTING)
         add_executable(complex_convert_cuda_test
             tests/complex_convert_cuda_test.cpp)
         target_link_libraries(complex_convert_cuda_test PRIVATE
+            rdma_module_complex_convert
+            CUDA::cudart)
+        add_executable(complex_convert_transpose_cuda_benchmark
+            tools/complex_convert_transpose_cuda_benchmark.cpp)
+        target_link_libraries(complex_convert_transpose_cuda_benchmark PRIVATE
             rdma_module_complex_convert
             CUDA::cudart)
         add_executable(power_cuda_test tests/power_cuda_test.cpp)
@@ -339,6 +356,14 @@ if(BUILD_TESTING)
             tests/pipeline_worker_cuda_chain_test.cpp)
         target_link_libraries(pipeline_worker_cuda_chain_test PRIVATE
             rdma_pipeline_worker_core
+            rdma_module_complex_convert
+            rdma_module_transfer
+            CUDA::cudart)
+        add_executable(pipeline_worker_cuda_products_test
+            tests/pipeline_worker_cuda_products_test.cpp)
+        target_link_libraries(pipeline_worker_cuda_products_test PRIVATE
+            rdma_pipeline_worker_core
+            rdma_module_complex_convert
             rdma_module_transfer
             CUDA::cudart)
     endif()
@@ -467,6 +492,8 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
     endif()
     add_test(NAME pipeline_core_test COMMAND pipeline_core_test)
+    add_test(NAME beamform_weight_metadata_test
+        COMMAND beamform_weight_metadata_test)
     add_test(
         NAME beamform_module_test
         COMMAND beamform_module_test
@@ -482,6 +509,11 @@ if(BUILD_TESTING)
         COMMAND pipeline_worker_core_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline_worker.example.json
                 ${CMAKE_CURRENT_BINARY_DIR}/pipeline_worker_test_weights.npy)
+    add_test(
+        NAME worker_resolved_plan_test
+        COMMAND worker_resolved_plan_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
     if(USE_CUDA)
         add_test(
             NAME beamform_cuda_fp32_test
@@ -507,6 +539,10 @@ if(BUILD_TESTING)
             COMMAND pipeline_worker_cuda_chain_test
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/beamform_cuda_weights_f2_p1_a2_b2_i8.npy)
         add_test(
+            NAME pipeline_worker_cuda_products_test
+            COMMAND pipeline_worker_cuda_products_test
+                    ${CMAKE_CURRENT_BINARY_DIR}/pipeline_worker_cuda_products_weights.npy)
+        add_test(
             NAME complex_convert_cuda_help_test
             COMMAND complex_convert_cuda_test -h)
         add_test(NAME beamform_cuda_help_test COMMAND beamform_cuda_test -h)
@@ -521,6 +557,9 @@ if(BUILD_TESTING)
         add_test(
             NAME pipeline_worker_cuda_chain_help_test
             COMMAND pipeline_worker_cuda_chain_test -h)
+        add_test(
+            NAME pipeline_worker_cuda_products_help_test
+            COMMAND pipeline_worker_cuda_products_test -h)
         set_tests_properties(
             beamform_cuda_fp32_test
             beamform_cuda_tf32_test
@@ -530,6 +569,7 @@ if(BUILD_TESTING)
             time_integrate_cuda_test
             transfer_cuda_roundtrip_test
             pipeline_worker_cuda_chain_test
+            pipeline_worker_cuda_products_test
             complex_convert_cuda_help_test
             beamform_cuda_help_test
             power_cuda_help_test
@@ -537,6 +577,7 @@ if(BUILD_TESTING)
             time_integrate_cuda_help_test
             transfer_cuda_roundtrip_help_test
             pipeline_worker_cuda_chain_help_test
+            pipeline_worker_cuda_products_help_test
             PROPERTIES
             LABELS "cuda"
             SKIP_RETURN_CODE 77)
@@ -579,6 +620,17 @@ if(BUILD_RDMA_PIPELINE)
             INTERFACE_INCLUDE_DIRECTORIES "${PSRDADA_INCLUDE_DIR}")
         set(PSRDADA_TARGET psrdada_external)
     endif()
+    if(PSRDADA_PREFIX)
+        set(_PSRDADA_RUNTIME_BIN_DEFAULT "${PSRDADA_PREFIX}/bin")
+    elseif(PSRDADA_LIBRARY)
+        get_filename_component(_PSRDADA_LIBRARY_DIR "${PSRDADA_LIBRARY}" DIRECTORY)
+        get_filename_component(_PSRDADA_PREFIX "${_PSRDADA_LIBRARY_DIR}" DIRECTORY)
+        set(_PSRDADA_RUNTIME_BIN_DEFAULT "${_PSRDADA_PREFIX}/bin")
+    else()
+        set(_PSRDADA_RUNTIME_BIN_DEFAULT "")
+    endif()
+    set(PSRDADA_RUNTIME_BIN_DIR "${_PSRDADA_RUNTIME_BIN_DEFAULT}" CACHE PATH
+        "Directory containing dada_db, dada_diskdb and dada_dbdisk")
 
     pkg_check_modules(IBVERBS QUIET IMPORTED_TARGET libibverbs)
     if(IBVERBS_FOUND)
@@ -663,6 +715,8 @@ if(BUILD_RDMA_PIPELINE)
     target_link_libraries(pipeline_worker
         PRIVATE
             rdma_pipeline_worker_core
+            rdma_observation_compiler
+            rdma_module_complex_convert
             rdma_module_transfer
             ${PSRDADA_TARGET}
             Threads::Threads)
@@ -719,6 +773,23 @@ if(BUILD_RDMA_PIPELINE)
             LABELS "psrdada;integration"
             SKIP_RETURN_CODE 77
             TIMEOUT 90)
+        if(USE_CUDA)
+            add_test(
+                NAME pipeline_worker_resolved_integration_test
+                COMMAND bash
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/pipeline_worker_resolved_integration.sh
+                        $<TARGET_FILE:pipeline_worker>
+                        $<TARGET_FILE:observation_config_compile>
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_beamform_test_weights.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}
+                        ${PSRDADA_RUNTIME_BIN_DIR})
+            set_tests_properties(
+                pipeline_worker_resolved_integration_test PROPERTIES
+                LABELS "cuda;psrdada;integration"
+                RUN_SERIAL TRUE
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120)
+        endif()
     endif()
 endif()
 

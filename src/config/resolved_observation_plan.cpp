@@ -1,5 +1,7 @@
 #include "rdma_dada/config/resolved_observation_plan.h"
 
+#include "rdma_dada/config/beamform_weight_metadata.h"
+
 #include <limits>
 #include <set>
 
@@ -97,6 +99,141 @@ bool ResolveVdifStart(const std::string& text,
     }
     *reference_epoch = static_cast<std::uint8_t>(epoch);
     *seconds = static_cast<std::uint32_t>(second_value);
+    return true;
+}
+
+bool ResolveProcessingGeometry(const ObservationConfig& config,
+                               ResolvedObservationPlan* result,
+                               std::string* error) {
+    if (config.modules.empty()) return true;
+    if (config.output_sample_format != "AUTO") {
+        return Fail("processing.output.sample_format must be AUTO", error);
+    }
+    if (config.modules[0].kind != ObservationModuleKind::kBeamform) {
+        return Fail("processing.modules must start with beamform", error);
+    }
+    if (config.modules.size() > 3U) {
+        return Fail("processing module chain is too long", error);
+    }
+    const ObservationModuleConfig& beamform = config.modules[0];
+    if (beamform.weights_order != "FPAB2") {
+        return Fail("beamform weights_order must be FPAB2", error);
+    }
+    BeamformWeightMetadata weights = BeamformWeightMetadata();
+    if (!ReadBeamformWeightMetadata(beamform.weights_file, &weights, error)) {
+        return false;
+    }
+    if (weights.nchan != config.nchan || weights.npol != config.npol ||
+        weights.nant != result->nant) {
+        return Fail("beamform weight F/P/A shape conflicts with observation",
+                    error);
+    }
+    std::uint64_t weight_complex_bytes = 0U;
+    if (!CheckedMultiply(weights.component_bytes, 2U,
+                         "weight complex sample bytes",
+                         &weight_complex_bytes, error)) {
+        return false;
+    }
+    if (weight_complex_bytes != result->complex_sample_bytes) {
+        return Fail("beamform weight dtype must match antenna input width",
+                    error);
+    }
+    result->nbeam = weights.nbeam;
+    if (!CheckedMultiply(result->compute_block_bytes, 4U,
+                         "converted CF32 block bytes",
+                         &result->converted_block_bytes, error)) {
+        return false;
+    }
+    std::uint64_t beamformed_frame_bytes = 0U;
+    if (!CheckedMultiply(config.nchan, config.npol, "beamformed F*P",
+                         &beamformed_frame_bytes, error) ||
+        !CheckedMultiply(beamformed_frame_bytes, result->nbeam,
+                         "beamformed F*P*B", &beamformed_frame_bytes,
+                         error) ||
+        !CheckedMultiply(beamformed_frame_bytes, 8U,
+                         "beamformed CF32 frame bytes",
+                         &beamformed_frame_bytes, error) ||
+        !CheckedMultiply(result->samples_per_block, beamformed_frame_bytes,
+                         "beamformed block bytes",
+                         &result->beamformed_block_bytes, error)) {
+        return false;
+    }
+    result->product_block_bytes = result->beamformed_block_bytes;
+    result->output_samples_per_block = result->samples_per_block;
+    result->output_data_stage = "BEAMFORMED";
+    result->output_order = "TFPB";
+    result->output_sample_format = "CF32";
+
+    if (config.modules.size() >= 2U) {
+        const ObservationModuleKind product = config.modules[1].kind;
+        std::uint64_t product_frame_bytes = 0U;
+        if (product == ObservationModuleKind::kPower) {
+            if (!CheckedMultiply(config.nchan, config.npol, "power F*P",
+                                 &product_frame_bytes, error) ||
+                !CheckedMultiply(product_frame_bytes, result->nbeam,
+                                 "power F*P*B", &product_frame_bytes,
+                                 error) ||
+                !CheckedMultiply(product_frame_bytes, 4U,
+                                 "power F32 frame bytes",
+                                 &product_frame_bytes, error)) {
+                return false;
+            }
+            result->output_data_stage = "POWER";
+            result->output_order = "TFPB";
+        } else if (product == ObservationModuleKind::kStokes) {
+            if (config.npol != 2U) {
+                return Fail("stokes requires NPOL=2", error);
+            }
+            if (!CheckedMultiply(config.nchan, result->nbeam,
+                                 "stokes F*B", &product_frame_bytes,
+                                 error) ||
+                !CheckedMultiply(product_frame_bytes, 4U,
+                                 "stokes product count",
+                                 &product_frame_bytes, error) ||
+                !CheckedMultiply(product_frame_bytes, 4U,
+                                 "stokes F32 frame bytes",
+                                 &product_frame_bytes, error)) {
+                return false;
+            }
+            result->output_data_stage = "POLARIZATION_PRODUCTS";
+            result->output_order = "TFBS";
+        } else {
+            return Fail("beamform may be followed only by power or stokes",
+                        error);
+        }
+        if (!CheckedMultiply(result->samples_per_block, product_frame_bytes,
+                             "product block bytes",
+                             &result->product_block_bytes, error)) {
+            return false;
+        }
+        result->output_sample_format = "F32";
+    }
+    result->output_block_bytes = result->product_block_bytes;
+
+    if (config.modules.size() == 3U) {
+        const ObservationModuleConfig& integrate = config.modules[2];
+        if (integrate.kind != ObservationModuleKind::kIntegrate ||
+            integrate.integration_length == 0U) {
+            return Fail("third module must be a positive integration", error);
+        }
+        if (result->samples_per_block % integrate.integration_length != 0U) {
+            return Fail("integration length must divide block sample count",
+                        error);
+        }
+        result->output_samples_per_block =
+            result->samples_per_block / integrate.integration_length;
+        result->output_block_bytes =
+            result->product_block_bytes / integrate.integration_length;
+        result->output_data_stage =
+            result->output_data_stage == "POWER" ?
+                "POWER_INTEGRATED" :
+                "POLARIZATION_PRODUCTS_INTEGRATED";
+    }
+    if (!CheckedMultiply(result->output_block_bytes,
+                         config.compute_ring_blocks, "output ring bytes",
+                         &result->output_ring_bytes, error)) {
+        return false;
+    }
     return true;
 }
 
@@ -284,6 +421,7 @@ bool ResolveObservationPlan(const ObservationConfig& config,
         return false;
     }
     result.group_start_frame = 0U;
+    if (!ResolveProcessingGeometry(config, &result, error)) return false;
     *plan = result;
     return true;
 }
@@ -315,6 +453,16 @@ bool BuildPipelineRuntimeFromResolvedPlan(
         verified.window_validity_bytes != plan.window_validity_bytes ||
         verified.raw_ring_bytes != plan.raw_ring_bytes ||
         verified.compute_ring_bytes != plan.compute_ring_bytes ||
+        verified.nbeam != plan.nbeam ||
+        verified.converted_block_bytes != plan.converted_block_bytes ||
+        verified.beamformed_block_bytes != plan.beamformed_block_bytes ||
+        verified.product_block_bytes != plan.product_block_bytes ||
+        verified.output_samples_per_block != plan.output_samples_per_block ||
+        verified.output_block_bytes != plan.output_block_bytes ||
+        verified.output_ring_bytes != plan.output_ring_bytes ||
+        verified.output_data_stage != plan.output_data_stage ||
+        verified.output_order != plan.output_order ||
+        verified.output_sample_format != plan.output_sample_format ||
         verified.raw_file_bytes != plan.raw_file_bytes ||
         verified.compute_file_bytes != plan.compute_file_bytes ||
         verified.payload_bytes_per_second != plan.payload_bytes_per_second ||

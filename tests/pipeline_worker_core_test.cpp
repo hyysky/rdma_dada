@@ -71,7 +71,7 @@ bool WriteLegacyWorkerConfig(const std::string& path,
         << "  \"execution\": {\"backend\": \"CPU_REFERENCE\", "
            "\"cuda_device\": 0, \"run_once\": true},\n"
         << "  \"input_geometry\": {\"nchan\": 1, \"nant\": 2, "
-           "\"npol\": 2, \"udp_payload_bytes\": 16, "
+           "\"npol\": 2, \"udp_payload_bytes\": 4, "
            "\"samples_per_udp\": 1, "
            "\"udp_packets_per_antenna_per_block\": 1},\n"
         << "  \"beamform\": {\"weights_file\": \"" << weights_path
@@ -116,9 +116,10 @@ rdma_dada::pipeline::WorkerConfig MakeConfig(const std::string& weights_path) {
     config.nchan = 1;
     config.nant = 2;
     config.npol = 2;
-    config.udp_payload_bytes = 16;
+    config.udp_payload_bytes = 4;
     config.samples_per_udp = 1;
     config.udp_packets_per_antenna_per_block = 1;
+    config.conversion_scale = 1.0;
     config.weights_file = weights_path;
     config.weights_order = "FPAB2";
     config.weights_id = "worker-test-v1";
@@ -142,6 +143,8 @@ void TestConfigAndAsciiCodec(const std::string& config_path) {
            "hexadecimal ring keys are parsed");
     Expect(config.execution_backend == "CPU_REFERENCE" && config.run_once,
            "execution settings are parsed");
+    Expect(std::fabs(config.conversion_scale - 0.0078125) < 1.0e-12,
+           "mandatory integer-to-CF32 conversion scale is parsed");
     Expect(config.product == rdma_dada::pipeline::WorkerProduct::kPower,
            "output product is parsed");
     Expect(config.integration_enabled && config.integration_length == 128 &&
@@ -156,11 +159,14 @@ void TestConfigAndAsciiCodec(const std::string& config_path) {
            "example worker block geometry computes: " + error);
     Expect(geometry.ntime == UINT64_C(2097152),
            "T is UDP samples times UDP packets per antenna per block");
-    Expect(geometry.udp_antenna_group_bytes == 32768,
+    Expect(geometry.udp_antenna_group_bytes == 8192,
            "one UDP antenna group is payload bytes times A");
-    Expect(geometry.input_frame_bytes == 64 &&
-               geometry.input_block_bytes == UINT64_C(134217728),
-           "CF32 TFPA input block is computed from F*A*P*T");
+    Expect(geometry.input_frame_bytes == 16 &&
+               geometry.input_block_bytes == UINT64_C(33554432),
+           "CI8 ATFP ring input block is computed from F*A*P*T");
+    Expect(geometry.converted_frame_bytes == 64 &&
+               geometry.converted_block_bytes == UINT64_C(134217728),
+           "converted TFPA CF32 block has an independent capacity");
     Expect(geometry.beamformed_block_bytes == UINT64_C(67108864) &&
                geometry.product_block_bytes == UINT64_C(33554432),
            "beamformed and unintegrated power blocks are derived from T");
@@ -206,8 +212,9 @@ void TestLegacyConfigDefaults(const std::string& config_path) {
                config_path, &config, &error),
            "schema v1 worker JSON remains readable: " + error);
     Expect(!config.integration_enabled && config.integration_length == 1 &&
-               config.integration_operation == "MEAN",
-           "schema v1 defaults to disabled time integration");
+               config.integration_operation == "MEAN" &&
+               std::fabs(config.conversion_scale - 1.0) < 1.0e-12,
+           "schema v1 keeps legacy integration and conversion defaults");
 }
 
 void TestModuleChain(const std::string& weights_path) {

@@ -19,7 +19,8 @@ public:
     virtual pipeline::StageStatus Process(
         const pipeline::InputBlock& input,
         pipeline::OutputBlock* output,
-        std::uint64_t sample_count,
+        std::uint64_t nant,
+        std::uint64_t q,
         const pipeline::BlockExecutionContext& context) = 0;
 
     virtual pipeline::StageStatus Finish() = 0;

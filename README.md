@@ -8,7 +8,10 @@ H2D/D2H 的独立 CUDA correctness test 已在目标服务器通过；`pipeline_
 
 ## 当前数据契约
 
-- 所有运行时参数由 JSON 配置输入；`NANT`/`NCHAN`/`NPOL`、`PKT_TSAMP`、`UTC_START` 和 ring/file 几何不写死在程序中。
+- 用户只维护 Observation JSON；编译后的 `resolved_observation.json` 是各进程共同的
+  运行契约。编译器同时生成 RAW、UNPACKED、CONVERTED、BEAMFORMED 和最终产品 header
+  （没有处理模块时只生成前两级）。`NANT`/`NCHAN`/`NPOL`、`PKT_TSAMP`、`UTC_START`
+  和 ring/file 几何不写死。
 - raw ring 中的每条 record 是 `32-byte Project VDIF v1 header + TFP payload`。RoCE 接收缓冲区中额外的 Ethernet/IPv4/UDP 42 字节会在写 ring 前剔除。
 - PSRDADA 的 header block 描述一次 transfer；数据 block 不会重复前缀 ASCII header。
 - 一个解包/计算 block 包含所有 `A` 个阵元的数据。总 UDP record 数必须是 `A` 的
@@ -74,14 +77,16 @@ RTX 3090 的默认 CUDA architecture 是 `86`，可通过
 `-DCMAKE_CUDA_ARCHITECTURES=86` 显式覆盖。CUDA 构建建议使用 CMake 3.24 或更新
 版本；项目最低版本仍为 3.18。
 
-Linux 上构建完成后，worker 使用一个 JSON 文件绑定输入、输出 ring key：
+Linux 上先编译 Observation 配置，再由 worker 消费同一份 Resolved Plan：
 
 ```bash
-./build/pipeline_worker config/pipeline_worker.example.json
+./build/observation_config_compile config/observation.json run/observation
+./build/pipeline_worker run/observation/resolved_observation.json
 ```
 
-输入必须是 host ring 中的 `CONVERTED/TFPA/CF32` 数据。输出可以配置为
-`BEAMFORMED`、`POWER` 或 `STOKES`；ring block 的准确尺寸关系及 header 必填字段见
+输入必须是 host compute ring 中的 `UNPACKED/ATFP/CI8` 数据；worker 在 GPU 内完成
+ATFP→TFPA 与 CI8→CF32，再执行 Beamform 以及可选 Power/Stokes/Integration。
+输出 ring block 大小由权重 NPY 的 B 维和算法链自动推导；准确尺寸关系见
 [apps/pipeline_worker/README.md](apps/pipeline_worker/README.md)。
 
 ## JSON 配置
@@ -92,13 +97,14 @@ Linux 上构建完成后，worker 使用一个 JSON 文件绑定输入、输出 
 ./build/pipeline_config_inspect config/pipeline.example.json
 ```
 
-worker 输入、Beamform 中间结果和最终输出 block 大小由 worker JSON 的
-`F/A/P`、UDP 分组和 `NBEAM/product` 直接计算：
+Observation JSON、Resolved Plan、ring plan 和 DADA header artifact 的生成方式：
 
 ```bash
-./build/pipeline_worker_config_inspect \
-  config/pipeline_worker.example.json
+./build/observation_config_compile \
+  config/observation.example.json run/observation
 ```
+
+`config/pipeline_worker.example.json` 仅用于模块级兼容测试，不再作为应用入口。
 
 前端固定 32-byte Project VDIF v1 header 和 TFP payload 轴布局使用独立
 packet-format profile：

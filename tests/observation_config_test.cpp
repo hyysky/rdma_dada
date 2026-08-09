@@ -106,12 +106,17 @@ int main(int argc, char** argv) {
                    config.compute_ring_blocks == 8 && config.window_blocks == 2,
                "block and window policy");
         Expect(config.raw_key == 0x00d2U && config.compute_key == 0x00d4U,
-               "ring keys");
+               "raw and compute ring keys");
+        Expect(config.output_key == 0x00d6U, "worker output ring key");
         Expect(config.receiver_device == "mlx5_0" &&
                    config.destination_ip == "174.0.1.111" &&
                    config.destination_port == 1000,
                "receiver endpoint");
         Expect(config.modules.empty(), "example is raw/unpack-only");
+        Expect(config.conversion_scale == "0.0078125",
+               "configured integer-to-CF32 scale");
+        Expect(config.output_sample_format == "AUTO",
+               "first-version output format policy");
         Expect(config.wire_profile_path.find("packet_formats/frontend.example-v1.json") !=
                    std::string::npos,
                "wire profile path is resolved relative to observation JSON");
@@ -186,6 +191,32 @@ int main(int argc, char** argv) {
                                  "\"raw_key\": \"invalid\""),
                      &ignored, &error),
            "invalid ring key must be rejected");
+
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(valid, "\"output_key\": \"0x00d6\"",
+                                 "\"output_key\": \"0x00d4\""),
+                     &ignored, &error),
+           "raw, compute and output ring keys must be distinct");
+
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(valid, "\"scale\": \"0.0078125\"",
+                                 "\"scale\": \"1e-3\""),
+                     &ignored, &error),
+           "conversion scale rejects exponent syntax");
+
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(
+                         valid, "\"scale\": \"0.0078125\"",
+                         "\"scale\": "
+                         "\"999999999999999999999999999999999999999\""),
+                     &ignored, &error),
+           "conversion scale must be representable as positive FP32");
+
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(valid, "\"sample_format\": \"AUTO\"",
+                                 "\"sample_format\": \"F16\""),
+                     &ignored, &error),
+           "first-version output format rejects non-AUTO selection");
 
     const std::string invalid_order = ReplaceOnce(
         valid, "\"modules\": []",

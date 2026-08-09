@@ -1,5 +1,8 @@
 #include "rdma_dada/modules/device_to_host/device_to_host_module.h"
 #include "rdma_dada/modules/host_to_device/host_to_device_module.h"
+#include "rdma_dada/modules/complex_convert/complex_convert_module.h"
+#include "rdma_dada/config/observation_artifacts.h"
+#include "rdma_dada/config/resolved_plan_json.h"
 #include "rdma_dada/pipeline/ascii_metadata.h"
 #include "rdma_dada/pipeline/module_chain.h"
 #include "rdma_dada/pipeline/worker_config.h"
@@ -22,6 +25,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,18 +39,23 @@ void HandleSignal(int) { stop_requested = 1; }
 struct WorkerRuntime {
     WorkerRuntime()
         : log(NULL), output_hdu(NULL), output_locked(false), failed(false),
-          input_block_capacity(0), scratch_block_capacity(0),
+          input_block_capacity(0), converted_block_capacity(0),
+          scratch_block_capacity(0),
           output_block_capacity(0), output_block_open(false),
           input_ring_location(rdma_dada::pipeline::MemoryLocation::kHost)
 #if defined(RDMA_DADA_HAVE_CUDA)
-          , stream(NULL), device_input(NULL), device_scratch(NULL),
-          device_output(NULL)
+          , stream(NULL), device_input(NULL), device_converted(NULL),
+          device_scratch(NULL), device_output(NULL)
 #endif
     {}
 
     rdma_dada::pipeline::WorkerConfig config;
     rdma_dada::pipeline::WorkerBlockGeometry geometry;
+    rdma_dada::ResolvedObservationPlan plan;
+    rdma_dada::pipeline::Metadata expected_input_header;
+    rdma_dada::pipeline::Metadata expected_output_header;
     rdma_dada::pipeline::ModuleChain chain;
+    rdma_dada::modules::complex_convert::ComplexConvertModule conversion;
     rdma_dada::modules::host_to_device::HostToDeviceModule h2d;
     rdma_dada::modules::device_to_host::DeviceToHostModule d2h;
     multilog_t* log;
@@ -55,14 +64,17 @@ struct WorkerRuntime {
     bool failed;
     std::string error;
     std::uint64_t input_block_capacity;
+    std::uint64_t converted_block_capacity;
     std::uint64_t scratch_block_capacity;
     std::uint64_t output_block_capacity;
     bool output_block_open;
     rdma_dada::pipeline::MemoryLocation input_ring_location;
     std::vector<std::uint8_t> host_scratch;
+    std::vector<std::uint8_t> host_converted;
 #if defined(RDMA_DADA_HAVE_CUDA)
     cudaStream_t stream;
     std::uint8_t* device_input;
+    std::uint8_t* device_converted;
     std::uint8_t* device_scratch;
     std::uint8_t* device_output;
 #endif
@@ -82,6 +94,127 @@ bool FitsSizeT(std::uint64_t value) {
                         std::numeric_limits<std::size_t>::max());
 }
 
+bool ValidateInputHeader(const rdma_dada::pipeline::Metadata& header,
+                         const WorkerRuntime& runtime,
+                         std::string* error) {
+    struct TextExpectation { const char* name; const char* value; };
+    const TextExpectation text_fields[] = {
+        {"DATA_STAGE", "UNPACKED"}, {"ORDER", "ATFP"},
+        {"LAYOUT_SCOPE", "BLOCK"}, {"SAMPLE_FORMAT", "CI8"},
+        {"SAMPLE_ENCODING", "TWOS_COMPLEMENT"},
+        {"COMPONENT_ORDER", "IQ"}, {"ENDIAN", "LITTLE"}
+    };
+    for (std::size_t index = 0;
+         index < sizeof(text_fields) / sizeof(text_fields[0]); ++index) {
+        std::string actual;
+        if (!header.GetString(text_fields[index].name, &actual) ||
+            actual != text_fields[index].value) {
+            *error = std::string("input DADA header ") +
+                text_fields[index].name + " must be " +
+                text_fields[index].value;
+            return false;
+        }
+    }
+    std::string memory;
+    if (!header.GetString("MEMORY", &memory) ||
+        (memory != "HOST" && memory != "PINNED_HOST")) {
+        *error = "input DADA header MEMORY must be HOST or PINNED_HOST";
+        return false;
+    }
+    struct UintExpectation { const char* name; std::uint64_t value; };
+    const UintExpectation uint_fields[] = {
+        {"COMPONENT_NBIT", 8U}, {"SAMPLE_NBIT", 16U},
+        {"NCHAN", runtime.plan.source.nchan},
+        {"NPOL", runtime.plan.source.npol}, {"NANT", runtime.plan.nant},
+        {"BLOCK_NTIME", runtime.plan.samples_per_block},
+        {"RESOLUTION", runtime.geometry.input_frame_bytes},
+        {"RECORD_BYTES", runtime.plan.compute_block_bytes},
+        {"OUTPUT_BLOCK_BYTES", runtime.plan.compute_block_bytes},
+        {"BLOCK_BYTES", runtime.plan.compute_block_bytes},
+        {"RING_BYTES", runtime.plan.compute_ring_bytes}
+    };
+    for (std::size_t index = 0;
+         index < sizeof(uint_fields) / sizeof(uint_fields[0]); ++index) {
+        std::uint64_t actual = 0U;
+        if (!header.GetUint64(uint_fields[index].name, &actual) ||
+            actual != uint_fields[index].value) {
+            std::ostringstream message;
+            message << "input DADA header " << uint_fields[index].name
+                    << " must be " << uint_fields[index].value;
+            *error = message.str();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateExactMetadataContract(
+    const rdma_dada::pipeline::Metadata& actual,
+    const rdma_dada::pipeline::Metadata& expected,
+    const char* contract_name,
+    std::string* error) {
+    const std::map<std::string, std::string>& actual_fields = actual.Fields();
+    const std::map<std::string, std::string>& expected_fields =
+        expected.Fields();
+    if (actual_fields == expected_fields) return true;
+    for (std::map<std::string, std::string>::const_iterator field =
+             expected_fields.begin(); field != expected_fields.end(); ++field) {
+        const std::map<std::string, std::string>::const_iterator found =
+            actual_fields.find(field->first);
+        if (found == actual_fields.end() || found->second != field->second) {
+            std::ostringstream message;
+            message << contract_name << " header field " << field->first
+                    << " must be " << field->second << "; got ";
+            if (found == actual_fields.end()) message << "<missing>";
+            else message << found->second;
+            *error = message.str();
+            return false;
+        }
+    }
+    for (std::map<std::string, std::string>::const_iterator field =
+             actual_fields.begin(); field != actual_fields.end(); ++field) {
+        if (expected_fields.count(field->first) == 0U) {
+            *error = std::string(contract_name) +
+                " header has unexpected field " + field->first;
+            return false;
+        }
+    }
+    *error = std::string(contract_name) + " header metadata mismatch";
+    return false;
+}
+
+bool ValidateConnectedRings(WorkerRuntime* runtime, dada_hdu_t* input_hdu) {
+    const std::uint64_t input_block_bytes = ipcbuf_get_bufsz(
+        reinterpret_cast<ipcbuf_t*>(input_hdu->data_block));
+    const std::uint64_t output_block_bytes = ipcbuf_get_bufsz(
+        reinterpret_cast<ipcbuf_t*>(runtime->output_hdu->data_block));
+    const std::uint64_t input_blocks = ipcbuf_get_nbufs(
+        reinterpret_cast<ipcbuf_t*>(input_hdu->data_block));
+    const std::uint64_t output_blocks = ipcbuf_get_nbufs(
+        reinterpret_cast<ipcbuf_t*>(runtime->output_hdu->data_block));
+    const std::uint64_t input_header_bytes =
+        ipcbuf_get_bufsz(input_hdu->header_block);
+    const std::uint64_t output_header_bytes =
+        ipcbuf_get_bufsz(runtime->output_hdu->header_block);
+    if (input_block_bytes != runtime->plan.compute_block_bytes ||
+        input_blocks != runtime->plan.source.compute_ring_blocks ||
+        input_header_bytes != 4096U) {
+        SetFailure(runtime,
+                   "connected input ring geometry does not match resolved "
+                   "compute ring");
+        return false;
+    }
+    if (output_block_bytes != runtime->plan.output_block_bytes ||
+        output_blocks != runtime->plan.source.compute_ring_blocks ||
+        output_header_bytes != 4096U) {
+        SetFailure(runtime,
+                   "connected output ring geometry does not match resolved "
+                   "output ring");
+        return false;
+    }
+    return true;
+}
+
 #if defined(RDMA_DADA_HAVE_CUDA)
 bool CheckCuda(WorkerRuntime* runtime, cudaError_t result,
                const std::string& operation) {
@@ -96,21 +229,25 @@ void ReleaseExecutionBuffers(WorkerRuntime* runtime) {
 #if defined(RDMA_DADA_HAVE_CUDA)
     if (runtime->stream) cudaStreamSynchronize(runtime->stream);
     if (runtime->device_input) cudaFree(runtime->device_input);
+    if (runtime->device_converted) cudaFree(runtime->device_converted);
     if (runtime->device_scratch) cudaFree(runtime->device_scratch);
     if (runtime->device_output) cudaFree(runtime->device_output);
     runtime->device_input = NULL;
+    runtime->device_converted = NULL;
     runtime->device_scratch = NULL;
     runtime->device_output = NULL;
     if (runtime->stream) cudaStreamDestroy(runtime->stream);
     runtime->stream = NULL;
 #endif
     runtime->host_scratch.clear();
+    runtime->host_converted.clear();
 }
 
 void AbortOpenTransfer(WorkerRuntime* runtime) {
     if (!runtime) return;
     runtime->h2d.Finish();
     runtime->d2h.Finish();
+    runtime->conversion.Finish();
     runtime->chain.Finish();
     ReleaseExecutionBuffers(runtime);
     if (runtime->output_locked) {
@@ -124,12 +261,15 @@ void AbortOpenTransfer(WorkerRuntime* runtime) {
 
 bool PrepareExecutionBuffers(WorkerRuntime* runtime) {
     if (!FitsSizeT(runtime->input_block_capacity) ||
+        !FitsSizeT(runtime->converted_block_capacity) ||
         !FitsSizeT(runtime->scratch_block_capacity) ||
         !FitsSizeT(runtime->output_block_capacity)) {
         SetFailure(runtime, "ring block capacity exceeds addressable size_t");
         return false;
     }
     if (runtime->config.execution_backend == "CPU_REFERENCE") {
+        runtime->host_converted.resize(
+            static_cast<std::size_t>(runtime->converted_block_capacity));
         if (runtime->scratch_block_capacity > 0U) {
             runtime->host_scratch.resize(
                 static_cast<std::size_t>(
@@ -154,6 +294,14 @@ bool PrepareExecutionBuffers(WorkerRuntime* runtime) {
                               static_cast<std::size_t>(
                                   runtime->input_block_capacity)),
                    "cudaMalloc input block")) {
+        return false;
+    }
+    if (!CheckCuda(runtime,
+                   cudaMalloc(
+                       reinterpret_cast<void**>(&runtime->device_converted),
+                       static_cast<std::size_t>(
+                           runtime->converted_block_capacity)),
+                   "cudaMalloc converted TFPA block")) {
         return false;
     }
     if (runtime->scratch_block_capacity > 0U &&
@@ -198,31 +346,48 @@ int OpenTransfer(dada_client_t* client) {
             SetFailure(runtime, "cannot parse input DADA header: " + error);
             return -1;
         }
-
-        rdma_dada::pipeline::Metadata output_header;
-        const rdma_dada::pipeline::StageStatus configure_status =
-            runtime->chain.Configure(
-                input_header, runtime->config, &output_header);
-        if (!configure_status.ok()) {
+        std::string input_config_id;
+        std::string input_geometry_id;
+        if (!input_header.GetString("CONFIG_ID", &input_config_id) ||
+            input_config_id != runtime->plan.config_id ||
+            !input_header.GetString("GEOMETRY_ID", &input_geometry_id) ||
+            input_geometry_id != runtime->plan.geometry_id) {
             SetFailure(runtime,
-                       "cannot configure module chain: " +
-                           configure_status.message());
-            AbortOpenTransfer(runtime);
+                       "input DADA header CONFIG_ID/GEOMETRY_ID does not "
+                       "match resolved observation plan");
+            return -1;
+        }
+        if (!ValidateInputHeader(input_header, *runtime, &error)) {
+            SetFailure(runtime, error);
+            return -1;
+        }
+        if (!ValidateExactMetadataContract(
+                input_header, runtime->expected_input_header,
+                "input", &error)) {
+            SetFailure(runtime, error);
             return -1;
         }
 
+        rdma_dada::pipeline::StageParameters algorithm_parameters;
+        algorithm_parameters.SetString(
+            "EXECUTION_BACKEND", runtime->config.execution_backend);
+        algorithm_parameters.SetDouble(
+            "CONVERSION_SCALE", runtime->config.conversion_scale);
+        rdma_dada::pipeline::StageParameters transfer_parameters;
+        rdma_dada::pipeline::Metadata conversion_input_header = input_header;
         if (runtime->config.execution_backend == "CUDA") {
-            rdma_dada::pipeline::StageParameters transfer_parameters;
             transfer_parameters.SetString("EXECUTION_BACKEND", "CUDA");
             transfer_parameters.SetUint64(
                 "CUDA_DEVICE",
                 static_cast<std::uint64_t>(runtime->config.cuda_device));
+            algorithm_parameters.SetUint64(
+                "CUDA_DEVICE",
+                static_cast<std::uint64_t>(runtime->config.cuda_device));
 
-            rdma_dada::pipeline::Metadata device_input_header;
             rdma_dada::pipeline::StageStatus transfer_status =
                 runtime->h2d.ConfigureHeader(
                     input_header, transfer_parameters,
-                    &device_input_header);
+                    &conversion_input_header);
             if (!transfer_status.ok()) {
                 SetFailure(runtime,
                            "cannot configure H2D module: " +
@@ -230,32 +395,6 @@ int OpenTransfer(dada_client_t* client) {
                 AbortOpenTransfer(runtime);
                 return -1;
             }
-            if (device_input_header.Fields() !=
-                runtime->chain.plan().input_header.Fields()) {
-                SetFailure(runtime,
-                           "H2D output header does not match module-chain "
-                           "input header");
-                AbortOpenTransfer(runtime);
-                return -1;
-            }
-
-            rdma_dada::pipeline::Metadata device_output_header =
-                output_header;
-            device_output_header.SetString("MEMORY", "CUDA_DEVICE");
-            device_output_header.SetUint64(
-                "CUDA_DEVICE",
-                static_cast<std::uint64_t>(runtime->config.cuda_device));
-            transfer_parameters.SetString("OUTPUT_MEMORY", "HOST");
-            transfer_status = runtime->d2h.ConfigureHeader(
-                device_output_header, transfer_parameters, &output_header);
-            if (!transfer_status.ok()) {
-                SetFailure(runtime,
-                           "cannot configure D2H module: " +
-                               transfer_status.message());
-                AbortOpenTransfer(runtime);
-                return -1;
-            }
-
             std::string input_memory;
             input_header.GetString("MEMORY", &input_memory);
             runtime->input_ring_location =
@@ -267,8 +406,70 @@ int OpenTransfer(dada_client_t* client) {
                 rdma_dada::pipeline::MemoryLocation::kHost;
         }
 
+        rdma_dada::pipeline::Metadata converted_header;
+        rdma_dada::pipeline::StageStatus configure_status =
+            runtime->conversion.ConfigureHeader(
+                conversion_input_header, algorithm_parameters,
+                &converted_header);
+        if (!configure_status.ok()) {
+            SetFailure(runtime,
+                       "cannot configure complex conversion: " +
+                           configure_status.message());
+            AbortOpenTransfer(runtime);
+            return -1;
+        }
+        if (runtime->config.execution_backend == "CPU_REFERENCE") {
+            converted_header.SetString("MEMORY", "HOST");
+            converted_header.Erase("CUDA_DEVICE");
+        }
+
+        rdma_dada::pipeline::Metadata output_header;
+        configure_status = runtime->chain.Configure(
+            converted_header, runtime->config, &output_header);
+        if (!configure_status.ok()) {
+            SetFailure(runtime,
+                       "cannot configure module chain: " +
+                           configure_status.message());
+            AbortOpenTransfer(runtime);
+            return -1;
+        }
+        std::string pipeline_modules;
+        if (output_header.GetString("PIPELINE_MODULES", &pipeline_modules)) {
+            output_header.SetString(
+                "PIPELINE_MODULES", "complex_convert," + pipeline_modules);
+        }
+
+        if (runtime->config.execution_backend == "CUDA") {
+            rdma_dada::pipeline::Metadata device_output_header =
+                output_header;
+            device_output_header.SetString("MEMORY", "CUDA_DEVICE");
+            device_output_header.SetUint64(
+                "CUDA_DEVICE",
+                static_cast<std::uint64_t>(runtime->config.cuda_device));
+            transfer_parameters.SetString("OUTPUT_MEMORY", "HOST");
+            const rdma_dada::pipeline::StageStatus transfer_status =
+                runtime->d2h.ConfigureHeader(
+                    device_output_header, transfer_parameters, &output_header);
+            if (!transfer_status.ok()) {
+                SetFailure(runtime,
+                           "cannot configure D2H module: " +
+                               transfer_status.message());
+                AbortOpenTransfer(runtime);
+                return -1;
+            }
+        }
+        output_header.SetUint64(
+            "INPUT_BLOCK_BYTES", runtime->geometry.input_block_bytes);
+        output_header.SetUint64(
+            "CONVERTED_BLOCK_BYTES",
+            runtime->geometry.converted_block_bytes);
+        output_header.SetDouble(
+            "CONVERSION_SCALE", runtime->config.conversion_scale);
+
         runtime->input_block_capacity = ipcbuf_get_bufsz(
             reinterpret_cast<ipcbuf_t*>(client->data_block));
+        runtime->converted_block_capacity =
+            runtime->geometry.converted_block_bytes;
         runtime->output_block_capacity = ipcbuf_get_bufsz(
             reinterpret_cast<ipcbuf_t*>(runtime->output_hdu->data_block));
         if (runtime->input_block_capacity !=
@@ -285,7 +486,7 @@ int OpenTransfer(dada_client_t* client) {
         std::uint64_t expected_output_capacity = 0;
         rdma_dada::pipeline::StageStatus plan_status =
             runtime->chain.PlanBlock(
-                runtime->input_block_capacity,
+                runtime->converted_block_capacity,
                 &runtime->scratch_block_capacity,
                 &expected_output_capacity);
         if (!plan_status.ok()) {
@@ -302,6 +503,16 @@ int OpenTransfer(dada_client_t* client) {
                     << runtime->input_block_capacity << " bytes; got "
                     << runtime->output_block_capacity;
             SetFailure(runtime, message.str());
+            AbortOpenTransfer(runtime);
+            return -1;
+        }
+        if (runtime->output_block_capacity !=
+                runtime->plan.output_block_bytes ||
+            runtime->plan.output_ring_bytes !=
+                runtime->plan.output_block_bytes *
+                    runtime->plan.source.compute_ring_blocks) {
+            SetFailure(runtime,
+                       "output ring capacity does not match resolved plan");
             AbortOpenTransfer(runtime);
             return -1;
         }
@@ -323,10 +534,29 @@ int OpenTransfer(dada_client_t* client) {
                 return -1;
             }
             if (transfer_size != 0) {
+                if (transfer_size % runtime->geometry.input_frame_bytes != 0) {
+                    SetFailure(runtime,
+                               "input TRANSFER_SIZE is not aligned to an "
+                               "ATFP CI8 time frame");
+                    AbortOpenTransfer(runtime);
+                    return -1;
+                }
+                const std::uint64_t transfer_ntime =
+                    transfer_size / runtime->geometry.input_frame_bytes;
+                if (transfer_ntime >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        runtime->geometry.converted_frame_bytes) {
+                    SetFailure(runtime,
+                               "converted TRANSFER_SIZE overflows uint64");
+                    AbortOpenTransfer(runtime);
+                    return -1;
+                }
+                const std::uint64_t converted_transfer_size =
+                    transfer_ntime * runtime->geometry.converted_frame_bytes;
                 std::uint64_t transfer_scratch_bytes = 0;
                 std::uint64_t transfer_output_bytes = 0;
                 plan_status = runtime->chain.PlanBlock(
-                    transfer_size, &transfer_scratch_bytes,
+                    converted_transfer_size, &transfer_scratch_bytes,
                     &transfer_output_bytes);
                 if (!plan_status.ok()) {
                     SetFailure(runtime,
@@ -342,6 +572,30 @@ int OpenTransfer(dada_client_t* client) {
             "INPUT_BLOCK_BYTES", runtime->input_block_capacity);
         output_header.SetUint64(
             "OUTPUT_BLOCK_BYTES", runtime->output_block_capacity);
+        output_header.SetUint64("BLOCK_BYTES", runtime->output_block_capacity);
+        output_header.SetUint64("RING_BYTES", runtime->plan.output_ring_bytes);
+        if (!ValidateExactMetadataContract(
+                output_header, runtime->expected_output_header,
+                "output", &error)) {
+            SetFailure(runtime, error);
+            AbortOpenTransfer(runtime);
+            return -1;
+        }
+        std::string output_stage;
+        std::string output_order;
+        std::string output_format;
+        if (!output_header.GetString("DATA_STAGE", &output_stage) ||
+            output_stage != runtime->plan.output_data_stage ||
+            !output_header.GetString("ORDER", &output_order) ||
+            output_order != runtime->plan.output_order ||
+            !output_header.GetString("SAMPLE_FORMAT", &output_format) ||
+            output_format != runtime->plan.output_sample_format) {
+            SetFailure(runtime,
+                       "computed output DADA header does not match resolved "
+                       "output contract");
+            AbortOpenTransfer(runtime);
+            return -1;
+        }
         const std::uint64_t output_header_capacity = ipcbuf_get_bufsz(
             runtime->output_hdu->header_block);
         if (!FitsSizeT(output_header_capacity)) {
@@ -421,8 +675,24 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
 
     std::uint64_t scratch_bytes = 0;
     std::uint64_t output_bytes = 0;
+    if (data_size == 0 ||
+        data_size % runtime->geometry.input_frame_bytes != 0) {
+        SetFailure(runtime,
+                   "input block does not contain complete ATFP CI8 frames");
+        return -1;
+    }
+    const std::uint64_t actual_ntime =
+        data_size / runtime->geometry.input_frame_bytes;
+    if (actual_ntime >
+        std::numeric_limits<std::uint64_t>::max() /
+            runtime->geometry.converted_frame_bytes) {
+        SetFailure(runtime, "converted block byte count overflows uint64");
+        return -1;
+    }
+    const std::uint64_t converted_bytes =
+        actual_ntime * runtime->geometry.converted_frame_bytes;
     rdma_dada::pipeline::StageStatus status = runtime->chain.PlanBlock(
-        data_size, &scratch_bytes, &output_bytes);
+        converted_bytes, &scratch_bytes, &output_bytes);
     if (!status.ok() || output_bytes > runtime->output_block_capacity) {
         SetFailure(runtime,
                    status.ok() ? "planned output exceeds output ring block" :
@@ -443,8 +713,19 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         rdma_dada::pipeline::ExecutionBackend::kHost, -1, NULL
     };
     if (runtime->config.execution_backend == "CPU_REFERENCE") {
-        const rdma_dada::pipeline::InputBlock input = {
+        const rdma_dada::pipeline::InputBlock integer_input = {
             static_cast<const std::uint8_t*>(data), data_size, block_id,
+            rdma_dada::pipeline::MemoryLocation::kHost
+        };
+        rdma_dada::pipeline::OutputBlock converted_output = {
+            &runtime->host_converted[0], runtime->host_converted.size(),
+            0, 0, rdma_dada::pipeline::MemoryLocation::kHost
+        };
+        status = runtime->conversion.ProcessBlock(
+            integer_input, &converted_output, host_context);
+        const rdma_dada::pipeline::InputBlock input = {
+            converted_output.data, converted_output.size,
+            converted_output.sequence,
             rdma_dada::pipeline::MemoryLocation::kHost
         };
         rdma_dada::pipeline::OutputBlock output = {
@@ -454,9 +735,11 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         };
         std::uint8_t* scratch = runtime->host_scratch.empty() ?
             NULL : &runtime->host_scratch[0];
-        status = runtime->chain.ProcessBlock(
-            input, &output, scratch, runtime->host_scratch.size(),
-            host_context);
+        if (status.ok()) {
+            status = runtime->chain.ProcessBlock(
+                input, &output, scratch, runtime->host_scratch.size(),
+                host_context);
+        }
         if (status.ok() && output.size != output_bytes) {
             status = rdma_dada::pipeline::StageStatus::Error(
                 "module chain produced an unexpected output byte count");
@@ -479,8 +762,20 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         status = runtime->h2d.ProcessBlock(
             host_input, &device_input, cuda_context);
         if (status.ok()) {
-            const rdma_dada::pipeline::InputBlock input = {
+            const rdma_dada::pipeline::InputBlock integer_input = {
                 device_input.data, device_input.size, device_input.sequence,
+                rdma_dada::pipeline::MemoryLocation::kCudaDevice
+            };
+            rdma_dada::pipeline::OutputBlock converted_output = {
+                runtime->device_converted,
+                runtime->converted_block_capacity, 0, 0,
+                rdma_dada::pipeline::MemoryLocation::kCudaDevice
+            };
+            status = runtime->conversion.ProcessBlock(
+                integer_input, &converted_output, cuda_context);
+            const rdma_dada::pipeline::InputBlock input = {
+                converted_output.data, converted_output.size,
+                converted_output.sequence,
                 rdma_dada::pipeline::MemoryLocation::kCudaDevice
             };
             rdma_dada::pipeline::OutputBlock output = {
@@ -488,9 +783,11 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                 0, block_id,
                 rdma_dada::pipeline::MemoryLocation::kCudaDevice
             };
-            status = runtime->chain.ProcessBlock(
-                input, &output, runtime->device_scratch,
-                scratch_bytes, cuda_context);
+            if (status.ok()) {
+                status = runtime->chain.ProcessBlock(
+                    input, &output, runtime->device_scratch,
+                    scratch_bytes, cuda_context);
+            }
             if (status.ok() && output.size != output_bytes) {
                 status = rdma_dada::pipeline::StageStatus::Error(
                     "module chain produced an unexpected output byte count");
@@ -568,6 +865,14 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
                    "module chain finish failed: " + finish_status.message());
         cleanup_failed = true;
     }
+    const rdma_dada::pipeline::StageStatus conversion_finish_status =
+        runtime->conversion.Finish();
+    if (!conversion_finish_status.ok()) {
+        SetFailure(runtime,
+                   "complex conversion finish failed: " +
+                       conversion_finish_status.message());
+        cleanup_failed = true;
+    }
     const rdma_dada::pipeline::StageStatus h2d_finish_status =
         runtime->h2d.Finish();
     if (!h2d_finish_status.ok()) {
@@ -597,7 +902,7 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
 }
 
 void PrintUsage(const char* program) {
-    std::cerr << "Usage: " << program << " CONFIG.json\n";
+    std::cerr << "Usage: " << program << " RESOLVED_OBSERVATION.json\n";
 }
 
 }  // namespace
@@ -610,13 +915,23 @@ int main(int argc, char** argv) {
 
     WorkerRuntime runtime;
     std::string config_error;
-    if (!rdma_dada::pipeline::LoadWorkerConfig(
-            argv[1], &runtime.config, &config_error) ||
-        !rdma_dada::pipeline::ComputeWorkerBlockGeometry(
-            runtime.config, &runtime.geometry, &config_error)) {
+    if (!rdma_dada::LoadResolvedObservationPlan(
+            argv[1], &runtime.plan, &config_error) ||
+        !rdma_dada::pipeline::BuildWorkerConfigFromResolvedPlan(
+            runtime.plan, &runtime.config, &runtime.geometry,
+            &config_error)) {
         std::cerr << "pipeline_worker: " << config_error << '\n';
         return EXIT_FAILURE;
     }
+    rdma_dada::ObservationArtifacts expected_artifacts;
+    if (!rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+            runtime.plan, &expected_artifacts, &config_error)) {
+        std::cerr << "pipeline_worker: cannot build compiled header contract: "
+                  << config_error << '\n';
+        return EXIT_FAILURE;
+    }
+    runtime.expected_input_header = expected_artifacts.unpacked_header;
+    runtime.expected_output_header = expected_artifacts.output_header;
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
@@ -651,6 +966,9 @@ int main(int argc, char** argv) {
             SetFailure(&runtime, "cannot connect output DADA ring");
         } else if (!runtime.failed) {
             output_connected = true;
+        }
+        if (!runtime.failed) {
+            (void)ValidateConnectedRings(&runtime, input_hdu);
         }
         if (!runtime.failed && dada_hdu_lock_read(input_hdu) < 0) {
             SetFailure(&runtime, "cannot lock input DADA ring for reading");

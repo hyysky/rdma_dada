@@ -49,7 +49,7 @@ bool RangesOverlap(const std::uint8_t* input, std::uint64_t input_bytes,
 
 pipeline::StageStatus ScaleByteField(
     const pipeline::Metadata& input, const std::string& name,
-    std::uint64_t input_frame_bytes, std::uint64_t output_frame_bytes,
+    std::uint64_t alignment_bytes, std::uint64_t input_sample_bytes,
     bool required, pipeline::Metadata* output) {
     if (!input.Has(name)) {
         return required ? MissingOrInvalid(name) : pipeline::StageStatus::Ok();
@@ -57,13 +57,14 @@ pipeline::StageStatus ScaleByteField(
     std::uint64_t input_value = 0;
     if (!input.GetUint64(name, &input_value) ||
         (required && input_value == 0) ||
-        input_value % input_frame_bytes != 0) {
+        input_value % alignment_bytes != 0 ||
+        input_value % input_sample_bytes != 0) {
         return pipeline::StageStatus::Error(
-            name + " must be aligned to a complete integer TFPA frame");
+            name + " is not aligned to the ATFP block geometry");
     }
     std::uint64_t output_value = 0;
-    if (!CheckedMultiply(input_value / input_frame_bytes,
-                         output_frame_bytes, &output_value)) {
+    if (!CheckedMultiply(input_value / input_sample_bytes,
+                         sizeof(pipeline::Complex32), &output_value)) {
         return pipeline::StageStatus::Error(
             name + " output scaling overflows");
     }
@@ -77,8 +78,9 @@ class ComplexConvertModule::Impl {
 public:
     Impl()
         : configured(false), scale(0.0f), component_bits(0),
-          input_sample_bytes(0), input_frame_bytes(0),
-          output_frame_bytes(0),
+          input_sample_bytes(0), nant(0), elements_per_antenna(0),
+          input_frame_bytes(0), output_frame_bytes(0),
+          input_block_bytes(0), output_block_bytes(0),
           execution_backend(pipeline::ExecutionBackend::kHost),
           cuda_device(-1) {}
 
@@ -86,8 +88,12 @@ public:
     float scale;
     std::uint64_t component_bits;
     std::uint64_t input_sample_bytes;
+    std::uint64_t nant;
+    std::uint64_t elements_per_antenna;
     std::uint64_t input_frame_bytes;
     std::uint64_t output_frame_bytes;
+    std::uint64_t input_block_bytes;
+    std::uint64_t output_block_bytes;
     pipeline::ExecutionBackend execution_backend;
     int cuda_device;
     std::unique_ptr<CudaComplexConvertExecutor> cuda_executor;
@@ -114,9 +120,13 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
         return pipeline::StageStatus::Error(
             "complex conversion input DATA_STAGE must be UNPACKED");
     }
-    if (!input_header.GetString("ORDER", &text) || text != "TFPA") {
+    if (!input_header.GetString("ORDER", &text) || text != "ATFP") {
         return pipeline::StageStatus::Error(
-            "complex conversion input ORDER must be TFPA");
+            "complex conversion input ORDER must be ATFP");
+    }
+    if (!input_header.GetString("LAYOUT_SCOPE", &text) || text != "BLOCK") {
+        return pipeline::StageStatus::Error(
+            "complex conversion input LAYOUT_SCOPE must be BLOCK");
     }
     std::string source_sample_format;
     if (!input_header.GetString("SAMPLE_FORMAT", &source_sample_format) ||
@@ -126,9 +136,15 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
     }
     impl_->component_bits = source_sample_format == "CI8" ? 8 : 16;
     impl_->input_sample_bytes = impl_->component_bits / 4;
-    if (!input_header.GetString("COMPONENT_ORDER", &text) || text != "RI") {
+    if (!input_header.GetString("SAMPLE_ENCODING", &text) ||
+        text != "TWOS_COMPLEMENT") {
         return pipeline::StageStatus::Error(
-            "complex conversion input COMPONENT_ORDER must be RI");
+            "complex conversion input SAMPLE_ENCODING must be "
+            "TWOS_COMPLEMENT");
+    }
+    if (!input_header.GetString("COMPONENT_ORDER", &text) || text != "IQ") {
+        return pipeline::StageStatus::Error(
+            "complex conversion input COMPONENT_ORDER must be IQ");
     }
     if (!input_header.GetString("ENDIAN", &text) || text != "LITTLE") {
         return pipeline::StageStatus::Error(
@@ -140,22 +156,31 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
         return pipeline::StageStatus::Error(
             "COMPONENT_NBIT does not match SAMPLE_FORMAT");
     }
-    if (!input_header.GetUint64("COMPONENT_SIGNED", &number) || number != 1) {
-        return pipeline::StageStatus::Error(
-            "complex conversion requires COMPONENT_SIGNED=1");
-    }
     if (!input_header.GetUint64("SAMPLE_NBIT", &number) ||
         number != 2 * impl_->component_bits) {
         return pipeline::StageStatus::Error(
             "SAMPLE_NBIT does not match SAMPLE_FORMAT");
     }
-    std::uint64_t element_count = 1;
-    const char* const axes[] = {"NCHAN", "NPOL", "NANT"};
-    for (std::size_t i = 0; i < sizeof(axes) / sizeof(axes[0]); ++i) {
-        if (!input_header.GetUint64(axes[i], &number) || number == 0 ||
-            !CheckedMultiply(element_count, number, &element_count)) {
-            return MissingOrInvalid(axes[i]);
-        }
+    std::uint64_t nchan = 0;
+    std::uint64_t npol = 0;
+    if (!input_header.GetUint64("NCHAN", &nchan) || nchan == 0) {
+        return MissingOrInvalid("NCHAN");
+    }
+    if (!input_header.GetUint64("NPOL", &npol) || npol == 0) {
+        return MissingOrInvalid("NPOL");
+    }
+    if (!input_header.GetUint64("NANT", &impl_->nant) || impl_->nant == 0) {
+        return MissingOrInvalid("NANT");
+    }
+    if (!CheckedMultiply(nchan, npol, &impl_->elements_per_antenna)) {
+        return pipeline::StageStatus::Error(
+            "complex conversion per-antenna geometry overflows");
+    }
+    std::uint64_t element_count = 0;
+    if (!CheckedMultiply(impl_->nant, impl_->elements_per_antenna,
+                         &element_count)) {
+        return pipeline::StageStatus::Error(
+            "complex conversion frame geometry overflows");
     }
     if (!CheckedMultiply(element_count, impl_->input_sample_bytes,
                          &impl_->input_frame_bytes) ||
@@ -164,15 +189,29 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
         return pipeline::StageStatus::Error(
             "complex conversion frame geometry overflows");
     }
-    if (!input_header.GetUint64("RECORD_BYTES", &number) ||
-        number != impl_->input_frame_bytes) {
-        return pipeline::StageStatus::Error(
-            "RECORD_BYTES must equal one complete integer TFPA frame");
-    }
     if (!input_header.GetUint64("RESOLUTION", &number) ||
         number != impl_->input_frame_bytes) {
         return pipeline::StageStatus::Error(
-            "RESOLUTION must equal one complete integer TFPA frame");
+            "RESOLUTION must equal one complete ATFP time frame");
+    }
+    std::uint64_t block_ntime = 0;
+    if (!input_header.GetUint64("BLOCK_NTIME", &block_ntime) ||
+        block_ntime == 0 ||
+        !CheckedMultiply(block_ntime, impl_->input_frame_bytes,
+                         &impl_->input_block_bytes) ||
+        !CheckedMultiply(block_ntime, impl_->output_frame_bytes,
+                         &impl_->output_block_bytes)) {
+        return MissingOrInvalid("BLOCK_NTIME");
+    }
+    if (!input_header.GetUint64("OUTPUT_BLOCK_BYTES", &number) ||
+        number != impl_->input_block_bytes) {
+        return pipeline::StageStatus::Error(
+            "OUTPUT_BLOCK_BYTES must match nominal ATFP block geometry");
+    }
+    if (!input_header.GetUint64("RECORD_BYTES", &number) ||
+        number != impl_->input_block_bytes) {
+        return pipeline::StageStatus::Error(
+            "RECORD_BYTES must equal OUTPUT_BLOCK_BYTES");
     }
 
     std::string execution_backend;
@@ -254,15 +293,22 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
 
     *output_header = input_header;
     output_header->SetString("DATA_STAGE", "CONVERTED");
+    output_header->SetString("ORDER", "TFPA");
+    output_header->SetString("SOURCE_ORDER", "ATFP");
     output_header->SetString("SAMPLE_FORMAT", "CF32");
+    output_header->SetString("COMPONENT_ORDER", "RI");
     output_header->SetString("EXECUTION_BACKEND", execution_backend);
     output_header->SetString("SOURCE_SAMPLE_FORMAT", source_sample_format);
+    output_header->SetString("SOURCE_SAMPLE_ENCODING", "TWOS_COMPLEMENT");
+    output_header->SetString("SOURCE_COMPONENT_ORDER", "IQ");
     output_header->SetUint64("SOURCE_COMPONENT_NBIT", impl_->component_bits);
-    output_header->SetUint64("SOURCE_COMPONENT_SIGNED", 1);
     output_header->Erase("COMPONENT_SIGNED");
+    output_header->Erase("SOURCE_COMPONENT_SIGNED");
+    output_header->Erase("SAMPLE_ENCODING");
     output_header->SetUint64("COMPONENT_NBIT", 32);
     output_header->SetUint64("SAMPLE_NBIT", 64);
-    output_header->SetUint64("RECORD_BYTES", impl_->output_frame_bytes);
+    output_header->SetUint64("RECORD_BYTES", impl_->output_block_bytes);
+    output_header->SetUint64("OUTPUT_BLOCK_BYTES", impl_->output_block_bytes);
     output_header->SetUint64("RESOLUTION", impl_->output_frame_bytes);
     output_header->SetDouble("CONVERSION_SCALE", scale);
     if (impl_->execution_backend == pipeline::ExecutionBackend::kCuda) {
@@ -271,17 +317,17 @@ pipeline::StageStatus ComplexConvertModule::ConfigureHeader(
     } else {
         output_header->Erase("CUDA_DEVICE");
     }
-    const char* const byte_fields[] = {
+    const char* const frame_aligned_fields[] = {
         "BYTES_PER_SECOND", "TRANSFER_SIZE", "FILE_SIZE", "OBS_OFFSET"
     };
     for (std::size_t i = 0;
-         i < sizeof(byte_fields) / sizeof(byte_fields[0]); ++i) {
+         i < sizeof(frame_aligned_fields) / sizeof(frame_aligned_fields[0]);
+         ++i) {
         const pipeline::StageStatus status = ScaleByteField(
-            input_header, byte_fields[i], impl_->input_frame_bytes,
-            impl_->output_frame_bytes, i == 0, output_header);
+            input_header, frame_aligned_fields[i], impl_->input_frame_bytes,
+            impl_->input_sample_bytes, i == 0, output_header);
         if (!status.ok()) return status;
     }
-
     impl_->configured = true;
     return pipeline::StageStatus::Ok();
 }
@@ -301,7 +347,7 @@ pipeline::StageStatus ComplexConvertModule::ProcessBlock(
     if (!input.data || input.size == 0 ||
         input.size % impl_->input_frame_bytes != 0) {
         return pipeline::StageStatus::Error(
-            "input block does not contain complete integer TFPA frames");
+            "input block does not contain complete ATFP time frames");
     }
     const std::uint64_t frame_count = input.size / impl_->input_frame_bytes;
     std::uint64_t output_bytes = 0;
@@ -320,12 +366,13 @@ pipeline::StageStatus ComplexConvertModule::ProcessBlock(
     }
 
     const std::uint64_t sample_count = input.size / impl_->input_sample_bytes;
+    const std::uint64_t q = sample_count / impl_->nant;
     if (impl_->execution_backend == pipeline::ExecutionBackend::kCuda) {
         if (context.device_id != impl_->cuda_device ||
             context.native_stream == NULL) {
             return pipeline::StageStatus::Error(
                 "CUDA execution requires the configured device and a "
-                "worker-owned stream");
+                "worker-owned non-default stream");
         }
         if (input.location != pipeline::MemoryLocation::kCudaDevice ||
             output->location != pipeline::MemoryLocation::kCudaDevice) {
@@ -338,7 +385,7 @@ pipeline::StageStatus ComplexConvertModule::ProcessBlock(
         }
         const pipeline::StageStatus cuda_status =
             impl_->cuda_executor->Process(
-                input, output, sample_count, context);
+                input, output, impl_->nant, q, context);
         if (!cuda_status.ok()) return cuda_status;
     } else {
         if (context.device_id != -1 || context.native_stream != NULL) {
@@ -361,23 +408,37 @@ pipeline::StageStatus ComplexConvertModule::ProcessBlock(
         if (impl_->component_bits == 8) {
             const std::int8_t* source =
                 reinterpret_cast<const std::int8_t*>(input.data);
-            for (std::uint64_t i = 0; i < sample_count; ++i) {
-                destination[i].real =
-                    static_cast<float>(source[2 * i]) * impl_->scale;
-                destination[i].imag =
-                    static_cast<float>(source[2 * i + 1]) * impl_->scale;
+            for (std::uint64_t a = 0; a < impl_->nant; ++a) {
+                for (std::uint64_t q_index = 0; q_index < q; ++q_index) {
+                    const std::uint64_t source_index = a * q + q_index;
+                    const std::uint64_t destination_index =
+                        q_index * impl_->nant + a;
+                    destination[destination_index].real =
+                        static_cast<float>(source[2 * source_index]) *
+                        impl_->scale;
+                    destination[destination_index].imag =
+                        static_cast<float>(source[2 * source_index + 1]) *
+                        impl_->scale;
+                }
             }
         } else {
-            for (std::uint64_t i = 0; i < sample_count; ++i) {
-                std::int16_t real = 0;
-                std::int16_t imag = 0;
-                std::memcpy(&real, input.data + 4 * i, sizeof(real));
-                std::memcpy(&imag, input.data + 4 * i + sizeof(real),
-                            sizeof(imag));
-                destination[i].real =
-                    static_cast<float>(real) * impl_->scale;
-                destination[i].imag =
-                    static_cast<float>(imag) * impl_->scale;
+            for (std::uint64_t a = 0; a < impl_->nant; ++a) {
+                for (std::uint64_t q_index = 0; q_index < q; ++q_index) {
+                    const std::uint64_t source_index = a * q + q_index;
+                    const std::uint64_t destination_index =
+                        q_index * impl_->nant + a;
+                    std::int16_t real = 0;
+                    std::int16_t imag = 0;
+                    std::memcpy(&real, input.data + 4 * source_index,
+                                sizeof(real));
+                    std::memcpy(&imag,
+                                input.data + 4 * source_index + sizeof(real),
+                                sizeof(imag));
+                    destination[destination_index].real =
+                        static_cast<float>(real) * impl_->scale;
+                    destination[destination_index].imag =
+                        static_cast<float>(imag) * impl_->scale;
+                }
             }
         }
     }

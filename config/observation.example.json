@@ -27,7 +27,8 @@
   },
   "rings": {
     "raw_key": "0x00d2",
-    "compute_key": "0x00d4"
+    "compute_key": "0x00d4",
+    "output_key": "0x00d6"
   },
   "storage": {
     "enabled": false,
@@ -44,6 +45,12 @@
     "backend": "CUDA",
     "cuda_device": 0,
     "run_once": true,
+    "conversion": {
+      "scale": "0.0078125"
+    },
+    "output": {
+      "sample_format": "AUTO"
+    },
     "modules": []
   }
 }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "rings": {
     "input_key": "dada",
     "output_key": "dadb"
@@ -13,9 +13,12 @@
     "nchan": 1,
     "nant": 4,
     "npol": 2,
-    "udp_payload_bytes": 8192,
+    "udp_payload_bytes": 2048,
     "samples_per_udp": 512,
     "udp_packets_per_antenna_per_block": 4096
+  },
+  "conversion": {
+    "scale": 0.0078125
   },
   "beamform": {
     "weights_file": "weights/beamform_weights.npy",

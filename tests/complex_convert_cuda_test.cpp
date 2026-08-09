@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -20,18 +21,208 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
-void ExpectNear(float actual, float expected, const std::string& message) {
-    if (std::fabs(actual - expected) > 1.0e-6f) {
-        std::cerr << "FAIL: " << message << ": expected " << expected
-                  << ", got " << actual << '\n';
-        ++failures;
-    }
-}
-
 bool IsHelpRequest(int argc, char** argv) {
     return argc == 2 &&
            (std::strcmp(argv[1], "-h") == 0 ||
             std::strcmp(argv[1], "--help") == 0);
+}
+
+rdma_dada::pipeline::Metadata MakeHeader(
+    const std::string& format, std::uint64_t nchan, std::uint64_t npol,
+    std::uint64_t nant, std::uint64_t nominal_t,
+    const std::string& memory, int device) {
+    const std::uint64_t component_bits = format == "CI8" ? 8 : 16;
+    const std::uint64_t sample_bytes = 2 * component_bits / 8;
+    const std::uint64_t frame_bytes = nchan * npol * nant * sample_bytes;
+    const std::uint64_t block_bytes = nominal_t * frame_bytes;
+    rdma_dada::pipeline::Metadata header;
+    header.SetString("DATA_STAGE", "UNPACKED");
+    header.SetString("ORDER", "ATFP");
+    header.SetString("LAYOUT_SCOPE", "BLOCK");
+    header.SetString("SAMPLE_FORMAT", format);
+    header.SetString("SAMPLE_ENCODING", "TWOS_COMPLEMENT");
+    header.SetString("COMPONENT_ORDER", "IQ");
+    header.SetString("ENDIAN", "LITTLE");
+    header.SetString("MEMORY", memory);
+    header.SetUint64("COMPONENT_NBIT", component_bits);
+    header.SetUint64("SAMPLE_NBIT", 2 * component_bits);
+    header.SetUint64("NCHAN", nchan);
+    header.SetUint64("NPOL", npol);
+    header.SetUint64("NANT", nant);
+    header.SetUint64("BLOCK_NTIME", nominal_t);
+    header.SetUint64("RESOLUTION", frame_bytes);
+    header.SetUint64("RECORD_BYTES", block_bytes);
+    header.SetUint64("OUTPUT_BLOCK_BYTES", block_bytes);
+    header.SetUint64("BYTES_PER_SECOND", 10 * frame_bytes);
+    header.SetUint64("TRANSFER_SIZE", block_bytes);
+    if (memory == "CUDA_DEVICE") {
+        header.SetUint64("CUDA_DEVICE", static_cast<std::uint64_t>(device));
+    }
+    return header;
+}
+
+rdma_dada::pipeline::StageParameters Parameters(
+    const std::string& backend, double scale, int device) {
+    rdma_dada::pipeline::StageParameters parameters;
+    parameters.SetString("EXECUTION_BACKEND", backend);
+    parameters.SetDouble("CONVERSION_SCALE", scale);
+    if (backend == "CUDA") {
+        parameters.SetUint64("CUDA_DEVICE", static_cast<std::uint64_t>(device));
+    }
+    return parameters;
+}
+
+std::vector<std::uint8_t> MakeInput(const std::string& format,
+                                    std::uint64_t sample_count) {
+    const std::uint64_t sample_bytes = format == "CI8" ? 2 : 4;
+    std::vector<std::uint8_t> bytes(sample_count * sample_bytes, 0);
+    if (format == "CI8") {
+        std::int8_t* values = reinterpret_cast<std::int8_t*>(&bytes[0]);
+        for (std::uint64_t i = 0; i < sample_count; ++i) {
+            values[2 * i] = static_cast<std::int8_t>(
+                static_cast<std::int64_t>((37 * i + 11) % 251) - 125);
+            values[2 * i + 1] = static_cast<std::int8_t>(
+                static_cast<std::int64_t>((53 * i + 7) % 253) - 126);
+        }
+        values[0] = -128;
+        values[1] = 127;
+    } else {
+        for (std::uint64_t i = 0; i < sample_count; ++i) {
+            const std::int16_t real = static_cast<std::int16_t>(
+                static_cast<std::int64_t>((7919 * i + 101) % 65521) -
+                32760);
+            const std::int16_t imag = static_cast<std::int16_t>(
+                static_cast<std::int64_t>((3571 * i + 307) % 65519) -
+                32759);
+            std::memcpy(&bytes[4 * i], &real, sizeof(real));
+            std::memcpy(&bytes[4 * i + 2], &imag, sizeof(imag));
+        }
+        const std::int16_t minimum = -32768;
+        const std::int16_t maximum = 32767;
+        std::memcpy(&bytes[0], &minimum, sizeof(minimum));
+        std::memcpy(&bytes[2], &maximum, sizeof(maximum));
+    }
+    return bytes;
+}
+
+void RunCase(const std::string& format, std::uint64_t nchan,
+             std::uint64_t npol, std::uint64_t nant,
+             std::uint64_t actual_t, std::uint64_t nominal_t,
+             double scale, std::uint64_t sequence, bool check_bad_context) {
+    const std::uint64_t q = actual_t * nchan * npol;
+    const std::uint64_t sample_count = nant * q;
+    std::vector<std::uint8_t> host_input = MakeInput(format, sample_count);
+    std::vector<rdma_dada::pipeline::Complex32> reference(sample_count);
+    std::vector<rdma_dada::pipeline::Complex32> result(sample_count);
+
+    rdma_dada::modules::complex_convert::ComplexConvertModule cpu_module;
+    rdma_dada::pipeline::Metadata cpu_output_header;
+    rdma_dada::pipeline::StageStatus status = cpu_module.ConfigureHeader(
+        MakeHeader(format, nchan, npol, nant, nominal_t, "HOST", 0),
+        Parameters("CPU_REFERENCE", scale, 0), &cpu_output_header);
+    Expect(status.ok(), format + " CPU oracle configures");
+    if (!status.ok()) return;
+    const rdma_dada::pipeline::InputBlock cpu_input = {
+        &host_input[0], static_cast<std::uint64_t>(host_input.size()), sequence,
+        rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    rdma_dada::pipeline::OutputBlock cpu_output = {
+        reinterpret_cast<std::uint8_t*>(&reference[0]),
+        static_cast<std::uint64_t>(reference.size() * sizeof(reference[0])),
+        0, 0, rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    const rdma_dada::pipeline::BlockExecutionContext cpu_context = {
+        rdma_dada::pipeline::ExecutionBackend::kHost, -1, NULL
+    };
+    status = cpu_module.ProcessBlock(cpu_input, &cpu_output, cpu_context);
+    Expect(status.ok(), format + " CPU oracle executes");
+    if (!status.ok()) return;
+
+    rdma_dada::modules::complex_convert::ComplexConvertModule cuda_module;
+    rdma_dada::pipeline::Metadata cuda_output_header;
+    status = cuda_module.ConfigureHeader(
+        MakeHeader(format, nchan, npol, nant, nominal_t, "CUDA_DEVICE", 0),
+        Parameters("CUDA", scale, 0), &cuda_output_header);
+    Expect(status.ok(), format + " CUDA transpose configures");
+    if (!status.ok()) {
+        std::cerr << status.message() << '\n';
+        return;
+    }
+
+    std::string text;
+    Expect(cuda_output_header.GetString("ORDER", &text) && text == "TFPA",
+           format + " CUDA header publishes TFPA");
+    Expect(cuda_output_header.GetString("SOURCE_ORDER", &text) &&
+               text == "ATFP",
+           format + " CUDA header records ATFP source");
+
+    std::uint8_t* device_input = NULL;
+    std::uint8_t* device_output = NULL;
+    cudaStream_t stream = NULL;
+    Expect(cudaMalloc(reinterpret_cast<void**>(&device_input),
+                      host_input.size()) == cudaSuccess,
+           format + " allocates device input");
+    Expect(cudaMalloc(reinterpret_cast<void**>(&device_output),
+                      result.size() * sizeof(result[0])) == cudaSuccess,
+           format + " allocates device output");
+    Expect(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
+               cudaSuccess,
+           format + " creates non-default stream");
+    if (!device_input || !device_output || !stream) return;
+    Expect(cudaMemcpyAsync(device_input, &host_input[0], host_input.size(),
+                           cudaMemcpyHostToDevice, stream) == cudaSuccess,
+           format + " enqueues H2D");
+
+    const rdma_dada::pipeline::InputBlock cuda_input = {
+        device_input, static_cast<std::uint64_t>(host_input.size()), sequence,
+        rdma_dada::pipeline::MemoryLocation::kCudaDevice
+    };
+    rdma_dada::pipeline::OutputBlock cuda_output = {
+        device_output,
+        static_cast<std::uint64_t>(result.size() * sizeof(result[0])),
+        0, 0, rdma_dada::pipeline::MemoryLocation::kCudaDevice
+    };
+    const rdma_dada::pipeline::BlockExecutionContext cuda_context = {
+        rdma_dada::pipeline::ExecutionBackend::kCuda, 0,
+        reinterpret_cast<void*>(stream)
+    };
+    status = cuda_module.ProcessBlock(cuda_input, &cuda_output, cuda_context);
+    Expect(status.ok(), format + " enqueues fused ATFP transpose");
+    if (!status.ok()) std::cerr << status.message() << '\n';
+    Expect(cuda_output.size == result.size() * sizeof(result[0]),
+           format + " reports exact output bytes");
+    Expect(cuda_output.sequence == sequence,
+           format + " preserves block sequence");
+
+    if (check_bad_context) {
+        const rdma_dada::pipeline::BlockExecutionContext null_stream = {
+            rdma_dada::pipeline::ExecutionBackend::kCuda, 0, NULL
+        };
+        status = cuda_module.ProcessBlock(cuda_input, &cuda_output, null_stream);
+        Expect(!status.ok(), "CUDA transpose rejects null/default stream");
+        const rdma_dada::pipeline::BlockExecutionContext wrong_device = {
+            rdma_dada::pipeline::ExecutionBackend::kCuda, 1,
+            reinterpret_cast<void*>(stream)
+        };
+        status = cuda_module.ProcessBlock(
+            cuda_input, &cuda_output, wrong_device);
+        Expect(!status.ok(), "CUDA transpose rejects wrong device context");
+    }
+
+    Expect(cudaMemcpyAsync(&result[0], device_output,
+                           result.size() * sizeof(result[0]),
+                           cudaMemcpyDeviceToHost, stream) == cudaSuccess,
+           format + " enqueues D2H");
+    Expect(cudaStreamSynchronize(stream) == cudaSuccess,
+           format + " completes caller-owned stream");
+    Expect(std::memcmp(&reference[0], &result[0],
+                       result.size() * sizeof(result[0])) == 0,
+           format + " CUDA output exactly matches CPU ATFP oracle");
+
+    Expect(cuda_module.Finish().ok(), format + " module finishes");
+    cudaStreamDestroy(stream);
+    cudaFree(device_output);
+    cudaFree(device_input);
 }
 
 }  // namespace
@@ -45,7 +236,6 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: complex_convert_cuda_test\n";
         return 2;
     }
-
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         std::cout << "SKIP: no CUDA device is available\n";
@@ -53,188 +243,9 @@ int main(int argc, char** argv) {
     }
     Expect(cudaSetDevice(0) == cudaSuccess, "select CUDA device 0");
 
-    rdma_dada::pipeline::Metadata input_header;
-    input_header.SetString("DATA_STAGE", "UNPACKED");
-    input_header.SetString("ORDER", "TFPA");
-    input_header.SetString("SAMPLE_FORMAT", "CI8");
-    input_header.SetString("COMPONENT_ORDER", "RI");
-    input_header.SetString("ENDIAN", "LITTLE");
-    input_header.SetString("MEMORY", "CUDA_DEVICE");
-    input_header.SetUint64("CUDA_DEVICE", 0);
-    input_header.SetUint64("COMPONENT_NBIT", 8);
-    input_header.SetUint64("COMPONENT_SIGNED", 1);
-    input_header.SetUint64("SAMPLE_NBIT", 16);
-    input_header.SetUint64("NCHAN", 1);
-    input_header.SetUint64("NPOL", 1);
-    input_header.SetUint64("NANT", 2);
-    input_header.SetUint64("RECORD_BYTES", 4);
-    input_header.SetUint64("RESOLUTION", 4);
-    input_header.SetUint64("BYTES_PER_SECOND", 40);
-
-    rdma_dada::pipeline::StageParameters parameters;
-    parameters.SetString("EXECUTION_BACKEND", "CUDA");
-    parameters.SetUint64("CUDA_DEVICE", 0);
-    parameters.SetDouble("CONVERSION_SCALE", 0.25);
-
-    rdma_dada::modules::complex_convert::ComplexConvertModule module;
-    rdma_dada::pipeline::Metadata output_header;
-    rdma_dada::pipeline::StageStatus status =
-        module.ConfigureHeader(input_header, parameters, &output_header);
-    Expect(status.ok(), "CUDA CI8 conversion configures");
-    if (!status.ok()) {
-        std::cerr << status.message() << '\n';
-        return 1;
-    }
-
-    const std::int8_t host_input[] = {
-        -128, 127, 8, -12,
-        20, -24, 40, -48
-    };
-    const float expected[][2] = {
-        {-32.0f, 31.75f}, {2.0f, -3.0f},
-        {5.0f, -6.0f}, {10.0f, -12.0f}
-    };
-    rdma_dada::pipeline::Complex32 host_output[4] = {};
-    std::uint8_t* device_input = NULL;
-    std::uint8_t* device_output = NULL;
-    cudaStream_t stream = NULL;
-    Expect(cudaMalloc(reinterpret_cast<void**>(&device_input),
-                      sizeof(host_input)) == cudaSuccess,
-           "allocate CUDA CI8 input");
-    Expect(cudaMalloc(reinterpret_cast<void**>(&device_output),
-                      sizeof(host_output)) == cudaSuccess,
-           "allocate CUDA CF32 output");
-    Expect(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
-               cudaSuccess,
-           "create nonblocking CUDA stream");
-    if (!device_input || !device_output || !stream) return 1;
-    Expect(cudaMemcpyAsync(device_input, host_input, sizeof(host_input),
-                           cudaMemcpyHostToDevice, stream) == cudaSuccess,
-           "enqueue CI8 input copy");
-
-    const rdma_dada::pipeline::InputBlock input = {
-        device_input, sizeof(host_input), 101,
-        rdma_dada::pipeline::MemoryLocation::kCudaDevice
-    };
-    rdma_dada::pipeline::OutputBlock output = {
-        device_output, sizeof(host_output), 0, 0,
-        rdma_dada::pipeline::MemoryLocation::kCudaDevice
-    };
-    const rdma_dada::pipeline::BlockExecutionContext context = {
-        rdma_dada::pipeline::ExecutionBackend::kCuda, 0,
-        reinterpret_cast<void*>(stream)
-    };
-    status = module.ProcessBlock(input, &output, context);
-    Expect(status.ok(), "enqueue CUDA CI8 to CF32 conversion");
-    if (!status.ok()) std::cerr << status.message() << '\n';
-    Expect(output.size == sizeof(host_output), "CUDA output has CF32 size");
-    Expect(output.sequence == 101, "CUDA conversion preserves sequence");
-    Expect(cudaMemcpyAsync(host_output, device_output, sizeof(host_output),
-                           cudaMemcpyDeviceToHost, stream) == cudaSuccess,
-           "enqueue CUDA conversion output copy");
-    Expect(cudaStreamSynchronize(stream) == cudaSuccess,
-           "wait for CUDA conversion result");
-    for (std::size_t i = 0; i < 4; ++i) {
-        ExpectNear(host_output[i].real, expected[i][0],
-                   "CUDA CI8 real component");
-        ExpectNear(host_output[i].imag, expected[i][1],
-                   "CUDA CI8 imag component");
-    }
-
-    const rdma_dada::pipeline::BlockExecutionContext null_stream_context = {
-        rdma_dada::pipeline::ExecutionBackend::kCuda, 0, NULL
-    };
-    status = module.ProcessBlock(input, &output, null_stream_context);
-    Expect(!status.ok(), "CUDA conversion rejects null/default stream");
-
-    status = module.Finish();
-    Expect(status.ok(), "finish CUDA conversion module");
-    cudaFree(device_input);
-    cudaFree(device_output);
-    cudaStreamDestroy(stream);
-
-    rdma_dada::pipeline::Metadata ci16_header = input_header;
-    ci16_header.SetString("SAMPLE_FORMAT", "CI16");
-    ci16_header.SetUint64("COMPONENT_NBIT", 16);
-    ci16_header.SetUint64("SAMPLE_NBIT", 32);
-    ci16_header.SetUint64("RECORD_BYTES", 8);
-    ci16_header.SetUint64("RESOLUTION", 8);
-    ci16_header.SetUint64("BYTES_PER_SECOND", 80);
-    parameters.SetDouble("CONVERSION_SCALE", 0.125);
-
-    rdma_dada::modules::complex_convert::ComplexConvertModule ci16_module;
-    status = ci16_module.ConfigureHeader(
-        ci16_header, parameters, &output_header);
-    Expect(status.ok(), "CUDA CI16 conversion configures");
-    if (!status.ok()) {
-        std::cerr << status.message() << '\n';
-        return 1;
-    }
-
-    const std::int16_t ci16_host_input[] = {
-        -32768, 32767, -8, 12,
-        40, -48, 800, -1600
-    };
-    const float ci16_expected[][2] = {
-        {-4096.0f, 4095.875f}, {-1.0f, 1.5f},
-        {5.0f, -6.0f}, {100.0f, -200.0f}
-    };
-    rdma_dada::pipeline::Complex32 ci16_host_output[4] = {};
-    device_input = NULL;
-    device_output = NULL;
-    stream = NULL;
-    Expect(cudaMalloc(reinterpret_cast<void**>(&device_input),
-                      sizeof(ci16_host_input)) == cudaSuccess,
-           "allocate CUDA CI16 input");
-    Expect(cudaMalloc(reinterpret_cast<void**>(&device_output),
-                      sizeof(ci16_host_output)) == cudaSuccess,
-           "allocate CUDA CI16 output");
-    Expect(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
-               cudaSuccess,
-           "create CI16 nonblocking CUDA stream");
-    if (!device_input || !device_output || !stream) return 1;
-    Expect(cudaMemcpyAsync(device_input, ci16_host_input,
-                           sizeof(ci16_host_input), cudaMemcpyHostToDevice,
-                           stream) == cudaSuccess,
-           "enqueue CI16 input copy");
-
-    const rdma_dada::pipeline::InputBlock ci16_input = {
-        device_input, sizeof(ci16_host_input), 102,
-        rdma_dada::pipeline::MemoryLocation::kCudaDevice
-    };
-    rdma_dada::pipeline::OutputBlock ci16_output = {
-        device_output, sizeof(ci16_host_output), 0, 0,
-        rdma_dada::pipeline::MemoryLocation::kCudaDevice
-    };
-    const rdma_dada::pipeline::BlockExecutionContext ci16_context = {
-        rdma_dada::pipeline::ExecutionBackend::kCuda, 0,
-        reinterpret_cast<void*>(stream)
-    };
-    status = ci16_module.ProcessBlock(
-        ci16_input, &ci16_output, ci16_context);
-    Expect(status.ok(), "enqueue CUDA CI16 to CF32 conversion");
-    if (!status.ok()) std::cerr << status.message() << '\n';
-    Expect(ci16_output.size == sizeof(ci16_host_output),
-           "CUDA CI16 output has CF32 size");
-    Expect(ci16_output.sequence == 102,
-           "CUDA CI16 conversion preserves sequence");
-    Expect(cudaMemcpyAsync(ci16_host_output, device_output,
-                           sizeof(ci16_host_output), cudaMemcpyDeviceToHost,
-                           stream) == cudaSuccess,
-           "enqueue CUDA CI16 output copy");
-    Expect(cudaStreamSynchronize(stream) == cudaSuccess,
-           "wait for CUDA CI16 conversion result");
-    for (std::size_t i = 0; i < 4; ++i) {
-        ExpectNear(ci16_host_output[i].real, ci16_expected[i][0],
-                   "CUDA CI16 real component");
-        ExpectNear(ci16_host_output[i].imag, ci16_expected[i][1],
-                   "CUDA CI16 imag component");
-    }
-    status = ci16_module.Finish();
-    Expect(status.ok(), "finish CUDA CI16 conversion module");
-    cudaFree(device_input);
-    cudaFree(device_output);
-    cudaStreamDestroy(stream);
+    RunCase("CI8", 5, 1, 3, 1, 3, 0.25, 201, true);   // Q=5 < tile.
+    RunCase("CI16", 17, 2, 3, 2, 2, 0.125, 202, false); // Q=68.
+    RunCase("CI8", 65, 1, 37, 3, 3, 0.5, 203, false);  // 37x195.
 
     if (failures != 0) return 1;
     std::cout << "complex_convert_cuda_test passed\n";

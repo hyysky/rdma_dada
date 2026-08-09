@@ -255,7 +255,7 @@ typedef std::function<bool(const AtfpBlockView&, std::string*)>
 
   ```bash
   cmake --build build-atfp-local --target vdif_timeline_test vdif_unpack_engine_test
-  ctest --test-dir build-atfp-local -R '^(vdif_timeline_test|vdif_unpack_engine_test)$' --repeat until-pass:3 --output-on-failure
+  ctest --test-dir build-atfp-local -R '^(vdif_timeline_test|vdif_unpack_engine_test)$' --repeat until-fail:3 --output-on-failure
   ```
 
 - [x] **Step 8: Perform the Task 3 server handoff and wait for callback**

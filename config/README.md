@@ -30,12 +30,17 @@ build/observation_config_compile \
 ```
 
 The destination must not already exist. It contains the verified resolved
-configuration, ring plan, 4096-byte RAW/UNPACKED DADA headers, validation report
-and `MANIFEST.sha256`.
+configuration, ring plan, 4096-byte `raw.header`/`unpacked.header`, validation
+report and `MANIFEST.sha256`. When `processing.modules` is non-empty, the
+compiler also invokes the production module header transforms and writes
+`converted.header`, `beamformed.header` and the final `output.header`; every
+generated file is covered by the manifest.
 
-`station_ids` order defines the A axis. `duration_seconds` and beamformer
-`weights_scale` are decimal strings so they can be parsed without binary
-floating-point rounding. `metadata.telescope`, `bandwidth_hz` and
+`station_ids` order defines the A axis. `duration_seconds`, explicit
+`processing.conversion.scale` and beamformer `weights_scale` are decimal
+strings so they can be parsed without binary floating-point rounding. The
+conversion scale must also be representable as a positive FP32 value.
+`metadata.telescope`, `bandwidth_hz` and
 `center_frequency_hz` are required and will propagate to generated DADA
 headers.
 
@@ -156,7 +161,9 @@ The legacy launcher always started `dada_dbdisk`, so the converter writes
 `"disk.enabled": true`. Change it to `false` when raw disk recording is not a
 consumer of the ring.
 
-`pipeline_worker.example.json` is a separate strict schema version 2 for the
+`pipeline_worker.example.json` is a legacy module-test schema and is not the
+application entry point. The application consumes the compiled
+`resolved_observation.json`. The legacy file is a separate strict schema for
 processing worker. It contains:
 
 - `rings`: hexadecimal input/output PSRDADA keys. The two keys must differ.
@@ -167,9 +174,10 @@ processing worker. It contains:
 - `output`: one of `BEAMFORMED`, `POWER` or `STOKES`.
 - `integration`: enable flag, positive integer length and `sum` or `mean`.
 
-Schema version 1 remains readable as integration disabled with length 1. New
-configs should use version 2. Integration may follow `POWER` or `STOKES`, not
-`BEAMFORMED`, and the configured block `T` must be divisible by its length.
+Schema versions 1–3 remain readable for module regression tests; new application
+runs must not create this independent worker JSON. Integration may follow
+`POWER` or `STOKES`, not `BEAMFORMED`, and block `T` must be divisible by its
+length.
 
 Relative `weights_file` paths are resolved from the worker JSON directory, not
 from the process working directory. The example therefore expects

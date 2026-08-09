@@ -1,5 +1,6 @@
 #include "rdma_dada/modules/device_to_host/device_to_host_module.h"
 #include "rdma_dada/modules/host_to_device/host_to_device_module.h"
+#include "rdma_dada/modules/complex_convert/complex_convert_module.h"
 #include "rdma_dada/pipeline/complex32.h"
 #include "rdma_dada/pipeline/module_chain.h"
 #include "rdma_dada/pipeline/worker_config.h"
@@ -18,7 +19,8 @@ int failures = 0;
 
 void PrintUsage(std::ostream& output, const char* program) {
     output << "Usage: " << program << " WEIGHTS.npy\n"
-           << "Validate H2D -> Beamform -> Power -> TimeIntegrate -> D2H "
+           << "Validate H2D -> ATFP convert -> Beamform -> Power -> "
+              "TimeIntegrate -> D2H "
               "on CUDA device 0.\n";
 }
 
@@ -39,18 +41,27 @@ void ExpectNear(float actual, float expected, const std::string& message) {
 
 rdma_dada::pipeline::Metadata MakeInputHeader() {
     rdma_dada::pipeline::Metadata header;
-    header.SetString("DATA_STAGE", "CONVERTED");
-    header.SetString("ORDER", "TFPA");
-    header.SetString("SAMPLE_FORMAT", "CF32");
+    header.SetString("DATA_STAGE", "UNPACKED");
+    header.SetString("ORDER", "ATFP");
+    header.SetString("LAYOUT_SCOPE", "BLOCK");
+    header.SetString("SAMPLE_FORMAT", "CI8");
+    header.SetString("SAMPLE_ENCODING", "TWOS_COMPLEMENT");
+    header.SetString("COMPONENT_ORDER", "IQ");
+    header.SetString("ENDIAN", "LITTLE");
     header.SetString("MEMORY", "HOST");
     header.SetString("SOURCE", "cuda-worker-chain-test");
     header.SetUint64("NCHAN", 2);
     header.SetUint64("NPOL", 1);
     header.SetUint64("NANT", 2);
-    header.SetUint64("RESOLUTION", 32);
-    header.SetUint64("BYTES_PER_SECOND", 3200);
-    header.SetUint64("TRANSFER_SIZE", 64);
-    header.SetUint64("FILE_SIZE", 64);
+    header.SetUint64("COMPONENT_NBIT", 8);
+    header.SetUint64("SAMPLE_NBIT", 16);
+    header.SetUint64("BLOCK_NTIME", 2);
+    header.SetUint64("RESOLUTION", 8);
+    header.SetUint64("RECORD_BYTES", 16);
+    header.SetUint64("OUTPUT_BLOCK_BYTES", 16);
+    header.SetUint64("BYTES_PER_SECOND", 800);
+    header.SetUint64("TRANSFER_SIZE", 16);
+    header.SetUint64("FILE_SIZE", 16);
     header.SetUint64("OBS_OFFSET", 0);
     header.SetDouble("TSAMP", 1.0);
     return header;
@@ -69,9 +80,10 @@ rdma_dada::pipeline::WorkerConfig MakeConfig(
     config.nchan = 2;
     config.nant = 2;
     config.npol = 1;
-    config.udp_payload_bytes = 16;
+    config.udp_payload_bytes = 4;
     config.samples_per_udp = 1;
     config.udp_packets_per_antenna_per_block = 2;
+    config.conversion_scale = 1.0;
     config.weights_file = weights_path;
     config.weights_order = "FPAB2";
     config.weights_id = "cuda-worker-chain-test-v1";
@@ -107,34 +119,40 @@ int main(int argc, char** argv) {
 
     const rdma_dada::pipeline::Metadata input_header = MakeInputHeader();
     const rdma_dada::pipeline::WorkerConfig config = MakeConfig(argv[1]);
+    rdma_dada::pipeline::StageParameters conversion_parameters;
+    conversion_parameters.SetString("EXECUTION_BACKEND", "CUDA");
+    conversion_parameters.SetUint64("CUDA_DEVICE", 0);
+    conversion_parameters.SetDouble("CONVERSION_SCALE", 1.0);
     rdma_dada::pipeline::ModuleChain chain;
     rdma_dada::pipeline::Metadata chain_output_header;
-    rdma_dada::pipeline::StageStatus status =
-        chain.Configure(input_header, config, &chain_output_header);
-    Expect(status.ok(), "configure CUDA Beamform/Power/Integration chain");
-    if (!status.ok()) {
-        std::cerr << status.message() << '\n';
-        return 1;
-    }
 
     std::uint64_t scratch_bytes = 0;
     std::uint64_t output_bytes = 0;
-    status = chain.PlanBlock(64, &scratch_bytes, &output_bytes);
-    Expect(status.ok(), "plan one CUDA worker input block");
-    Expect(scratch_bytes == 96, "chain scratch is 64-byte beamformed plus "
-                                "32-byte power block");
-    Expect(output_bytes == 16, "K=2 integration produces a 16-byte block");
 
     rdma_dada::pipeline::StageParameters transfer_parameters;
     transfer_parameters.SetString("EXECUTION_BACKEND", "CUDA");
     transfer_parameters.SetUint64("CUDA_DEVICE", 0);
     rdma_dada::modules::host_to_device::HostToDeviceModule h2d;
     rdma_dada::pipeline::Metadata device_input_header;
-    status = h2d.ConfigureHeader(
+    rdma_dada::pipeline::StageStatus status = h2d.ConfigureHeader(
         input_header, transfer_parameters, &device_input_header);
     Expect(status.ok(), "configure worker H2D stage");
-    Expect(device_input_header.Fields() == chain.plan().input_header.Fields(),
-           "H2D header matches module-chain CUDA input header");
+    rdma_dada::modules::complex_convert::ComplexConvertModule conversion;
+    rdma_dada::pipeline::Metadata converted_header;
+    status = conversion.ConfigureHeader(
+        device_input_header, conversion_parameters, &converted_header);
+    Expect(status.ok(), "configure worker ATFP conversion stage");
+    status = chain.Configure(converted_header, config, &chain_output_header);
+    Expect(status.ok(), "configure CUDA convert/Beamform/Power/Integration chain");
+    if (!status.ok()) {
+        std::cerr << status.message() << '\n';
+        return 1;
+    }
+    status = chain.PlanBlock(64, &scratch_bytes, &output_bytes);
+    Expect(status.ok(), "plan one converted CUDA worker block");
+    Expect(scratch_bytes == 96, "chain scratch is 64-byte beamformed plus "
+                                "32-byte power block");
+    Expect(output_bytes == 16, "K=2 integration produces a 16-byte block");
 
     rdma_dada::pipeline::Metadata device_output_header = chain_output_header;
     device_output_header.SetString("MEMORY", "CUDA_DEVICE");
@@ -160,15 +178,13 @@ int main(int argc, char** argv) {
                header_value == 1,
            "output header publishes integrated block T");
 
-    typedef rdma_dada::pipeline::Complex32 Complex32;
-    const Complex32 host_input[] = {
-        {1.0f, 2.0f}, {3.0f, 4.0f},
-        {5.0f, 6.0f}, {7.0f, 8.0f},
-        {2.0f, 0.0f}, {0.0f, 1.0f},
-        {1.0f, -1.0f}, {2.0f, 2.0f}
+    const std::int8_t host_input[] = {
+        1, 2, 5, 6, 2, 0, 1, -1,
+        3, 4, 7, 8, 0, 1, 2, 2
     };
     float host_output[4] = {};
     std::uint8_t* device_input = NULL;
+    std::uint8_t* device_converted = NULL;
     std::uint8_t* device_scratch = NULL;
     std::uint8_t* device_output = NULL;
     cudaStream_t stream = NULL;
@@ -179,6 +195,9 @@ int main(int argc, char** argv) {
     Expect(cudaMalloc(reinterpret_cast<void**>(&device_input),
                       sizeof(host_input)) == cudaSuccess,
            "allocate worker device input");
+    Expect(cudaMalloc(reinterpret_cast<void**>(&device_converted), 64) ==
+               cudaSuccess,
+           "allocate distinct converted TFPA device block");
     Expect(cudaMalloc(reinterpret_cast<void**>(&device_scratch),
                       static_cast<std::size_t>(scratch_bytes)) == cudaSuccess,
            "allocate worker chain scratch");
@@ -187,6 +206,7 @@ int main(int argc, char** argv) {
            "allocate worker device output");
     if (failures != 0) {
         if (device_input) cudaFree(device_input);
+        if (device_converted) cudaFree(device_converted);
         if (device_scratch) cudaFree(device_scratch);
         if (device_output) cudaFree(device_output);
         if (stream) cudaStreamDestroy(stream);
@@ -209,9 +229,21 @@ int main(int argc, char** argv) {
     status = h2d.ProcessBlock(ring_input, &transferred_input, context);
     Expect(status.ok(), "enqueue worker H2D");
 
-    const rdma_dada::pipeline::InputBlock chain_input = {
+    const rdma_dada::pipeline::InputBlock conversion_input = {
         transferred_input.data, transferred_input.size,
         transferred_input.sequence,
+        rdma_dada::pipeline::MemoryLocation::kCudaDevice
+    };
+    rdma_dada::pipeline::OutputBlock conversion_output = {
+        device_converted, 64, 0, 0,
+        rdma_dada::pipeline::MemoryLocation::kCudaDevice
+    };
+    status = conversion.ProcessBlock(
+        conversion_input, &conversion_output, context);
+    Expect(status.ok(), "enqueue fused ATFP conversion");
+    const rdma_dada::pipeline::InputBlock chain_input = {
+        conversion_output.data, conversion_output.size,
+        conversion_output.sequence,
         rdma_dada::pipeline::MemoryLocation::kCudaDevice
     };
     rdma_dada::pipeline::OutputBlock chain_output = {
@@ -256,6 +288,7 @@ int main(int argc, char** argv) {
     status = d2h.Finish();
     Expect(status.ok(), "finish D2H");
     cudaFree(device_input);
+    cudaFree(device_converted);
     cudaFree(device_scratch);
     cudaFree(device_output);
     cudaStreamDestroy(stream);

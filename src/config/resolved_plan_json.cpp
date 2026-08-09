@@ -165,9 +165,13 @@ std::string ObservationJson(const ObservationConfig& config,
            << "\"utc_start\":" << Quote(config.utc_start) << "},"
            << "\"processing\":{"
            << "\"backend\":" << Quote(config.backend) << ','
+           << "\"conversion\":{\"scale\":"
+           << Quote(config.conversion_scale) << "},"
            << "\"cuda_device\":" << config.cuda_device << ','
            << "\"modules\":" << ModulesJson(config.modules, include_paths)
-           << ',' << "\"run_once\":" << BoolText(config.run_once) << "},"
+           << ',' << "\"output\":{\"sample_format\":"
+           << Quote(config.output_sample_format) << "},"
+           << "\"run_once\":" << BoolText(config.run_once) << "},"
            << "\"receiver\":{"
            << "\"destination_ip\":" << Quote(config.destination_ip) << ','
            << "\"destination_mac\":" << Quote(config.destination_mac) << ','
@@ -177,9 +181,12 @@ std::string ObservationJson(const ObservationConfig& config,
            << "\"compute_key\":";
     std::ostringstream compute_key;
     compute_key << "0x" << std::hex << config.compute_key;
+    std::ostringstream output_key;
+    output_key << "0x" << std::hex << config.output_key;
     std::ostringstream raw_key;
     raw_key << "0x" << std::hex << config.raw_key;
     output << Quote(compute_key.str()) << ','
+           << "\"output_key\":" << Quote(output_key.str()) << ','
            << "\"raw_key\":" << Quote(raw_key.str()) << "},"
            << "\"schema_version\":" << config.schema_version << ','
            << "\"storage\":{"
@@ -200,12 +207,19 @@ std::map<std::string, std::uint64_t> ResolvedValues(
     values["compute_block_bytes"] = plan.compute_block_bytes;
     values["compute_file_bytes"] = plan.compute_file_bytes;
     values["compute_ring_bytes"] = plan.compute_ring_bytes;
+    values["converted_block_bytes"] = plan.converted_block_bytes;
     values["expected_groups"] = plan.expected_groups;
     values["group_period_ps"] = plan.group_period_ps;
     values["group_start_frame"] = plan.group_start_frame;
     values["group_start_reference_epoch"] = plan.group_start_reference_epoch;
     values["group_start_seconds"] = plan.group_start_seconds;
     values["nant"] = plan.nant;
+    values["nbeam"] = plan.nbeam;
+    values["beamformed_block_bytes"] = plan.beamformed_block_bytes;
+    values["product_block_bytes"] = plan.product_block_bytes;
+    values["output_block_bytes"] = plan.output_block_bytes;
+    values["output_ring_bytes"] = plan.output_ring_bytes;
+    values["output_samples_per_block"] = plan.output_samples_per_block;
     values["payload_bytes"] = plan.payload_bytes;
     values["payload_bytes_per_second"] = plan.payload_bytes_per_second;
     values["raw_block_bytes"] = plan.raw_block_bytes;
@@ -233,6 +247,16 @@ std::string ResolvedValuesJson(const ResolvedObservationPlan& plan) {
         output << Quote(item->first) << ':' << item->second;
     }
     output << '}';
+    return output.str();
+}
+
+std::string OutputContractJson(const ResolvedObservationPlan& plan) {
+    std::ostringstream output;
+    output << '{'
+           << "\"data_stage\":" << Quote(plan.output_data_stage) << ','
+           << "\"order\":" << Quote(plan.output_order) << ','
+           << "\"sample_format\":" << Quote(plan.output_sample_format)
+           << '}';
     return output.str();
 }
 
@@ -266,8 +290,8 @@ bool StringField(const json::Value::Object& object, const char* name,
 
 bool ExactTopLevel(const json::Value::Object& object, std::string* error) {
     static const char* const keys[] = {
-        "config_id", "geometry_id", "resolved", "schema_version",
-        "source_json", "source_path", "wire_profile_path"
+        "config_id", "geometry_id", "output_contract", "resolved",
+        "schema_version", "source_json", "source_path", "wire_profile_path"
     };
     if (object.size() != sizeof(keys) / sizeof(keys[0])) {
         return Fail("resolved plan has missing or unknown top-level fields", error);
@@ -309,6 +333,7 @@ std::string GeometryMaterial(const ResolvedObservationPlan& plan,
            << ModulesJson(plan.source.modules, false) << ','
            << "\"nchan\":" << plan.source.nchan << ','
            << "\"npol\":" << plan.source.npol << ','
+           << "\"output_contract\":" << OutputContractJson(plan) << ','
            << "\"resolved\":" << ResolvedValuesJson(plan) << ','
            << "\"sample_interval_ps\":" << plan.source.sample_interval_ps
            << ',' << "\"samples_per_packet\":"
@@ -336,6 +361,7 @@ std::string ConfigMaterial(
     output << '{'
            << "\"observation\":"
            << ObservationJson(plan.source, plan.wire.format_id, false) << ','
+           << "\"output_contract\":" << OutputContractJson(plan) << ','
            << "\"resolved\":" << ResolvedValuesJson(plan) << ','
            << "\"weight_files\":" << weights.str() << ','
            << "\"wire_sha256\":" << Quote(wire_digest)
@@ -352,7 +378,10 @@ bool ComputeObservationIdentities(ResolvedObservationPlan* plan,
     if (!ResolveObservationPlan(plan->source, plan->wire, &expected, error)) {
         return false;
     }
-    if (ResolvedValues(expected) != ResolvedValues(*plan)) {
+    if (ResolvedValues(expected) != ResolvedValues(*plan) ||
+        expected.output_data_stage != plan->output_data_stage ||
+        expected.output_order != plan->output_order ||
+        expected.output_sample_format != plan->output_sample_format) {
         return Fail("resolved values conflict with source configuration", error);
     }
     std::string wire_digest;
@@ -385,6 +414,7 @@ bool SerializeResolvedObservationPlan(const ResolvedObservationPlan& plan,
     output << '{'
            << "\"config_id\":" << Quote(plan.config_id) << ','
            << "\"geometry_id\":" << Quote(plan.geometry_id) << ','
+           << "\"output_contract\":" << OutputContractJson(plan) << ','
            << "\"resolved\":" << ResolvedValuesJson(plan) << ','
            << "\"schema_version\":1,"
            << "\"source_json\":" << Quote(source_json) << ','
@@ -457,6 +487,31 @@ bool LoadResolvedObservationPlan(const std::string& path,
                          error) || value != item->second) {
             return Fail("resolved geometry mismatch: " + item->first, error);
         }
+    }
+    const json::Value& output_contract_json =
+        object.find("output_contract")->second;
+    if (output_contract_json.type() != json::Value::kObject ||
+        output_contract_json.object().size() != 3U ||
+        output_contract_json.object().count("data_stage") != 1U ||
+        output_contract_json.object().count("order") != 1U ||
+        output_contract_json.object().count("sample_format") != 1U) {
+        return Fail("output_contract has missing or unknown fields", error);
+    }
+    std::string output_data_stage;
+    std::string output_order;
+    std::string output_sample_format;
+    if (!StringField(output_contract_json.object(), "data_stage",
+                     &output_data_stage, error) ||
+        !StringField(output_contract_json.object(), "order", &output_order,
+                     error) ||
+        !StringField(output_contract_json.object(), "sample_format",
+                     &output_sample_format, error)) {
+        return false;
+    }
+    if (output_data_stage != resolved.output_data_stage ||
+        output_order != resolved.output_order ||
+        output_sample_format != resolved.output_sample_format) {
+        return Fail("resolved output contract mismatch", error);
     }
     if (!ComputeObservationIdentities(&resolved, error)) return false;
     if (resolved.config_id != stored_config_id ||

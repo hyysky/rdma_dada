@@ -263,8 +263,11 @@ bool PositiveDecimal(const std::string& text) {
     errno = 0;
     char* end = NULL;
     const double value = std::strtod(text.c_str(), &end);
+    const float float_value = static_cast<float>(value);
     return errno != ERANGE && end != text.c_str() && *end == '\0' &&
-           std::isfinite(value) && value > 0.0;
+           std::isfinite(value) && value > 0.0 &&
+           value <= static_cast<double>(std::numeric_limits<float>::max()) &&
+           std::isfinite(float_value) && float_value > 0.0f;
 }
 
 bool ParseModule(const json::Value& value, const std::string& source_path,
@@ -448,6 +451,7 @@ bool ParseObservationConfigText(const std::string& contents,
     const json::Value::Object *observation = NULL, *metadata = NULL;
     const json::Value::Object *wire = NULL, *blocks = NULL, *rings = NULL;
     const json::Value::Object *storage = NULL, *receiver = NULL, *processing = NULL;
+    const json::Value::Object *conversion = NULL, *output = NULL;
     if (!RequireObject(Field(*root_object, "observation"), "observation",
                        &observation, error) ||
         !RequireObject(Field(*root_object, "metadata"), "metadata",
@@ -472,7 +476,9 @@ bool ParseObservationConfigText(const std::string& contents,
         "groups_per_block", "raw_ring_blocks", "compute_ring_blocks",
         "window_blocks"
     };
-    static const char* const ring_keys[] = {"raw_key", "compute_key"};
+    static const char* const ring_keys[] = {
+        "raw_key", "compute_key", "output_key"
+    };
     static const char* const storage_keys[] = {
         "enabled", "blocks_per_file", "direct_io"
     };
@@ -480,25 +486,37 @@ bool ParseObservationConfigText(const std::string& contents,
         "device", "destination_mac", "destination_ip", "destination_port"
     };
     static const char* const processing_keys[] = {
-        "backend", "cuda_device", "run_once", "modules"
+        "backend", "cuda_device", "run_once", "conversion", "output",
+        "modules"
     };
+    static const char* const conversion_keys[] = {"scale"};
+    static const char* const output_keys[] = {"sample_format"};
     if (!RequireExactKeys(*observation, observation_keys,
                           sizeof(observation_keys) / sizeof(observation_keys[0]),
                           "observation", error) ||
         !RequireExactKeys(*metadata, metadata_keys, 3U, "metadata", error) ||
         !RequireExactKeys(*wire, wire_keys, 2U, "wire", error) ||
         !RequireExactKeys(*blocks, block_keys, 4U, "blocks", error) ||
-        !RequireExactKeys(*rings, ring_keys, 2U, "rings", error) ||
+        !RequireExactKeys(*rings, ring_keys, 3U, "rings", error) ||
         !RequireExactKeys(*storage, storage_keys, 3U, "storage", error) ||
         !RequireExactKeys(*receiver, receiver_keys, 4U, "receiver", error) ||
-        !RequireExactKeys(*processing, processing_keys, 4U,
+        !RequireExactKeys(*processing, processing_keys, 6U,
                           "processing", error)) return false;
+    if (!RequireObject(Field(*processing, "conversion"),
+                       "processing.conversion", &conversion, error) ||
+        !RequireObject(Field(*processing, "output"),
+                       "processing.output", &output, error) ||
+        !RequireExactKeys(*conversion, conversion_keys, 1U,
+                          "processing.conversion", error) ||
+        !RequireExactKeys(*output, output_keys, 1U,
+                          "processing.output", error)) return false;
 
     std::uint64_t first_channel = 0;
     std::uint64_t destination_port = 0;
     std::string profile_path;
     std::string raw_key_text;
     std::string compute_key_text;
+    std::string output_key_text;
     if (!ReadString(*observation, "observation_id", "observation",
                     &parsed.observation_id, error) ||
         !ReadString(*observation, "utc_start", "observation",
@@ -531,9 +549,12 @@ bool ParseObservationConfigText(const std::string& contents,
                     &parsed.window_blocks, error) ||
         !ReadString(*rings, "raw_key", "rings", &raw_key_text, error) ||
         !ReadString(*rings, "compute_key", "rings", &compute_key_text, error) ||
+        !ReadString(*rings, "output_key", "rings", &output_key_text, error) ||
         !ParseRingKey("rings.raw_key", raw_key_text, &parsed.raw_key, error) ||
         !ParseRingKey("rings.compute_key", compute_key_text,
                       &parsed.compute_key, error) ||
+        !ParseRingKey("rings.output_key", output_key_text,
+                      &parsed.output_key, error) ||
         !ReadBool(*storage, "enabled", "storage", &parsed.disk_enabled, error) ||
         !ReadUint64(*storage, "blocks_per_file", "storage",
                     &parsed.blocks_per_file, error) ||
@@ -551,7 +572,11 @@ bool ParseObservationConfigText(const std::string& contents,
         !ReadInt(*processing, "cuda_device", "processing",
                  &parsed.cuda_device, error) ||
         !ReadBool(*processing, "run_once", "processing",
-                  &parsed.run_once, error)) return false;
+                  &parsed.run_once, error) ||
+        !ReadString(*conversion, "scale", "processing.conversion",
+                    &parsed.conversion_scale, error) ||
+        !ReadString(*output, "sample_format", "processing.output",
+                    &parsed.output_sample_format, error)) return false;
 
     UtcDateTime utc_start = UtcDateTime();
     if (!ParseUtcDateTime(parsed.utc_start, &utc_start, error)) return false;
@@ -574,8 +599,10 @@ bool ParseObservationConfigText(const std::string& contents,
     if (parsed.bandwidth_hz == 0U || parsed.center_frequency_hz == 0U) {
         return Fail("frequency metadata must be positive", error);
     }
-    if (parsed.raw_key == parsed.compute_key) {
-        return Fail("raw and compute ring keys must differ", error);
+    if (parsed.raw_key == parsed.compute_key ||
+        parsed.raw_key == parsed.output_key ||
+        parsed.compute_key == parsed.output_key) {
+        return Fail("raw, compute and output ring keys must differ", error);
     }
     if (parsed.disk_enabled && parsed.blocks_per_file == 0U) {
         return Fail("storage.blocks_per_file must be positive when enabled", error);
@@ -595,6 +622,13 @@ bool ParseObservationConfigText(const std::string& contents,
     }
     if (parsed.cuda_device < 0) {
         return Fail("processing.cuda_device must be non-negative", error);
+    }
+    if (!PositiveDecimal(parsed.conversion_scale)) {
+        return Fail("processing.conversion.scale must be a positive decimal",
+                    error);
+    }
+    if (parsed.output_sample_format != "AUTO") {
+        return Fail("processing.output.sample_format must be AUTO", error);
     }
     parsed.wire_profile_path = ResolveRelative(path, profile_path);
 

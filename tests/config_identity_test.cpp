@@ -32,10 +32,26 @@ std::string WriteTemp(const std::string& suffix, const std::string& contents) {
     return path.str();
 }
 
+std::string WeightFixture() {
+    std::string header =
+        "{'descr': '|i1', 'fortran_order': False, 'shape': (2, 2, 2, 1, 2), }";
+    const std::size_t padding = 16U - ((10U + header.size() + 1U) % 16U);
+    header.append(padding, ' ');
+    header.push_back('\n');
+    std::string contents("\x93NUMPY\x01\x00", 8U);
+    contents.push_back(static_cast<char>(header.size() & 0xffU));
+    contents.push_back(static_cast<char>((header.size() >> 8U) & 0xffU));
+    contents += header;
+    contents.append(16U, '\0');
+    return contents;
+}
+
 std::string AlternateObservation(const std::string& wire_path) {
     std::ostringstream out;
     out << "{\n"
         << "  \"processing\": {\"modules\": [], \"run_once\": true, "
+           "\"output\":{\"sample_format\":\"AUTO\"},"
+           "\"conversion\":{\"scale\":\"0.0078125\"},"
            "\"cuda_device\": 0, \"backend\": \"CUDA\"},\n"
         << "  \"receiver\": {\"destination_port\":1000,"
            "\"destination_ip\":\"174.0.1.111\","
@@ -43,8 +59,8 @@ std::string AlternateObservation(const std::string& wire_path) {
            "\"device\":\"mlx5_0\"},\n"
         << "  \"storage\": {\"direct_io\":false,\"blocks_per_file\":0,"
            "\"enabled\":false},\n"
-        << "  \"rings\": {\"compute_key\":\"0x00d4\","
-           "\"raw_key\":\"0x00d2\"},\n"
+        << "  \"rings\": {\"output_key\":\"0x00d6\","
+           "\"compute_key\":\"0x00d4\",\"raw_key\":\"0x00d2\"},\n"
         << "  \"blocks\": {\"window_blocks\":2,\"compute_ring_blocks\":8,"
            "\"raw_ring_blocks\":8,\"groups_per_block\":1024},\n"
         << "  \"wire\": {\"samples_per_packet\":512,\"profile\":\""
@@ -120,6 +136,24 @@ int main(int argc, char** argv) {
     Expect(receiver_changed.geometry_id == base.geometry_id,
            "receiver change does not update GEOMETRY_ID");
 
+    rdma_dada::ResolvedObservationPlan conversion_changed = base;
+    conversion_changed.source.conversion_scale = "0.00390625";
+    error.clear();
+    Expect(rdma_dada::ComputeObservationIdentities(&conversion_changed, &error),
+           "conversion-scale variant identity: " + error);
+    Expect(conversion_changed.config_id != base.config_id &&
+               conversion_changed.geometry_id == base.geometry_id,
+           "conversion scale updates CONFIG_ID but not input geometry ID");
+
+    rdma_dada::ResolvedObservationPlan output_key_changed = base;
+    output_key_changed.source.output_key = 0x00d7U;
+    error.clear();
+    Expect(rdma_dada::ComputeObservationIdentities(&output_key_changed, &error),
+           "output-ring variant identity: " + error);
+    Expect(output_key_changed.config_id != base.config_id &&
+               output_key_changed.geometry_id == base.geometry_id,
+           "output ring key updates CONFIG_ID but not input geometry ID");
+
     rdma_dada::ObservationConfig geometry_source = base.source;
     geometry_source.nchan = 1U;
     rdma_dada::ResolvedObservationPlan geometry_changed;
@@ -133,7 +167,7 @@ int main(int argc, char** argv) {
                geometry_changed.geometry_id != base.geometry_id,
            "geometry change updates both IDs");
 
-    const std::string weights_path = WriteTemp("weights.bin", "AAAA");
+    const std::string weights_path = WriteTemp("weights.npy", WeightFixture());
     rdma_dada::ObservationModuleConfig beam =
         rdma_dada::ObservationModuleConfig();
     beam.kind = rdma_dada::ObservationModuleKind::kBeamform;
@@ -142,16 +176,22 @@ int main(int argc, char** argv) {
     beam.weights_id = "identity-fixture";
     beam.weights_scale = "0.0078125";
     beam.compute_mode = "FP32";
-    rdma_dada::ResolvedObservationPlan weighted = base;
-    weighted.source.modules.push_back(beam);
+    rdma_dada::ObservationConfig weighted_source = base.source;
+    weighted_source.modules.push_back(beam);
+    rdma_dada::ResolvedObservationPlan weighted;
     error.clear();
-    Expect(rdma_dada::ComputeObservationIdentities(&weighted, &error),
+    Expect(rdma_dada::ResolveObservationPlan(weighted_source, base.wire,
+                                             &weighted, &error) &&
+               rdma_dada::ComputeObservationIdentities(&weighted, &error),
            "weighted identity: " + error);
     const std::string weighted_config_id = weighted.config_id;
     const std::string weighted_geometry_id = weighted.geometry_id;
     {
         std::ofstream changed(weights_path.c_str(), std::ios::binary | std::ios::trunc);
-        changed << "AAAB";
+        std::string changed_contents = WeightFixture();
+        changed_contents[changed_contents.size() - 1U] = 1;
+        changed.write(changed_contents.data(),
+                      static_cast<std::streamsize>(changed_contents.size()));
     }
     error.clear();
     Expect(rdma_dada::ComputeObservationIdentities(&weighted, &error),
@@ -166,6 +206,11 @@ int main(int argc, char** argv) {
     Expect(rdma_dada::SerializeResolvedObservationPlan(base, &serialized,
                                                        &error),
            "serialize resolved plan: " + error);
+    Expect(serialized.find(
+               "\"output_contract\":{\"data_stage\":\"\","
+               "\"order\":\"\",\"sample_format\":\"\"}") !=
+               std::string::npos,
+           "resolved plan serializes the derived output contract");
     const std::string plan_path = WriteTemp("resolved.json", serialized);
     rdma_dada::ResolvedObservationPlan loaded;
     error.clear();
@@ -173,7 +218,11 @@ int main(int argc, char** argv) {
            "load serialized plan: " + error);
     Expect(loaded.config_id == base.config_id &&
                loaded.geometry_id == base.geometry_id &&
-               loaded.raw_block_bytes == base.raw_block_bytes,
+               loaded.raw_block_bytes == base.raw_block_bytes &&
+               loaded.source.output_key == base.source.output_key &&
+               loaded.source.conversion_scale ==
+                   base.source.conversion_scale &&
+               loaded.source.output_sample_format == "AUTO",
            "resolved plan round trip");
 
     std::string tampered = serialized;
@@ -188,6 +237,27 @@ int main(int argc, char** argv) {
     Expect(!rdma_dada::LoadResolvedObservationPlan(tampered_path, &loaded,
                                                    &error),
            "tampered derived geometry is rejected");
+
+    std::string output_contract_tampered = serialized;
+    const std::string output_contract_before =
+        "\"output_contract\":{\"data_stage\":\"\",\"order\":\"\","
+        "\"sample_format\":\"\"}";
+    const std::string output_contract_after =
+        "\"output_contract\":{\"data_stage\":\"POWER\","
+        "\"order\":\"TFPB\",\"sample_format\":\"F32\"}";
+    const std::string::size_type output_contract_position =
+        output_contract_tampered.find(output_contract_before);
+    if (output_contract_position != std::string::npos) {
+        output_contract_tampered.replace(output_contract_position,
+                                         output_contract_before.size(),
+                                         output_contract_after);
+    }
+    const std::string output_contract_tampered_path =
+        WriteTemp("output_contract_tampered.json", output_contract_tampered);
+    error.clear();
+    Expect(!rdma_dada::LoadResolvedObservationPlan(
+               output_contract_tampered_path, &loaded, &error),
+           "tampered output contract is rejected");
 
     std::string identity_tampered = serialized;
     const std::string config_marker = "\"config_id\":\"";
@@ -210,6 +280,7 @@ int main(int argc, char** argv) {
     std::remove(weights_path.c_str());
     std::remove(plan_path.c_str());
     std::remove(tampered_path.c_str());
+    std::remove(output_contract_tampered_path.c_str());
     std::remove(identity_tampered_path.c_str());
 
     if (failures != 0) return 1;

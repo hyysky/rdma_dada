@@ -11,6 +11,9 @@ struct ObservationArtifacts {
     ResolvedObservationPlan plan;
     pipeline::Metadata raw_header;
     pipeline::Metadata unpacked_header;
+    pipeline::Metadata converted_header;
+    pipeline::Metadata beamformed_header;
+    pipeline::Metadata output_header;
     std::string resolved_plan_json;
     std::string ring_plan_json;
     std::string validation_report_json;

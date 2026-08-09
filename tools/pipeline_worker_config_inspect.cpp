@@ -31,12 +31,15 @@ int main(int argc, char** argv) {
         << "UDP_PAYLOAD_BYTES=" << config.udp_payload_bytes << '\n'
         << "UDP_PACKETS_PER_ANTENNA_PER_BLOCK="
         << config.udp_packets_per_antenna_per_block << '\n'
+        << "CONVERSION_SCALE=" << config.conversion_scale << '\n'
         << "BLOCK_NTIME=" << geometry.ntime << '\n'
         << "UDP_ANTENNA_GROUP_BYTES="
         << geometry.udp_antenna_group_bytes << '\n'
         << "UDP_GROUP_MULTIPLE=" << geometry.udp_group_multiple << '\n'
         << "INPUT_FRAME_BYTES=" << geometry.input_frame_bytes << '\n'
         << "INPUT_BLOCK_BYTES=" << geometry.input_block_bytes << '\n'
+        << "CONVERTED_FRAME_BYTES=" << geometry.converted_frame_bytes << '\n'
+        << "CONVERTED_BLOCK_BYTES=" << geometry.converted_block_bytes << '\n'
         << "BEAMFORMED_FRAME_BYTES="
         << geometry.beamformed_frame_bytes << '\n'
         << "BEAMFORMED_BLOCK_BYTES="

@@ -168,7 +168,7 @@ bool LoadObservationConfig(const std::string& path,
 - [x] **Step 5: Run focused tests three times**
 
   ```bash
-  ctest --test-dir build-observation-local -R '^observation_config_test$' --repeat until-pass:3 --output-on-failure
+  ctest --test-dir build-observation-local -R '^observation_config_test$' --repeat until-fail:3 --output-on-failure
   ```
 
 - [x] **Step 6: Hand off Task 1 to the GPU-server test task**
@@ -232,7 +232,7 @@ struct PacketFormatConfig {
     packet_format_config_test packet_format_inspect project_vdif_v1_test
   ctest --test-dir build-observation-local \
     -R '^(packet_format_config_test|packet_format_inspect_test|project_vdif_v1_test)$' \
-    --repeat until-pass:3 --output-on-failure
+    --repeat until-fail:3 --output-on-failure
   ```
 
 - [x] **Step 5: Hand off Task 2 and wait for callback**
@@ -329,7 +329,7 @@ bool ResolveObservationPlan(const ObservationConfig& config,
   ```bash
   ctest --test-dir build-observation-local \
     -R '^(observation_config_test|packet_format_config_test|resolved_observation_plan_test)$' \
-    --repeat until-pass:3 --output-on-failure
+    --repeat until-fail:3 --output-on-failure
   ```
 
 - [x] **Step 6: Hand off Task 3 and wait for callback**
@@ -479,7 +479,7 @@ module.
     observation_artifacts_test observation_config_compile
   ctest --test-dir build-observation-local \
     -R '^(observation_artifacts_test|observation_config_compile_test)$' \
-    --repeat until-pass:3 --output-on-failure
+    --repeat until-fail:3 --output-on-failure
   ```
 
 - [x] **Step 6: Hand off Task 5 and wait for callback**
@@ -546,7 +546,7 @@ module.
   ```bash
   ctest --test-dir build-observation-local \
     -R '^(observation_config_test|resolved_observation_plan_test|vdif_unpack_config_test|vdif_unpack_header_test)$' \
-    --repeat until-pass:3 --output-on-failure
+    --repeat until-fail:3 --output-on-failure
   ```
 
   Server acceptance runs `vdif_unpack_worker_integration.sh` three clean repetitions with generated artifacts and verifies no static header template is read.

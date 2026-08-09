@@ -109,7 +109,11 @@ observation = {
         "compute_ring_blocks": 4,
         "window_blocks": 2,
     },
-    "rings": {"raw_key": "0x000a", "compute_key": "0x000c"},
+    "rings": {
+        "raw_key": "0x000a",
+        "compute_key": "0x000c",
+        "output_key": "0x000e",
+    },
     "storage": {"enabled": True, "blocks_per_file": 2, "direct_io": False},
     "receiver": {
         "device": "mlx5_0",
@@ -121,6 +125,8 @@ observation = {
         "backend": "CUDA",
         "cuda_device": 0,
         "run_once": case_name != "continuous",
+        "conversion": {"scale": "0.0078125"},
+        "output": {"sample_format": "AUTO"},
         "modules": [],
     },
 }

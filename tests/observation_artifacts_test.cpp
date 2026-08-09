@@ -1,4 +1,7 @@
 #include "rdma_dada/config/observation_artifacts.h"
+#include "rdma_dada/config/observation_config.h"
+#include "rdma_dada/config/packet_format_config.h"
+#include "rdma_dada/config/resolved_plan_json.h"
 
 #include "rdma_dada/pipeline/ascii_metadata.h"
 
@@ -34,8 +37,12 @@ void ExpectText(const rdma_dada::pipeline::Metadata& metadata,
 void ExpectUint(const rdma_dada::pipeline::Metadata& metadata,
                 const std::string& key, std::uint64_t expected) {
     std::uint64_t actual = 0;
-    Expect(metadata.GetUint64(key, &actual) && actual == expected,
-           key + " mismatch");
+    const bool found = metadata.GetUint64(key, &actual);
+    std::ostringstream message;
+    message << key << " mismatch: expected " << expected << ", got ";
+    if (found) message << actual;
+    else message << "<missing>";
+    Expect(found && actual == expected, message.str());
 }
 
 void ExpectDouble(const rdma_dada::pipeline::Metadata& metadata,
@@ -52,8 +59,31 @@ std::string ReadFile(const std::string& path) {
     return contents.str();
 }
 
+std::string WriteWeights() {
+    std::ostringstream path;
+    path << "/tmp/rdma_dada_artifact_weights_" << getpid() << ".npy";
+    std::string header =
+        "{'descr': '|i1', 'fortran_order': False, "
+        "'shape': (2, 2, 2, 3, 2), }";
+    const std::size_t padding = 16U - ((10U + header.size() + 1U) % 16U);
+    header.append(padding, ' ');
+    header.push_back('\n');
+    const unsigned char prefix[] = {
+        0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0,
+        static_cast<unsigned char>(header.size() & 0xffU),
+        static_cast<unsigned char>((header.size() >> 8U) & 0xffU)
+    };
+    std::ofstream output(path.str().c_str(), std::ios::binary);
+    output.write(reinterpret_cast<const char*>(prefix), sizeof(prefix));
+    output.write(header.data(), static_cast<std::streamsize>(header.size()));
+    const std::string payload(48U, '\0');
+    output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    return path.str();
+}
+
 void RemoveArtifacts(const std::string& directory) {
     static const char* const files[] = {
+        "beamformed.header", "converted.header", "output.header",
         "resolved_observation.json", "ring_plan.json", "raw.header",
         "unpacked.header", "validation_report.json", "MANIFEST.sha256"
     };
@@ -80,6 +110,7 @@ int main(int argc, char** argv) {
 
     const rdma_dada::pipeline::Metadata& raw = artifacts.raw_header;
     ExpectText(raw, "CONFIG_ID", artifacts.plan.config_id);
+    ExpectUint(raw, "HDR_SIZE", 4096U);
     ExpectText(raw, "GEOMETRY_ID", artifacts.plan.geometry_id);
     ExpectText(raw, "OBSERVATION_ID", "ca-functional-v1");
     ExpectText(raw, "TELESCOPE", "CA");
@@ -111,6 +142,7 @@ int main(int argc, char** argv) {
     ExpectUint(raw, "EXPECTED_GROUPS", 15141U);
 
     const rdma_dada::pipeline::Metadata& unpacked = artifacts.unpacked_header;
+    ExpectUint(unpacked, "HDR_SIZE", 4096U);
     ExpectText(unpacked, "CONFIG_ID", artifacts.plan.config_id);
     ExpectText(unpacked, "GEOMETRY_ID", artifacts.plan.geometry_id);
     ExpectText(unpacked, "TELESCOPE", "CA");
@@ -141,6 +173,100 @@ int main(int argc, char** argv) {
     Expect(artifacts.validation_report_json.find("\"stage_headers\":[\"RAW\",\"UNPACKED\"]") !=
                std::string::npos,
            "validation report records generated stages");
+
+    rdma_dada::ObservationConfig processing_source = artifacts.plan.source;
+    const std::string weights = WriteWeights();
+    rdma_dada::ObservationModuleConfig beamform =
+        rdma_dada::ObservationModuleConfig();
+    beamform.kind = rdma_dada::ObservationModuleKind::kBeamform;
+    beamform.weights_file = weights;
+    beamform.weights_order = "FPAB2";
+    beamform.weights_id = "artifact-test";
+    beamform.weights_scale = "0.0078125";
+    beamform.compute_mode = "FP32";
+    processing_source.modules.push_back(beamform);
+    rdma_dada::ObservationModuleConfig power =
+        rdma_dada::ObservationModuleConfig();
+    power.kind = rdma_dada::ObservationModuleKind::kPower;
+    processing_source.modules.push_back(power);
+    rdma_dada::ObservationModuleConfig integration =
+        rdma_dada::ObservationModuleConfig();
+    integration.kind = rdma_dada::ObservationModuleKind::kIntegrate;
+    integration.integration_length = 128U;
+    integration.integration_operation = "MEAN";
+    processing_source.modules.push_back(integration);
+    rdma_dada::ResolvedObservationPlan processing_plan;
+    error.clear();
+    Expect(rdma_dada::ResolveObservationPlan(
+               processing_source, artifacts.plan.wire, &processing_plan,
+               &error) &&
+               rdma_dada::ComputeObservationIdentities(
+                   &processing_plan, &error),
+           "resolve processing artifact geometry: " + error);
+    rdma_dada::ObservationArtifacts processing_artifacts;
+    error.clear();
+    Expect(rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+               processing_plan, &processing_artifacts, &error),
+           "build processing ring artifact: " + error);
+    Expect(processing_artifacts.ring_plan_json.find(
+               "\"output\":{\"block_bytes\":196608,\"blocks\":8") !=
+               std::string::npos &&
+               processing_artifacts.ring_plan_json.find(
+                   "\"key\":\"0x00d6\"") != std::string::npos &&
+               processing_artifacts.ring_plan_json.find(
+                   "\"ring_bytes\":1572864") != std::string::npos,
+           "ring plan derives one output ring from compute ring and modules");
+    ExpectText(processing_artifacts.converted_header,
+               "DATA_STAGE", "CONVERTED");
+    ExpectText(processing_artifacts.converted_header, "ORDER", "TFPA");
+    ExpectText(processing_artifacts.converted_header,
+               "SAMPLE_FORMAT", "CF32");
+    ExpectUint(processing_artifacts.converted_header,
+               "OUTPUT_BLOCK_BYTES", 33554432U);
+    ExpectText(processing_artifacts.beamformed_header,
+               "DATA_STAGE", "BEAMFORMED");
+    ExpectText(processing_artifacts.beamformed_header, "ORDER", "TFPB");
+    ExpectUint(processing_artifacts.beamformed_header, "NBEAM", 3U);
+    ExpectUint(processing_artifacts.beamformed_header,
+               "OUTPUT_BLOCK_BYTES", 50331648U);
+    ExpectText(processing_artifacts.output_header,
+               "DATA_STAGE", "POWER_INTEGRATED");
+    ExpectText(processing_artifacts.output_header, "ORDER", "TFPB");
+    ExpectText(processing_artifacts.output_header, "SAMPLE_FORMAT", "F32");
+    ExpectUint(processing_artifacts.output_header, "BLOCK_NTIME", 4096U);
+    ExpectUint(processing_artifacts.output_header,
+               "OUTPUT_BLOCK_BYTES", 196608U);
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"stage_headers\":[\"RAW\",\"UNPACKED\",\"CONVERTED\","
+               "\"BEAMFORMED\",\"POWER_INTEGRATED\"]") !=
+               std::string::npos,
+           "processing validation report lists every generated stage");
+
+    std::ostringstream processing_directory;
+    processing_directory << "/tmp/rdma_dada_processing_artifacts_" << getpid();
+    RemoveArtifacts(processing_directory.str());
+    error.clear();
+    Expect(rdma_dada::WriteObservationArtifacts(
+               processing_artifacts, processing_directory.str(), &error),
+           "write processing stage headers: " + error);
+    struct stat processing_status = {};
+    Expect(stat((processing_directory.str() + "/converted.header").c_str(),
+                &processing_status) == 0 &&
+               processing_status.st_size == 4096,
+           "converted.header is one DADA header block");
+    Expect(stat((processing_directory.str() + "/beamformed.header").c_str(),
+                &processing_status) == 0 &&
+               processing_status.st_size == 4096,
+           "beamformed.header is one DADA header block");
+    Expect(stat((processing_directory.str() + "/output.header").c_str(),
+                &processing_status) == 0 &&
+               processing_status.st_size == 4096,
+           "output.header is one DADA header block");
+    Expect(ReadFile(processing_directory.str() + "/MANIFEST.sha256").find(
+               "  output.header\n") != std::string::npos,
+           "manifest covers final output header");
+    RemoveArtifacts(processing_directory.str());
+    std::remove(weights.c_str());
 
     std::ostringstream directory;
     directory << "/tmp/rdma_dada_artifacts_" << getpid();

@@ -1,6 +1,7 @@
 #include "rdma_dada/pipeline/worker_config.h"
 
 #include "rdma_dada/config/json_value.h"
+#include "rdma_dada/config/resolved_plan_json.h"
 #include "rdma_dada/pipeline/complex32.h"
 
 #include <cerrno>
@@ -185,6 +186,10 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
         "schema_version", "rings", "execution", "input_geometry",
         "beamform", "output", "integration"
     };
+    static const char* const root_keys_v3[] = {
+        "schema_version", "rings", "execution", "input_geometry",
+        "conversion", "beamform", "output", "integration"
+    };
 
     std::uint64_t schema_version = 0;
     if (root_object->count("schema_version") == 0U) {
@@ -206,6 +211,13 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                 "root", error)) {
             return false;
         }
+    } else if (schema_version == 3) {
+        if (!RequireExactKeys(
+                *root_object, root_keys_v3,
+                sizeof(root_keys_v3) / sizeof(root_keys_v3[0]),
+                "root", error)) {
+            return false;
+        }
     } else {
         return Fail("unsupported worker schema_version", error);
     }
@@ -213,6 +225,7 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     const json::Value::Object* rings = NULL;
     const json::Value::Object* execution = NULL;
     const json::Value::Object* input_geometry = NULL;
+    const json::Value::Object* conversion = NULL;
     const json::Value::Object* beamform = NULL;
     const json::Value::Object* output = NULL;
     const json::Value::Object* integration = NULL;
@@ -227,7 +240,12 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                        error)) {
         return false;
     }
-    if (schema_version == 2 &&
+    if (schema_version == 3 &&
+        !RequireObject(Field(*root_object, "conversion"), "conversion",
+                       &conversion, error)) {
+        return false;
+    }
+    if (schema_version >= 2 &&
         !RequireObject(Field(*root_object, "integration"), "integration",
                        &integration, error)) {
         return false;
@@ -245,6 +263,7 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
         "weights_file", "weights_order", "weights_id", "weights_scale",
         "nbeam", "compute_mode"
     };
+    static const char* const conversion_keys[] = {"scale"};
     static const char* const output_keys[] = {"product"};
     static const char* const integration_keys[] = {
         "enabled", "length", "operation"
@@ -267,7 +286,14 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                           "output", error)) {
         return false;
     }
-    if (schema_version == 2 &&
+    if (schema_version == 3 &&
+        !RequireExactKeys(*conversion, conversion_keys,
+                          sizeof(conversion_keys) /
+                              sizeof(conversion_keys[0]),
+                          "conversion", error)) {
+        return false;
+    }
+    if (schema_version >= 2 &&
         !RequireExactKeys(
             *integration, integration_keys,
             sizeof(integration_keys) / sizeof(integration_keys[0]),
@@ -280,6 +306,7 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     parsed.integration_enabled = false;
     parsed.integration_length = 1;
     parsed.integration_operation = "MEAN";
+    parsed.conversion_scale = 1.0;
     std::uint64_t cuda_device = 0;
     std::uint64_t nbeam = 0;
     std::string product;
@@ -332,6 +359,15 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     if (parsed.input_key == parsed.output_key) {
         return Fail("input and output ring keys must be different", error);
     }
+    if (schema_version == 3 &&
+        !ReadDouble(*conversion, "scale", "conversion",
+                    &parsed.conversion_scale, error)) {
+        return false;
+    }
+    if (!(parsed.conversion_scale > 0.0) ||
+        !std::isfinite(parsed.conversion_scale)) {
+        return Fail("conversion.scale must be finite and positive", error);
+    }
     if (cuda_device > static_cast<std::uint64_t>(
                           std::numeric_limits<int>::max())) {
         return Fail("execution.cuda_device exceeds int range", error);
@@ -368,7 +404,7 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                     error);
     }
 
-    if (schema_version == 2) {
+    if (schema_version >= 2) {
         std::string integration_operation;
         if (!ReadBool(*integration, "enabled", "integration",
                       &parsed.integration_enabled, error) ||
@@ -402,6 +438,134 @@ bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
     if (!ComputeWorkerBlockGeometry(parsed, &geometry, error)) return false;
     *config = parsed;
     return true;
+}
+
+bool BuildWorkerConfigFromResolvedPlan(
+    const ResolvedObservationPlan& plan,
+    WorkerConfig* config,
+    WorkerBlockGeometry* geometry,
+    std::string* error) {
+    if (!config || !geometry) {
+        return Fail("resolved worker output pointer is null", error);
+    }
+    ResolvedObservationPlan verified;
+    if (!ResolveObservationPlan(plan.source, plan.wire, &verified, error)) {
+        return false;
+    }
+    if (plan.source.modules.empty()) {
+        return Fail("pipeline_worker requires a beamform module chain", error);
+    }
+    if (verified.nbeam != plan.nbeam ||
+        verified.compute_block_bytes != plan.compute_block_bytes ||
+        verified.converted_block_bytes != plan.converted_block_bytes ||
+        verified.beamformed_block_bytes != plan.beamformed_block_bytes ||
+        verified.product_block_bytes != plan.product_block_bytes ||
+        verified.output_samples_per_block != plan.output_samples_per_block ||
+        verified.output_block_bytes != plan.output_block_bytes ||
+        verified.output_ring_bytes != plan.output_ring_bytes ||
+        verified.output_data_stage != plan.output_data_stage ||
+        verified.output_order != plan.output_order ||
+        verified.output_sample_format != plan.output_sample_format) {
+        return Fail("resolved plan contains stale worker geometry", error);
+    }
+
+    const ObservationModuleConfig& beamform = plan.source.modules[0];
+    WorkerConfig result = WorkerConfig();
+    result.input_key = plan.source.compute_key;
+    result.output_key = plan.source.output_key;
+    std::ostringstream input_key;
+    std::ostringstream output_key;
+    input_key << "0x" << std::hex << result.input_key;
+    output_key << "0x" << std::hex << result.output_key;
+    result.input_key_text = input_key.str();
+    result.output_key_text = output_key.str();
+    result.execution_backend = plan.source.backend;
+    result.cuda_device = plan.source.cuda_device;
+    result.run_once = plan.source.run_once;
+    result.nchan = plan.source.nchan;
+    result.nant = plan.nant;
+    result.npol = plan.source.npol;
+    result.udp_payload_bytes = plan.payload_bytes;
+    result.samples_per_udp = plan.source.samples_per_packet;
+    result.udp_packets_per_antenna_per_block =
+        plan.source.groups_per_block;
+
+    errno = 0;
+    char* scale_end = NULL;
+    result.conversion_scale =
+        std::strtod(plan.source.conversion_scale.c_str(), &scale_end);
+    if (errno == ERANGE || scale_end == plan.source.conversion_scale.c_str() ||
+        *scale_end != '\0' || !std::isfinite(result.conversion_scale) ||
+        result.conversion_scale <= 0.0) {
+        return Fail("processing.conversion.scale must be finite and positive",
+                    error);
+    }
+    result.weights_file = beamform.weights_file;
+    result.weights_order = beamform.weights_order;
+    result.weights_id = beamform.weights_id;
+    errno = 0;
+    char* weights_scale_end = NULL;
+    result.weights_scale =
+        std::strtod(beamform.weights_scale.c_str(), &weights_scale_end);
+    if (errno == ERANGE || weights_scale_end == beamform.weights_scale.c_str() ||
+        *weights_scale_end != '\0' || !std::isfinite(result.weights_scale) ||
+        result.weights_scale <= 0.0) {
+        return Fail("beamform weights_scale must be finite and positive",
+                    error);
+    }
+    result.nbeam = plan.nbeam;
+    result.compute_mode = beamform.compute_mode;
+    result.product = WorkerProduct::kBeamformed;
+    result.integration_enabled = false;
+    result.integration_length = 1U;
+    result.integration_operation = "MEAN";
+
+    if (plan.source.modules.size() >= 2U) {
+        const ObservationModuleKind kind = plan.source.modules[1].kind;
+        if (kind == ObservationModuleKind::kPower) {
+            result.product = WorkerProduct::kPower;
+        } else if (kind == ObservationModuleKind::kStokes) {
+            result.product = WorkerProduct::kStokes;
+        } else {
+            return Fail("resolved worker product must be power or stokes",
+                        error);
+        }
+    }
+    if (plan.source.modules.size() == 3U) {
+        const ObservationModuleConfig& integration = plan.source.modules[2];
+        if (integration.kind != ObservationModuleKind::kIntegrate) {
+            return Fail("resolved worker third module must be integration",
+                        error);
+        }
+        result.integration_enabled = true;
+        result.integration_length = integration.integration_length;
+        result.integration_operation = integration.integration_operation;
+    }
+
+    WorkerBlockGeometry computed;
+    if (!ComputeWorkerBlockGeometry(result, &computed, error)) return false;
+    if (computed.input_block_bytes != plan.compute_block_bytes ||
+        computed.converted_block_bytes != plan.converted_block_bytes ||
+        computed.beamformed_block_bytes != plan.beamformed_block_bytes ||
+        computed.product_block_bytes != plan.product_block_bytes ||
+        computed.output_ntime != plan.output_samples_per_block ||
+        computed.output_block_bytes != plan.output_block_bytes) {
+        return Fail("worker geometry conflicts with resolved observation plan",
+                    error);
+    }
+    *config = result;
+    *geometry = computed;
+    return true;
+}
+
+bool LoadWorkerConfigFromResolvedPlan(
+    const std::string& path,
+    WorkerConfig* config,
+    WorkerBlockGeometry* geometry,
+    std::string* error) {
+    ResolvedObservationPlan plan;
+    if (!LoadResolvedObservationPlan(path, &plan, error)) return false;
+    return BuildWorkerConfigFromResolvedPlan(plan, config, geometry, error);
 }
 
 bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
@@ -453,8 +617,8 @@ bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
                          "input frame F*P", &elements, error) ||
         !CheckedMultiply(elements, config.nant,
                          "input frame F*P*A", &elements, error) ||
-        !CheckedMultiply(elements, sizeof(Complex32),
-                         "input CF32 frame bytes",
+        !CheckedMultiply(elements, UINT64_C(2),
+                         "input CI8 frame bytes",
                          &result.input_frame_bytes, error) ||
         !CheckedMultiply(result.input_frame_bytes, result.ntime,
                          "input block bytes", &result.input_block_bytes,
@@ -468,6 +632,19 @@ bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
     }
     result.udp_group_multiple =
         result.input_block_bytes / result.udp_antenna_group_bytes;
+
+    if (!CheckedMultiply(config.nchan, config.npol,
+                         "converted frame F*P", &elements, error) ||
+        !CheckedMultiply(elements, config.nant,
+                         "converted frame F*P*A", &elements, error) ||
+        !CheckedMultiply(elements, sizeof(Complex32),
+                         "converted CF32 frame bytes",
+                         &result.converted_frame_bytes, error) ||
+        !CheckedMultiply(result.converted_frame_bytes, result.ntime,
+                         "converted block bytes",
+                         &result.converted_block_bytes, error)) {
+        return false;
+    }
 
     if (!CheckedMultiply(config.nchan, config.npol,
                          "beamformed frame F*P", &elements, error) ||

@@ -3,9 +3,14 @@
 #include "rdma_dada/config/resolved_observation_plan.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
+
+#include <unistd.h>
 
 namespace {
 
@@ -24,6 +29,52 @@ bool Resolve(const rdma_dada::ObservationConfig& observation,
              std::string* error) {
     error->clear();
     return rdma_dada::ResolveObservationPlan(observation, wire, plan, error);
+}
+
+std::string WriteWeights(std::uint64_t nchan, std::uint64_t npol,
+                         std::uint64_t nant, std::uint64_t nbeam) {
+    std::ostringstream path;
+    path << "/tmp/rdma_dada_resolved_weights_" << getpid() << ".npy";
+    std::ostringstream dictionary;
+    dictionary << "{'descr': '|i1', 'fortran_order': False, 'shape': ("
+               << nchan << ", " << npol << ", " << nant << ", " << nbeam
+               << ", 2), }";
+    std::string header = dictionary.str();
+    const std::size_t padding = 16U - ((10U + header.size() + 1U) % 16U);
+    header.append(padding, ' ');
+    header.push_back('\n');
+    const unsigned char prefix[] = {
+        0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0,
+        static_cast<unsigned char>(header.size() & 0xffU),
+        static_cast<unsigned char>((header.size() >> 8U) & 0xffU)
+    };
+    std::ofstream output(path.str().c_str(), std::ios::binary);
+    output.write(reinterpret_cast<const char*>(prefix), sizeof(prefix));
+    output.write(header.data(), static_cast<std::streamsize>(header.size()));
+    const std::uint64_t bytes = nchan * npol * nant * nbeam * 2U;
+    const std::string payload(static_cast<std::size_t>(bytes), '\0');
+    output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    return path.str();
+}
+
+rdma_dada::ObservationModuleConfig Beamform(const std::string& path) {
+    rdma_dada::ObservationModuleConfig module =
+        rdma_dada::ObservationModuleConfig();
+    module.kind = rdma_dada::ObservationModuleKind::kBeamform;
+    module.weights_file = path;
+    module.weights_order = "FPAB2";
+    module.weights_id = "resolved-plan-test";
+    module.weights_scale = "0.0078125";
+    module.compute_mode = "FP32";
+    return module;
+}
+
+rdma_dada::ObservationModuleConfig Module(
+    rdma_dada::ObservationModuleKind kind) {
+    rdma_dada::ObservationModuleConfig module =
+        rdma_dada::ObservationModuleConfig();
+    module.kind = kind;
+    return module;
 }
 
 }  // namespace
@@ -65,6 +116,9 @@ int main(int argc, char** argv) {
                "one validity bit per Station/group slot");
         Expect(plan.raw_ring_bytes == 67633152U, "raw ring bytes");
         Expect(plan.compute_ring_bytes == 67108864U, "compute ring bytes");
+        Expect(plan.nbeam == 0U && plan.output_block_bytes == 0U &&
+                   plan.output_ring_bytes == 0U,
+               "raw/unpack-only plan has no GPU output ring geometry");
         Expect(plan.raw_file_bytes == 0U && plan.compute_file_bytes == 0U,
                "disabled storage has no file allocation");
         Expect(plan.payload_bytes_per_second == 16000000U,
@@ -148,6 +202,73 @@ int main(int argc, char** argv) {
     invalid.direct_io = true;
     Expect(!Resolve(invalid, wire, &plan, &error),
            "direct-I/O block misalignment is rejected");
+
+    const std::string weights = WriteWeights(2U, 2U, 2U, 3U);
+    rdma_dada::ObservationConfig processed = observation;
+    processed.modules.push_back(Beamform(weights));
+    Expect(Resolve(processed, wire, &plan, &error),
+           "beamform-only plan resolves: " + error);
+    if (error.empty()) {
+        Expect(plan.nbeam == 3U, "NBEAM comes from weight B dimension");
+        Expect(plan.converted_block_bytes == 33554432U,
+               "CI8 ATFP converts to CF32 TFPA");
+        Expect(plan.beamformed_block_bytes == 50331648U &&
+                   plan.product_block_bytes == 50331648U,
+               "beamform-only TFPB CF32 bytes");
+        Expect(plan.output_samples_per_block == 524288U &&
+                   plan.output_block_bytes == 50331648U &&
+                   plan.output_ring_bytes == 402653184U,
+               "beamform-only output ring geometry");
+        Expect(plan.output_data_stage == "BEAMFORMED" &&
+                   plan.output_order == "TFPB" &&
+                   plan.output_sample_format == "CF32",
+               "beamform-only AUTO output contract");
+    }
+
+    processed.modules.push_back(
+        Module(rdma_dada::ObservationModuleKind::kPower));
+    Expect(Resolve(processed, wire, &plan, &error),
+           "power plan resolves: " + error);
+    Expect(plan.product_block_bytes == 25165824U &&
+               plan.output_block_bytes == 25165824U &&
+               plan.output_data_stage == "POWER" &&
+               plan.output_order == "TFPB" &&
+               plan.output_sample_format == "F32",
+           "Power AUTO output geometry");
+
+    rdma_dada::ObservationModuleConfig integrate =
+        Module(rdma_dada::ObservationModuleKind::kIntegrate);
+    integrate.integration_length = 128U;
+    integrate.integration_operation = "MEAN";
+    processed.modules.push_back(integrate);
+    Expect(Resolve(processed, wire, &plan, &error),
+           "power plus integration resolves: " + error);
+    Expect(plan.output_samples_per_block == 4096U &&
+               plan.output_block_bytes == 196608U &&
+               plan.output_ring_bytes == 1572864U &&
+               plan.output_data_stage == "POWER_INTEGRATED" &&
+               plan.output_order == "TFPB" &&
+               plan.output_sample_format == "F32",
+           "integration reduces T and preserves F32 product layout");
+
+    processed = observation;
+    processed.modules.push_back(Beamform(weights));
+    processed.modules.push_back(
+        Module(rdma_dada::ObservationModuleKind::kStokes));
+    Expect(Resolve(processed, wire, &plan, &error),
+           "Stokes plan resolves: " + error);
+    Expect(plan.product_block_bytes == 50331648U &&
+               plan.output_data_stage == "POLARIZATION_PRODUCTS" &&
+               plan.output_order == "TFBS" &&
+               plan.output_sample_format == "F32",
+           "Stokes emits four F32 products");
+
+    const std::string wrong_weights = WriteWeights(1U, 2U, 2U, 3U);
+    processed.modules[0].weights_file = wrong_weights;
+    Expect(!Resolve(processed, wire, &plan, &error),
+           "weight F/P/A geometry must match observation");
+    std::remove(weights.c_str());
+    std::remove(wrong_weights.c_str());
 
     if (failures != 0) return 1;
     std::cout << "resolved_observation_plan_test passed\n";

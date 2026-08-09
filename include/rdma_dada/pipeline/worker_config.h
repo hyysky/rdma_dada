@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rdma_dada/config/resolved_observation_plan.h"
+
 #include <cstdint>
 #include <string>
 
@@ -29,6 +31,8 @@ struct WorkerConfig {
     std::uint64_t samples_per_udp;
     std::uint64_t udp_packets_per_antenna_per_block;
 
+    double conversion_scale;
+
     std::string weights_file;
     std::string weights_order;
     std::string weights_id;
@@ -49,6 +53,8 @@ struct WorkerBlockGeometry {
     std::uint64_t udp_group_multiple;
     std::uint64_t input_frame_bytes;
     std::uint64_t input_block_bytes;
+    std::uint64_t converted_frame_bytes;
+    std::uint64_t converted_block_bytes;
     std::uint64_t beamformed_frame_bytes;
     std::uint64_t beamformed_block_bytes;
     std::uint64_t output_frame_bytes;
@@ -61,9 +67,24 @@ struct WorkerBlockGeometry {
 bool LoadWorkerConfig(const std::string& path, WorkerConfig* config,
                       std::string* error);
 
-// Compute full-block geometry from F/A/P, UDP grouping, CF32 input and the
-// configured Beamform/Power/Stokes product and optional time integration.
-// product_block_bytes is before integration; output_block_bytes is final.
+// Builds the worker runtime contract from the single resolved observation
+// plan. No geometry or NBEAM is independently entered by the worker.
+bool BuildWorkerConfigFromResolvedPlan(
+    const ResolvedObservationPlan& plan,
+    WorkerConfig* config,
+    WorkerBlockGeometry* geometry,
+    std::string* error);
+
+bool LoadWorkerConfigFromResolvedPlan(
+    const std::string& path,
+    WorkerConfig* config,
+    WorkerBlockGeometry* geometry,
+    std::string* error);
+
+// Compute full-block geometry from F/A/P, UDP grouping, block-scoped ATFP CI8
+// input, converted TFPA CF32, and the configured Beamform/Power/Stokes product.
+// product_block_bytes is before optional integration; output_block_bytes is
+// final.
 bool ComputeWorkerBlockGeometry(const WorkerConfig& config,
                                 WorkerBlockGeometry* geometry,
                                 std::string* error);

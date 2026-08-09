@@ -27,6 +27,16 @@ struct ResolvedObservationPlan {
     std::uint64_t window_validity_bytes;
     std::uint64_t raw_ring_bytes;
     std::uint64_t compute_ring_bytes;
+    std::uint64_t nbeam;
+    std::uint64_t converted_block_bytes;
+    std::uint64_t beamformed_block_bytes;
+    std::uint64_t product_block_bytes;
+    std::uint64_t output_samples_per_block;
+    std::uint64_t output_block_bytes;
+    std::uint64_t output_ring_bytes;
+    std::string output_data_stage;
+    std::string output_order;
+    std::string output_sample_format;
     std::uint64_t raw_file_bytes;
     std::uint64_t compute_file_bytes;
     std::uint64_t payload_bytes_per_second;

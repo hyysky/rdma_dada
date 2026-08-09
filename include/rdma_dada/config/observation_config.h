@@ -60,6 +60,7 @@ struct ObservationConfig {
 
     std::uint32_t raw_key;
     std::uint32_t compute_key;
+    std::uint32_t output_key;
 
     bool disk_enabled;
     std::uint64_t blocks_per_file;
@@ -73,6 +74,8 @@ struct ObservationConfig {
     std::string backend;
     int cuda_device;
     bool run_once;
+    std::string conversion_scale;
+    std::string output_sample_format;
     std::vector<ObservationModuleConfig> modules;
 };
 

@@ -7,8 +7,11 @@
 #include "rdma_dada/config/sha256.h"
 #include "rdma_dada/modules/vdif_unpack/vdif_unpack_config.h"
 #include "rdma_dada/modules/vdif_unpack/vdif_unpack_header.h"
+#include "rdma_dada/modules/complex_convert/complex_convert_module.h"
 #include "rdma_dada/pipeline/ascii_metadata.h"
 #include "rdma_dada/pipeline/dada_header_builder.h"
+#include "rdma_dada/pipeline/module_chain.h"
+#include "rdma_dada/pipeline/worker_config.h"
 
 #include <cerrno>
 #include <cstring>
@@ -104,6 +107,7 @@ pipeline::Metadata BuildRawHeader(const ResolvedObservationPlan& plan,
     }
     pipeline::Metadata header;
     header.SetString("HDR_VERSION", "1.0");
+    header.SetUint64("HDR_SIZE", kDadaHeaderBytes);
     header.SetUint64("OBS_OFFSET", 0U);
     header.SetUint64("PIPELINE_VERSION", 1U);
     header.SetString("CONFIG_ID", plan.config_id);
@@ -167,13 +171,107 @@ pipeline::Metadata BuildRawHeader(const ResolvedObservationPlan& plan,
     return header;
 }
 
+void ApplyRequestedExecutionMetadata(
+    const pipeline::WorkerConfig& requested,
+    const std::string& memory,
+    pipeline::Metadata* header) {
+    header->SetString("EXECUTION_BACKEND", requested.execution_backend);
+    header->SetString("MEMORY", memory);
+    if (header->Has("COMPUTE_MODE")) {
+        header->SetString("COMPUTE_MODE", requested.compute_mode);
+    }
+    if (requested.execution_backend == "CUDA") {
+        header->SetUint64("CUDA_DEVICE",
+                          static_cast<std::uint64_t>(requested.cuda_device));
+    } else {
+        header->Erase("CUDA_DEVICE");
+    }
+}
+
+bool BuildProcessingHeaders(
+    const ResolvedObservationPlan& plan,
+    const pipeline::Metadata& unpacked_header,
+    pipeline::Metadata* converted_header,
+    pipeline::Metadata* beamformed_header,
+    pipeline::Metadata* output_header,
+    std::string* error) {
+    if (plan.source.modules.empty()) return true;
+
+    pipeline::WorkerConfig requested;
+    pipeline::WorkerBlockGeometry geometry;
+    if (!pipeline::BuildWorkerConfigFromResolvedPlan(
+            plan, &requested, &geometry, error)) {
+        return false;
+    }
+    pipeline::WorkerConfig planning = requested;
+    planning.execution_backend = "CPU_REFERENCE";
+    planning.cuda_device = -1;
+    planning.compute_mode = "FP32";
+
+    pipeline::StageParameters conversion_parameters;
+    conversion_parameters.SetString("EXECUTION_BACKEND", "CPU_REFERENCE");
+    conversion_parameters.SetDouble(
+        "CONVERSION_SCALE", planning.conversion_scale);
+    modules::complex_convert::ComplexConvertModule conversion;
+    pipeline::StageStatus status = conversion.ConfigureHeader(
+        unpacked_header, conversion_parameters, converted_header);
+    if (!status.ok()) {
+        return Fail("cannot derive converted header: " + status.message(),
+                    error);
+    }
+
+    pipeline::WorkerConfig beam_only = planning;
+    beam_only.product = pipeline::WorkerProduct::kBeamformed;
+    beam_only.integration_enabled = false;
+    beam_only.integration_length = 1U;
+    beam_only.integration_operation = "SUM";
+    pipeline::ModuleChain beam_chain;
+    status = beam_chain.Configure(
+        *converted_header, beam_only, beamformed_header);
+    if (!status.ok()) {
+        return Fail("cannot derive beamformed header: " + status.message(),
+                    error);
+    }
+
+    pipeline::ModuleChain final_chain;
+    status = final_chain.Configure(*converted_header, planning, output_header);
+    if (!status.ok()) {
+        return Fail("cannot derive output header: " + status.message(), error);
+    }
+
+    const std::string device_memory =
+        requested.execution_backend == "CUDA" ? "CUDA_DEVICE" : "HOST";
+    ApplyRequestedExecutionMetadata(
+        requested, device_memory, converted_header);
+    ApplyRequestedExecutionMetadata(
+        requested, device_memory, beamformed_header);
+    ApplyRequestedExecutionMetadata(requested, "HOST", output_header);
+    std::string pipeline_modules;
+    if (output_header->GetString("PIPELINE_MODULES", &pipeline_modules)) {
+        output_header->SetString(
+            "PIPELINE_MODULES", "complex_convert," + pipeline_modules);
+    }
+    output_header->SetUint64("INPUT_BLOCK_BYTES", geometry.input_block_bytes);
+    output_header->SetUint64(
+        "CONVERTED_BLOCK_BYTES", geometry.converted_block_bytes);
+    output_header->SetDouble(
+        "CONVERSION_SCALE", requested.conversion_scale);
+    output_header->SetUint64("OUTPUT_BLOCK_BYTES", geometry.output_block_bytes);
+    output_header->SetUint64("BLOCK_BYTES", geometry.output_block_bytes);
+    output_header->SetUint64("RING_BYTES", plan.output_ring_bytes);
+    return true;
+}
+
 std::string RingPlanJson(const ResolvedObservationPlan& plan) {
     std::ostringstream compute_key;
     compute_key << "0x" << std::hex << std::setw(4) << std::setfill('0')
                 << plan.source.compute_key;
     std::ostringstream raw_key;
     raw_key << "0x" << std::hex << std::setw(4) << std::setfill('0')
-            << plan.source.raw_key;
+                << plan.source.raw_key;
+    std::ostringstream output_key;
+    output_key << "0x" << std::hex << std::setw(4) << std::setfill('0')
+               << plan.source.output_key;
     std::ostringstream output;
     output << '{'
            << "\"config_id\":" << Quote(plan.config_id) << ','
@@ -184,8 +282,20 @@ std::string RingPlanJson(const ResolvedObservationPlan& plan) {
            << "\"blocks\":" << plan.source.compute_ring_blocks << ','
            << "\"header_bytes\":" << kDadaHeaderBytes << ','
            << "\"key\":" << Quote(compute_key.str()) << ','
-           << "\"ring_bytes\":" << plan.compute_ring_bytes << "},"
-           << "\"raw\":{"
+           << "\"ring_bytes\":" << plan.compute_ring_bytes << "},";
+    if (plan.output_block_bytes != 0U) {
+        output << "\"output\":{"
+               << "\"block_bytes\":" << plan.output_block_bytes << ','
+               << "\"blocks\":" << plan.source.compute_ring_blocks << ','
+               << "\"data_stage\":" << Quote(plan.output_data_stage) << ','
+               << "\"header_bytes\":" << kDadaHeaderBytes << ','
+               << "\"key\":" << Quote(output_key.str()) << ','
+               << "\"order\":" << Quote(plan.output_order) << ','
+               << "\"ring_bytes\":" << plan.output_ring_bytes << ','
+               << "\"sample_format\":"
+               << Quote(plan.output_sample_format) << "},";
+    }
+    output << "\"raw\":{"
            << "\"block_bytes\":" << plan.raw_block_bytes << ','
            << "\"blocks\":" << plan.source.raw_ring_blocks << ','
            << "\"header_bytes\":" << kDadaHeaderBytes << ','
@@ -201,6 +311,13 @@ std::string RingPlanJson(const ResolvedObservationPlan& plan) {
 }
 
 std::string ValidationReportJson(const ResolvedObservationPlan& plan) {
+    std::ostringstream stage_headers;
+    stage_headers << "[\"RAW\",\"UNPACKED\"";
+    if (!plan.source.modules.empty()) {
+        stage_headers << ",\"CONVERTED\",\"BEAMFORMED\","
+                      << Quote(plan.output_data_stage);
+    }
+    stage_headers << ']';
     std::ostringstream output;
     output << '{'
            << "\"checks\":["
@@ -237,7 +354,7 @@ std::string ValidationReportJson(const ResolvedObservationPlan& plan) {
            << Quote(plan.source.wire_profile_path) << "},"
            << "\"observation_id\":" << Quote(plan.source.observation_id)
            << ',' << "\"schema_version\":1,"
-           << "\"stage_headers\":[\"RAW\",\"UNPACKED\"],"
+           << "\"stage_headers\":" << stage_headers.str() << ','
            << "\"valid\":true"
            << "}\n";
     return output.str();
@@ -399,6 +516,11 @@ bool BuildObservationArtifactsFromResolvedPlan(
     result.plan = plan;
     result.raw_header = raw_header;
     result.unpacked_header = unpacked_header;
+    if (!BuildProcessingHeaders(
+            plan, unpacked_header, &result.converted_header,
+            &result.beamformed_header, &result.output_header, error)) {
+        return false;
+    }
     if (!SerializeResolvedObservationPlan(plan, &result.resolved_plan_json,
                                           error)) {
         return false;
@@ -435,6 +557,21 @@ bool WriteObservationArtifacts(const ObservationArtifacts& artifacts,
     files["resolved_observation.json"] = artifacts.resolved_plan_json;
     files["ring_plan.json"] = artifacts.ring_plan_json;
     files["unpacked.header"] = unpacked_header;
+    if (!artifacts.converted_header.Fields().empty()) {
+        std::string converted_header;
+        std::string beamformed_header;
+        std::string output_header;
+        if (!HeaderBytes(artifacts.converted_header, &converted_header,
+                         error) ||
+            !HeaderBytes(artifacts.beamformed_header, &beamformed_header,
+                         error) ||
+            !HeaderBytes(artifacts.output_header, &output_header, error)) {
+            return false;
+        }
+        files["converted.header"] = converted_header;
+        files["beamformed.header"] = beamformed_header;
+        files["output.header"] = output_header;
+    }
     files["validation_report.json"] = artifacts.validation_report_json;
 
     std::ostringstream staging_name;
