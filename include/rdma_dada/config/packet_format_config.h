@@ -61,7 +61,6 @@ struct PacketFormatConfig {
     std::uint32_t schema_version;
     std::string format_id;
     std::uint64_t application_header_bytes;
-    std::uint64_t payload_bytes;
     std::string bit_numbering;
     std::vector<ApplicationHeaderField> header_fields;
     std::string sample_format;
@@ -69,7 +68,6 @@ struct PacketFormatConfig {
     std::string component_order;
     PacketEndianness payload_endianness;
     std::vector<std::string> packed_order;
-    std::vector<std::string> output_order;
     std::vector<PacketPayloadAxis> axes;
 };
 

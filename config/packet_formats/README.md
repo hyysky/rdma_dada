@@ -6,9 +6,9 @@
 VDIF 的完全兼容实现。完整协议见
 [`doc/PROJECT_VDIF_PROFILE_V1.md`](../../doc/PROJECT_VDIF_PROFILE_V1.md)。
 
-版本 1 的 JSON Schema 是
-[`packet-format-v1.schema.json`](packet-format-v1.schema.json)。C++ 运行时还会执行字段
-bit 重叠、header 引用、payload sample 对齐和常量 shape 几何等交叉校验：
+协议仍是 Project VDIF Profile v1；描述文件使用 schema v2：
+[`packet-format-v2.schema.json`](packet-format-v2.schema.json)。C++ 运行时还会执行字段
+bit 重叠、header 引用及固定 TFP/Station 映射校验：
 
 ```bash
 build/packet_format_inspect \
@@ -20,7 +20,7 @@ build/packet_format_inspect \
 一个 raw record 是：
 
 ```text
-32-byte Project VDIF header | payload_bytes bytes
+32-byte Project VDIF header | observation-derived payload
 ```
 
 32-byte header 在每个 UDP record 内重复出现；它不同于每个 PSRDADA transfer 只发布
@@ -49,13 +49,14 @@ Project VDIF v1 payload 是有符号二进制补码复整数：
   "sample_encoding": "TWOS_COMPLEMENT",
   "component_order": "IQ",
   "endian": "LITTLE",
-  "packed_order": ["T", "F", "P"],
-  "output_order": ["T", "F", "P", "A"]
+  "packed_order": ["T", "F", "P"]
 }
 ```
 
 `I` 对应复数实部，`Q` 对应复数虚部。单个 packet 只来自一个 Station ID，因此 raw
-payload 没有 A 轴；`vdif_unpack` 按 `antenna_map[station_id]` 聚合所有天线后生成 TFPA。
+payload 没有 A 轴。packet-format profile 只描述 wire layout，不声明下游布局；
+`vdif_unpack` 按 `antenna_map[station_id]` 聚合所有天线，在每个 compute block 内生成
+`[A,T,F,P]`（`ORDER=ATFP`、`LAYOUT_SCOPE=BLOCK`）。
 
 表达式语法支持以下来源：
 
@@ -80,13 +81,13 @@ P extent = HEADER:npol,              origin = CONST:0
 A extent = CONST:1,                  origin = LOOKUP:antenna_map:station_id
 ```
 
-上述四组映射是 Project VDIF v1 固定契约，不能在 schema v1 profile 中交换或替换。
+上述四组映射是 Project VDIF v1 固定契约，不能在 schema v2 profile 中交换或替换。
 
 `NCHAN` 是 Word 5 中的 UINT8 直接值，范围 1–255，不要求是 2 的幂。Word 2 的
 `channel_count_code=31` 只是 project sentinel，不能按标准 VDIF 解释成 `2^31`。
 
-profile loader 会验证 `32 + payload_bytes` 的溢出和 8-byte 对齐。由于 T/F/P extent
-来自 header，未来的 `vdif_unpack` 还必须按每个 packet 的实际值交叉验证：
+profile 不保存 `payload_bytes`、`NCHAN`、`NPOL` 或 packet T；这些观测几何由统一观测
+配置解析后计算。运行时仍按每个 packet 的实际 header 交叉验证：
 
 ```text
 payload_bytes = NSAMP_PER_PACKET * NCHAN * NPOL * complex_sample_bytes
@@ -102,5 +103,5 @@ frame_bytes = frame_length_units_8_bytes * 8
 4. 一组包含全部 Station ID 的同步 packet group 和对应 `antenna_map`；
 5. 丢包、重复、乱序和 invalid-data 的期望处理策略。
 
-这些 fixture 将作为 `vdif_unpack` CPU oracle、TFP→TFPA 聚合和后续 CUDA 测试的独立
-依据。
+这些 fixture 将作为 `vdif_unpack` CPU oracle、TFP→ATFP 聚合和后续 CUDA
+`[A,TFP]→[TFP,A]` 转置测试的独立依据。

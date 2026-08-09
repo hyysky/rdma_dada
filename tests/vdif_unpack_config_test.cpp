@@ -1,5 +1,8 @@
 #include "rdma_dada/config/packet_format_config.h"
 #include "rdma_dada/config/pipeline_config.h"
+#include "rdma_dada/config/observation_config.h"
+#include "rdma_dada/config/resolved_observation_plan.h"
+#include "rdma_dada/config/resolved_plan_json.h"
 #include "rdma_dada/modules/vdif_unpack/vdif_unpack_config.h"
 
 #include <iostream>
@@ -19,8 +22,8 @@ void Expect(bool condition, const std::string& message) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "usage: vdif_unpack_config_test CONFIG\n";
+    if (argc != 4) {
+        std::cerr << "usage: vdif_unpack_config_test LEGACY_CONFIG OBSERVATION WIRE\n";
         return 2;
     }
     namespace unpack = rdma_dada::modules::vdif_unpack;
@@ -109,7 +112,7 @@ int main(int argc, char** argv) {
                                             &layout, &error),
            "configured allocation cap is enforced");
     rdma_dada::PacketFormatConfig mismatch = packet;
-    mismatch.payload_bytes += 8U;
+    mismatch.sample_format = "CI16";
     Expect(!unpack::ComputeVdifUnpackLayout(config, pipeline, mismatch,
                                             &layout, &error),
            "packet profile mismatch rejected");
@@ -121,6 +124,39 @@ int main(int argc, char** argv) {
     Expect(!unpack::ComputeVdifUnpackLayout(invalid, huge, packet,
                                             &layout, &error),
            "window arithmetic overflow rejected");
+
+    rdma_dada::ObservationConfig observation;
+    rdma_dada::PacketFormatConfig resolved_wire;
+    rdma_dada::ResolvedObservationPlan plan;
+    error.clear();
+    Expect(rdma_dada::LoadObservationConfig(argv[2], &observation, &error) &&
+               rdma_dada::LoadPacketFormatConfig(argv[3], &resolved_wire,
+                                                  &error) &&
+               rdma_dada::ResolveObservationPlan(observation, resolved_wire,
+                                                  &plan, &error) &&
+               rdma_dada::ComputeObservationIdentities(&plan, &error),
+           "resolved observation fixture: " + error);
+    unpack::VdifUnpackConfig resolved_config = {};
+    rdma_dada::PipelineConfig resolved_pipeline = {};
+    rdma_dada::PipelineLayout resolved_pipeline_layout = {};
+    unpack::VdifUnpackLayout resolved_unpack_layout = {};
+    error.clear();
+    Expect(unpack::BuildVdifUnpackRuntimeFromResolvedPlan(
+               plan, &resolved_config, &resolved_pipeline,
+               &resolved_pipeline_layout, &resolved_unpack_layout, &error),
+           "resolved plan builds unpack runtime: " + error);
+    Expect(resolved_config.input_key == 0x00d2U &&
+               resolved_config.output_key == 0x00d4U,
+           "resolved plan owns both ring keys");
+    Expect(resolved_config.antenna_map == observation.station_ids,
+           "resolved Station order owns the A axis");
+    Expect(resolved_config.config_id == plan.config_id &&
+               resolved_config.geometry_id == plan.geometry_id,
+           "runtime carries both plan identities");
+    Expect(resolved_pipeline_layout.raw_block_bytes == 8454144U &&
+               resolved_unpack_layout.compute_block_bytes == 8388608U &&
+               resolved_unpack_layout.window_bytes == 16777216U,
+           "runtime uses exact resolved block/window geometry");
 
     if (failures) return 1;
     std::cout << "vdif_unpack_config_test passed\n";

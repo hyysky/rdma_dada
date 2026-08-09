@@ -35,8 +35,12 @@ endif()
 
 add_library(rdma_pipeline_config STATIC
     src/config/json_value.cpp
+    src/config/observation_config.cpp
     src/config/packet_format_config.cpp
     src/config/pipeline_config.cpp
+    src/config/resolved_observation_plan.cpp
+    src/config/resolved_plan_json.cpp
+    src/config/sha256.cpp
     src/pipeline/dada_header_builder.cpp)
 target_include_directories(rdma_pipeline_config
     PUBLIC
@@ -62,11 +66,21 @@ add_library(rdma_module_vdif_unpack STATIC
     modules/vdif_unpack/project_vdif_v1.cpp
     modules/vdif_unpack/vdif_unpack_config.cpp
     modules/vdif_unpack/vdif_unpack_engine.cpp
-    modules/vdif_unpack/vdif_unpack_header.cpp)
+    modules/vdif_unpack/vdif_unpack_header.cpp
+    modules/vdif_unpack/vdif_timeline.cpp)
 target_include_directories(rdma_module_vdif_unpack
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rdma_module_vdif_unpack PUBLIC rdma_pipeline_core)
+
+add_library(rdma_observation_compiler STATIC
+    src/config/observation_artifacts.cpp)
+target_include_directories(rdma_observation_compiler
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rdma_observation_compiler PUBLIC
+    rdma_module_vdif_unpack
+    rdma_pipeline_config)
 
 add_library(rdma_vdif_sender_sim STATIC
     src/simulation/vdif_sender_sim.cpp
@@ -207,6 +221,11 @@ target_link_libraries(pipeline_config_inspect PRIVATE rdma_pipeline_config)
 add_executable(packet_format_inspect tools/packet_format_inspect.cpp)
 target_link_libraries(packet_format_inspect PRIVATE rdma_pipeline_config)
 
+add_executable(observation_config_compile
+    tools/observation_config_compile.cpp)
+target_link_libraries(observation_config_compile PRIVATE
+    rdma_observation_compiler)
+
 add_executable(pipeline_worker_config_inspect
     tools/pipeline_worker_config_inspect.cpp)
 target_link_libraries(pipeline_worker_config_inspect PRIVATE rdma_pipeline_core)
@@ -224,6 +243,8 @@ if(BUILD_TESTING)
     target_link_libraries(vdif_unpack_config_test PRIVATE rdma_module_vdif_unpack)
     add_executable(vdif_unpack_header_test tests/vdif_unpack_header_test.cpp)
     target_link_libraries(vdif_unpack_header_test PRIVATE rdma_module_vdif_unpack)
+    add_executable(vdif_timeline_test tests/vdif_timeline_test.cpp)
+    target_link_libraries(vdif_timeline_test PRIVATE rdma_module_vdif_unpack)
     add_executable(vdif_unpack_engine_test tests/vdif_unpack_engine_test.cpp)
     target_link_libraries(vdif_unpack_engine_test PRIVATE rdma_module_vdif_unpack)
     add_executable(group_block_writer_test tests/group_block_writer_test.cpp)
@@ -244,6 +265,18 @@ if(BUILD_TESTING)
         rdma_pipeline_config)
     add_executable(pipeline_config_test tests/pipeline_config_test.cpp)
     target_link_libraries(pipeline_config_test PRIVATE rdma_pipeline_config)
+    add_executable(observation_config_test tests/observation_config_test.cpp)
+    target_link_libraries(observation_config_test PRIVATE rdma_pipeline_config)
+    add_executable(resolved_observation_plan_test
+        tests/resolved_observation_plan_test.cpp)
+    target_link_libraries(resolved_observation_plan_test PRIVATE
+        rdma_pipeline_config)
+    add_executable(config_identity_test tests/config_identity_test.cpp)
+    target_link_libraries(config_identity_test PRIVATE rdma_pipeline_config)
+    add_executable(observation_artifacts_test
+        tests/observation_artifacts_test.cpp)
+    target_link_libraries(observation_artifacts_test PRIVATE
+        rdma_observation_compiler)
     add_executable(packet_format_config_test
         tests/packet_format_config_test.cpp)
     target_link_libraries(packet_format_config_test PRIVATE
@@ -312,10 +345,15 @@ if(BUILD_TESTING)
     add_test(
         NAME vdif_unpack_config_test
         COMMAND vdif_unpack_config_test
-                ${CMAKE_CURRENT_SOURCE_DIR}/config/vdif_unpack.example.json)
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/vdif_unpack.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
     add_test(
         NAME vdif_unpack_header_test
         COMMAND vdif_unpack_header_test)
+    add_test(
+        NAME vdif_timeline_test
+        COMMAND vdif_timeline_test)
     add_test(
         NAME vdif_unpack_engine_test
         COMMAND vdif_unpack_engine_test)
@@ -335,6 +373,24 @@ if(BUILD_TESTING)
         COMMAND pipeline_config_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline.example.json)
     add_test(
+        NAME observation_config_test
+        COMMAND observation_config_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
+    add_test(
+        NAME resolved_observation_plan_test
+        COMMAND resolved_observation_plan_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
+    add_test(
+        NAME config_identity_test
+        COMMAND config_identity_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
+    add_test(
+        NAME observation_artifacts_test
+        COMMAND observation_artifacts_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
+    add_test(
         NAME packet_format_config_test
         COMMAND packet_format_config_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/packet_formats/frontend.example-v1.json)
@@ -353,6 +409,12 @@ if(BUILD_TESTING)
     set_tests_properties(pipeline_config_rejects_legacy_test
         PROPERTIES WILL_FAIL TRUE)
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME observation_config_compile_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/observation_config_compile_test.py
+                    $<TARGET_FILE:observation_config_compile>
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
         add_test(
             NAME fpga_sender_sim_loopback_test
             COMMAND ${Python3_EXECUTABLE}

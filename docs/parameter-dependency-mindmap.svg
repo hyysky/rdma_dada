@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1500" viewBox="0 0 2200 1500">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eef2ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowSlate" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      .title { font: 700 48px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 23px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .hubTitle { font: 700 34px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #ffffff; }
+      .hubSub { font: 500 20px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #dbeafe; }
+      .inputHead { font: 700 22px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #1e3a8a; }
+      .inputText { font: 500 18px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #334155; }
+      .cardHead { font: 700 26px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .cardText { font: 500 19px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #334155; }
+      .formula { font: 600 18px ui-monospace,SFMono-Regular,Menlo,monospace; fill: #0f172a; }
+      .small { font: 500 17px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .edgeLabel { font: 600 17px 'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif; fill: #2563eb; }
+      .edge { fill: none; stroke: #2563eb; stroke-width: 4; marker-end: url(#arrowBlue); }
+      .dependency { fill: none; stroke: #64748b; stroke-width: 3; stroke-dasharray: 10 9; marker-end: url(#arrowSlate); }
+    </style>
+  </defs>
+
+  <rect width="2200" height="1500" fill="url(#background)"/>
+  <text x="1100" y="66" text-anchor="middle" class="title">Pipeline 参数依赖关系</text>
+  <text x="1100" y="105" text-anchor="middle" class="subtitle">用户只输入观测事实与运行策略；尺寸、速率、时间线和各阶段 Header 统一派生</text>
+
+  <!-- Dependency edges behind nodes -->
+  <path class="edge" d="M1100 455 C1100 390,1100 330,1100 300"/>
+  <path class="edge" d="M1420 610 C1510 540,1560 450,1605 390"/>
+  <path class="edge" d="M1420 750 C1530 750,1580 700,1630 670"/>
+  <path class="edge" d="M1410 920 C1515 970,1550 1040,1585 1080"/>
+  <path class="edge" d="M1100 1050 C1100 1120,1100 1160,1100 1190"/>
+  <path class="edge" d="M790 930 C690 990,650 1060,610 1110"/>
+  <path class="edge" d="M780 730 C665 700,625 650,575 610"/>
+
+  <!-- Cross dependencies -->
+  <path class="dependency" d="M1540 390 C1600 420,1690 445,1750 485"/>
+  <path class="dependency" d="M1870 800 C1870 840,1820 880,1780 915"/>
+  <path class="dependency" d="M1510 1100 C1430 1180,1350 1220,1280 1250"/>
+  <path class="dependency" d="M750 1250 C665 1230,620 1215,590 1190"/>
+  <path class="dependency" d="M360 990 C310 900,315 820,360 750"/>
+  <path class="dependency" d="M850 300 C760 350,700 405,620 470"/>
+
+  <text x="1118" y="365" class="edgeLabel">时间输入</text>
+  <text x="1465" y="520" class="edgeLabel">包格式输入</text>
+  <text x="1475" y="720" class="edgeLabel">Block 策略</text>
+  <text x="1480" y="1010" class="edgeLabel">重排策略</text>
+  <text x="1118" y="1138" class="edgeLabel">算法配置</text>
+  <text x="650" y="1025" class="edgeLabel">全阶段结果</text>
+  <text x="620" y="690" class="edgeLabel">统一配置</text>
+
+  <!-- Center user-input area -->
+  <rect x="760" y="410" width="680" height="660" rx="42" fill="#eff6ff" stroke="#60a5fa" stroke-width="4" stroke-dasharray="12 10"/>
+  <rect x="870" y="610" width="460" height="125" rx="62" fill="#2563eb" filter="url(#shadow)"/>
+  <text x="1100" y="660" text-anchor="middle" class="hubTitle">用户输入参数</text>
+  <text x="1100" y="697" text-anchor="middle" class="hubSub">唯一真源，不直接填写任何字节数</text>
+
+  <rect x="825" y="450" width="550" height="125" rx="22" fill="#ffffff" stroke="#93c5fd" stroke-width="3"/>
+  <text x="1100" y="487" text-anchor="middle" class="inputHead">观测事实</text>
+  <text x="1100" y="521" text-anchor="middle" class="inputText">开始时间、观测时长、Station ID 列表</text>
+  <text x="1100" y="550" text-anchor="middle" class="inputText">起始通道、通道数、极化数、单 sample 间隔</text>
+
+  <rect x="790" y="770" width="290" height="120" rx="20" fill="#ffffff" stroke="#93c5fd" stroke-width="3"/>
+  <text x="935" y="808" text-anchor="middle" class="inputHead">包格式</text>
+  <text x="935" y="841" text-anchor="middle" class="inputText">VDIF profile</text>
+  <text x="935" y="870" text-anchor="middle" class="inputText">每包 sample 数、CI8/CI16</text>
+
+  <rect x="1120" y="770" width="290" height="120" rx="20" fill="#ffffff" stroke="#93c5fd" stroke-width="3"/>
+  <text x="1265" y="808" text-anchor="middle" class="inputHead">Block 与 Ring 策略</text>
+  <text x="1265" y="841" text-anchor="middle" class="inputText">每 block 的 group 数</text>
+  <text x="1265" y="870" text-anchor="middle" class="inputText">Ring block 数、Window block 数</text>
+
+  <rect x="790" y="920" width="290" height="115" rx="20" fill="#ffffff" stroke="#93c5fd" stroke-width="3"/>
+  <text x="935" y="958" text-anchor="middle" class="inputHead">算法配置</text>
+  <text x="935" y="991" text-anchor="middle" class="inputText">权重、精度、产品类型</text>
+  <text x="935" y="1020" text-anchor="middle" class="inputText">积分长度与运算</text>
+
+  <rect x="1120" y="920" width="290" height="115" rx="20" fill="#ffffff" stroke="#93c5fd" stroke-width="3"/>
+  <text x="1265" y="958" text-anchor="middle" class="inputHead">部署配置</text>
+  <text x="1265" y="991" text-anchor="middle" class="inputText">Ring key、NIC、IP、端口</text>
+  <text x="1265" y="1020" text-anchor="middle" class="inputText">CPU / NUMA / GPU 绑定</text>
+
+  <!-- Outer derived cards -->
+  <g filter="url(#shadow)">
+    <rect x="790" y="145" width="620" height="155" rx="26" fill="#fefce8" stroke="#eab308" stroke-width="4"/>
+  </g>
+  <text x="1100" y="184" text-anchor="middle" class="cardHead">时间线参数</text>
+  <text x="830" y="224" class="formula">GROUP_PERIOD_PS = T_pkt × sample_interval_ps</text>
+  <text x="830" y="258" class="formula">EXPECTED_GROUPS = duration_ps ÷ GROUP_PERIOD_PS</text>
+  <text x="830" y="286" class="small">同时派生 reference epoch、start seconds、start frame</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1510" y="145" width="610" height="245" rx="26" fill="#fff7ed" stroke="#f97316" stroke-width="4"/>
+  </g>
+  <text x="1815" y="187" text-anchor="middle" class="cardHead">Packet 几何</text>
+  <text x="1550" y="228" class="formula">NANT = Station ID 数量</text>
+  <text x="1550" y="262" class="formula">sample_bytes = CI8 ? 2 : 4</text>
+  <text x="1550" y="296" class="formula">payload = T_pkt × F × P × sample_bytes</text>
+  <text x="1550" y="330" class="formula">raw_record = 32 + payload</text>
+  <text x="1550" y="365" class="small">校验 Project VDIF header、TFP 布局及字段范围</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1630" y="485" width="490" height="315" rx="26" fill="#f0fdf4" stroke="#22c55e" stroke-width="4"/>
+  </g>
+  <text x="1875" y="527" text-anchor="middle" class="cardHead">Raw Ring 参数</text>
+  <text x="1670" y="570" class="formula">records_per_block = G × A</text>
+  <text x="1670" y="607" class="formula">raw_block = G × A × (32 + payload)</text>
+  <text x="1670" y="644" class="formula">raw_ring = raw_block × raw_blocks</text>
+  <text x="1670" y="688" class="cardText">RAW Header</text>
+  <text x="1670" y="722" class="small">DATA_STAGE=RAW，ORDER=TFP</text>
+  <text x="1670" y="750" class="small">RECORD_HEADER_BYTES=32</text>
+  <text x="1670" y="778" class="small">包含乱序的 VDIF header + payload</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1510" y="915" width="610" height="260" rx="26" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="4"/>
+  </g>
+  <text x="1815" y="958" text-anchor="middle" class="cardHead">ATFP Window 与 Compute Ring</text>
+  <text x="1550" y="1001" class="formula">T_block = G × T_pkt</text>
+  <text x="1550" y="1037" class="formula">compute_block = G × A × payload</text>
+  <text x="1550" y="1073" class="formula">window_payload = window_blocks × compute_block</text>
+  <text x="1550" y="1110" class="formula">compute_ring = compute_block × compute_blocks</text>
+  <text x="1550" y="1145" class="small">Window 与 Compute 均不保存 32-byte VDIF header</text>
+
+  <g filter="url(#shadow)">
+    <rect x="750" y="1190" width="700" height="245" rx="26" fill="#ecfeff" stroke="#06b6d4" stroke-width="4"/>
+  </g>
+  <text x="1100" y="1233" text-anchor="middle" class="cardHead">GPU 算法阶段参数</text>
+  <text x="790" y="1275" class="formula">ATFP/CI8 → TFPA/CF32 → TFPB/CF32</text>
+  <text x="790" y="1311" class="formula">Power: TFPB/F32　Stokes: TFBS/F32</text>
+  <text x="790" y="1347" class="formula">Integration: T_out = T_in ÷ K</text>
+  <text x="790" y="1385" class="small">逐阶段派生维度、类型、BLOCK_NTIME、输出 block 大小与速率</text>
+
+  <g filter="url(#shadow)">
+    <rect x="80" y="915" width="620" height="300" rx="26" fill="#fdf2f8" stroke="#ec4899" stroke-width="4"/>
+  </g>
+  <text x="390" y="958" text-anchor="middle" class="cardHead">各阶段 DADA Header</text>
+  <text x="120" y="1002" class="cardText">RAW → UNPACKED → CONVERTED → BEAMFORMED</text>
+  <text x="120" y="1040" class="cardText">→ POWER / STOKES → INTEGRATED</text>
+  <text x="120" y="1083" class="small">每一级复用生产模块的 Header 变换函数</text>
+  <text x="120" y="1117" class="small">派生 ORDER、DATA_STAGE、RESOLUTION、</text>
+  <text x="120" y="1148" class="small">BYTES_PER_SECOND、TRANSFER_SIZE、FILE_SIZE</text>
+  <text x="120" y="1183" class="small">模块输入输出不兼容时，预检直接失败</text>
+
+  <g filter="url(#shadow)">
+    <rect x="80" y="420" width="620" height="330" rx="26" fill="#eff6ff" stroke="#3b82f6" stroke-width="4"/>
+  </g>
+  <text x="390" y="464" text-anchor="middle" class="cardHead">统一配置编译与一致性门禁</text>
+  <text x="120" y="508" class="cardText">ResolvedObservationPlan（唯一派生结果）</text>
+  <text x="120" y="550" class="formula">CONFIG_ID = SHA256(规范化完整配置)</text>
+  <text x="120" y="586" class="formula">GEOMETRY_ID = SHA256(数据几何参数)</text>
+  <text x="120" y="630" class="small">统一生成 ring plan、进程 JSON、DADA Header</text>
+  <text x="120" y="664" class="small">rdma2dada / unpack / pipeline_worker 校验同一 ID</text>
+  <text x="120" y="698" class="small">先 preflight，配置通过后才能创建 Ring 和启动进程</text>
+  <text x="120" y="730" class="small">禁止命令行覆盖任何数据几何参数</text>
+
+  <rect x="80" y="1280" width="560" height="155" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="3"/>
+  <text x="110" y="1320" class="cardHead">图例</text>
+  <line x1="115" y1="1355" x2="200" y2="1355" stroke="#2563eb" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <text x="225" y="1362" class="small">用户输入驱动的一级派生</text>
+  <line x1="115" y1="1397" x2="200" y2="1397" stroke="#64748b" stroke-width="3" stroke-dasharray="10 9" marker-end="url(#arrowSlate)"/>
+  <text x="225" y="1404" class="small">派生结果之间的依赖</text>
+</svg>

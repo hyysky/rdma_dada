@@ -1,8 +1,13 @@
 #include "rdma_dada/config/packet_format_config.h"
 
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
+
+#include <unistd.h>
 
 namespace {
 
@@ -15,6 +20,59 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
+std::string WithoutOutputOrder(const std::string& source) {
+    std::string result = source;
+    const std::string::size_type field = result.find("\"output_order\"");
+    if (field == std::string::npos) return result;
+    const std::string::size_type line_begin = result.rfind('\n', field);
+    const std::string::size_type line_end = result.find('\n', field);
+    if (line_begin == std::string::npos || line_end == std::string::npos)
+        return result;
+    result.erase(line_begin + 1U, line_end - line_begin);
+    return result;
+}
+
+std::string WithLegacyOutputOrder(const std::string& wire_only) {
+    std::string result = wire_only;
+    const std::string marker = "\"packed_order\": [\"T\", \"F\", \"P\"],";
+    const std::string::size_type position = result.find(marker);
+    if (position != std::string::npos) {
+        result.insert(position + marker.size(),
+                      "\n    \"output_order\": [\"T\", \"F\", \"P\", \"A\"],");
+    }
+    return result;
+}
+
+std::string WithLegacyPayloadBytes(const std::string& wire_only) {
+    std::string result = wire_only;
+    const std::string marker = "\"application_header_bytes\": 32";
+    const std::string::size_type position = result.find(marker);
+    if (position != std::string::npos) {
+        result.insert(position + marker.size(), ",\n    \"payload_bytes\": 12288");
+    }
+    return result;
+}
+
+std::string WithSchemaVersionOne(const std::string& wire_only) {
+    std::string result = wire_only;
+    const std::string marker = "\"schema_version\": 2";
+    const std::string::size_type position = result.find(marker);
+    if (position != std::string::npos) {
+        result.replace(position, marker.size(), "\"schema_version\": 1");
+    }
+    return result;
+}
+
+std::string WriteTemporary(const std::string& suffix,
+                           const std::string& contents) {
+    std::ostringstream path;
+    path << "/tmp/rdma_dada_packet_format_" << static_cast<long>(getpid())
+         << '_' << suffix << ".json";
+    std::ofstream output(path.str().c_str());
+    output << contents;
+    return path.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -23,16 +81,46 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    std::ifstream source(argv[1]);
+    std::ostringstream buffer;
+    buffer << source.rdbuf();
+    const std::string wire_only = WithoutOutputOrder(buffer.str());
+    const std::string wire_path = WriteTemporary("wire", wire_only);
+    const std::string legacy_path = WriteTemporary(
+        "legacy", WithLegacyOutputOrder(wire_only));
+    const std::string payload_path = WriteTemporary(
+        "payload", WithLegacyPayloadBytes(wire_only));
+    const std::string schema_v1_path = WriteTemporary(
+        "schema-v1", WithSchemaVersionOne(WithLegacyPayloadBytes(wire_only)));
+
     rdma_dada::PacketFormatConfig config;
     std::string error;
-    Expect(rdma_dada::LoadPacketFormatConfig(argv[1], &config, &error),
-           "example packet format should load: " + error);
+    Expect(rdma_dada::LoadPacketFormatConfig(wire_path, &config, &error),
+           "wire-only packet format should load without output_order: " +
+               error);
+    rdma_dada::PacketFormatConfig unpublished = config;
+    error.clear();
+    Expect(!rdma_dada::LoadPacketFormatConfig(legacy_path, &unpublished,
+                                              &error),
+           "legacy payload.output_order is rejected as a non-wire field");
+    error.clear();
+    Expect(!rdma_dada::LoadPacketFormatConfig(payload_path, &unpublished,
+                                              &error),
+           "observation-specific record.payload_bytes is rejected");
+    error.clear();
+    Expect(!rdma_dada::LoadPacketFormatConfig(schema_v1_path, &unpublished,
+                                              &error),
+           "schema v1 profile requires migration");
+    Expect(error.find("schema_version 1") != std::string::npos,
+           "schema v1 rejection identifies the migration source");
+    std::remove(wire_path.c_str());
+    std::remove(legacy_path.c_str());
+    std::remove(payload_path.c_str());
+    std::remove(schema_v1_path.c_str());
     if (failures == 0) {
-        Expect(config.schema_version == 1, "schema version is retained");
+        Expect(config.schema_version == 2, "wire profile schema version is 2");
         Expect(config.application_header_bytes == 32,
                "Project VDIF v1 header is exactly 32 bytes");
-        Expect(config.payload_bytes == 12288,
-               "payload byte count is retained");
         static const char* const expected_field_names[] = {
             "invalid_data", "legacy_mode", "seconds_from_reference_epoch",
             "word1_reserved", "reference_epoch",
@@ -93,7 +181,7 @@ int main(int argc, char** argv) {
                    config.packed_order[2] == "P",
                "payload packed order is slowest-to-fastest TFP");
         Expect(config.axes.size() == 4,
-               "all logical TFPA axes are retained");
+               "wire axes and Station-to-A lookup semantics are retained");
         Expect(config.axes[0].extent.source ==
                    rdma_dada::PacketAxisValueSource::kHeader &&
                    config.axes[0].extent.reference == "nsamp_per_packet",
@@ -111,8 +199,8 @@ int main(int argc, char** argv) {
         rdma_dada::PacketFormatConfig ci16 = config;
         ci16.sample_format = "CI16";
         error.clear();
-        Expect(rdma_dada::ValidatePacketFormatConfig(ci16, &error),
-               "the fixed profile also accepts CI16 payloads: " + error);
+        Expect(!rdma_dada::ValidatePacketFormatConfig(ci16, &error),
+               "schema v2 fixes the first wire profile to CI8");
 
         rdma_dada::PacketFormatConfig overlapping = config;
         rdma_dada::ApplicationHeaderField duplicate =
@@ -203,31 +291,15 @@ int main(int argc, char** argv) {
                                                       &error),
                "packed order must contain each TFPA axis exactly once");
 
-        rdma_dada::PacketFormatConfig partial_sample = config;
-        partial_sample.payload_bytes = 12287;
+        rdma_dada::PacketFormatConfig literal_frequency_extent = config;
+        literal_frequency_extent.axes[1].extent.source =
+            rdma_dada::PacketAxisValueSource::kConstant;
+        literal_frequency_extent.axes[1].extent.constant = 2U;
+        literal_frequency_extent.axes[1].extent.reference.clear();
         error.clear();
-        Expect(!rdma_dada::ValidatePacketFormatConfig(partial_sample, &error),
-               "payload bytes must contain complete complex samples");
-
-        rdma_dada::PacketFormatConfig unaligned_frame = config;
-        unaligned_frame.payload_bytes = 12286;
-        error.clear();
-        Expect(!rdma_dada::ValidatePacketFormatConfig(unaligned_frame, &error),
-               "header plus payload must be aligned to eight bytes");
-
-        rdma_dada::PacketFormatConfig frame_overflow = config;
-        frame_overflow.payload_bytes =
-            std::numeric_limits<std::uint64_t>::max() - 15U;
-        error.clear();
-        Expect(!rdma_dada::ValidatePacketFormatConfig(frame_overflow, &error),
-               "header plus payload arithmetic must reject overflow");
-
-        rdma_dada::PacketFormatConfig frame_length_overflow = config;
-        frame_length_overflow.payload_bytes = UINT64_C(134217696);
-        error.clear();
-        Expect(!rdma_dada::ValidatePacketFormatConfig(frame_length_overflow,
-                                                      &error),
-               "frame length must fit the Word 2 24-bit unit field");
+        Expect(!rdma_dada::ValidatePacketFormatConfig(
+                   literal_frequency_extent, &error),
+               "wire profile must not contain an observation F extent");
     }
 
     if (failures != 0) return 1;

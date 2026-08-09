@@ -231,17 +231,6 @@ std::uint32_t FieldStorageBits(PacketFieldType type) {
     return 0;
 }
 
-bool CheckedMultiply(std::uint64_t left, std::uint64_t right,
-                     const std::string& name, std::uint64_t* output,
-                     std::string* error) {
-    if (left != 0U &&
-        right > std::numeric_limits<std::uint64_t>::max() / left) {
-        return Fail(name + " exceeds uint64 range", error);
-    }
-    *output = left * right;
-    return true;
-}
-
 bool IsReferenceName(const std::string& value, bool allow_dots) {
     if (value.empty()) return false;
     bool segment_start = true;
@@ -330,7 +319,11 @@ bool IsSignedPacketFieldType(PacketFieldType type) {
 
 bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
                                 std::string* error) {
-    if (config.schema_version != 1U) {
+    if (config.schema_version == 1U) {
+        return Fail("packet format schema_version 1 contains observation "
+                    "geometry; migrate to schema_version 2", error);
+    }
+    if (config.schema_version != 2U) {
         return Fail("unsupported packet format schema_version", error);
     }
     if (config.format_id != "project-vdif-v1") {
@@ -339,17 +332,14 @@ bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
     if (config.application_header_bytes != 32U) {
         return Fail("record.application_header_bytes must be 32", error);
     }
-    if (config.payload_bytes == 0U) {
-        return Fail("record.payload_bytes must be greater than zero", error);
-    }
     if (config.bit_numbering != "LSB0") {
         return Fail("application_header.bit_numbering must be LSB0", error);
     }
     if (config.header_fields.empty()) {
         return Fail("application_header.fields must not be empty", error);
     }
-    if (config.sample_format != "CI8" && config.sample_format != "CI16") {
-        return Fail("payload.sample_format must be CI8 or CI16", error);
+    if (config.sample_format != "CI8") {
+        return Fail("payload.sample_format must be CI8", error);
     }
     if (config.sample_encoding != "TWOS_COMPLEMENT") {
         return Fail("payload.sample_encoding must be TWOS_COMPLEMENT", error);
@@ -437,9 +427,9 @@ bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
     }
 
     static const char* const expected_axes[] = {"T", "F", "P", "A"};
-    if (config.packed_order.size() != 3U ||
-        config.output_order.size() != 4U || config.axes.size() != 4U) {
-        return Fail("payload must define packed TFP and output TFPA axes", error);
+    if (config.packed_order.size() != 3U || config.axes.size() != 4U) {
+        return Fail("payload must define packed TFP and Station lookup axes",
+                    error);
     }
     static const char* const expected_packed_axes[] = {"T", "F", "P"};
     for (std::size_t index = 0; index < 3U; ++index) {
@@ -448,12 +438,7 @@ bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
         }
     }
     std::set<std::string> described_axes;
-    bool all_extents_are_constant = true;
-    std::uint64_t constant_sample_count = 1U;
     for (std::size_t index = 0; index < 4U; ++index) {
-        if (config.output_order[index] != expected_axes[index]) {
-            return Fail("payload.output_order must be TFPA", error);
-        }
         const PacketPayloadAxis& axis = config.axes[index];
         if (!described_axes.insert(axis.name).second) {
             return Fail("payload axis names must be unique", error);
@@ -463,19 +448,12 @@ bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
                 return Fail("constant payload extent must be greater than zero",
                             error);
             }
-            if (!CheckedMultiply(constant_sample_count, axis.extent.constant,
-                                 "constant payload sample count",
-                                 &constant_sample_count, error)) {
-                return false;
-            }
         } else if (axis.extent.source == PacketAxisValueSource::kConfig) {
-            all_extents_are_constant = false;
             if (!IsReferenceName(axis.extent.reference, true)) {
                 return Fail("CONFIG payload extent reference is invalid",
                             error);
             }
         } else if (axis.extent.source == PacketAxisValueSource::kHeader) {
-            all_extents_are_constant = false;
             if (!IsReferenceName(axis.extent.reference, false) ||
                 field_names.count(axis.extent.reference) == 0U) {
                 return Fail(
@@ -547,44 +525,10 @@ bool ValidatePacketFormatConfig(const PacketFormatConfig& config,
         !AxisValueEquals(config.axes[3].origin,
                          PacketAxisValueSource::kLookup, 0, "antenna_map",
                          "station_id")) {
-        return Fail("payload.axes must use the Project VDIF v1 TFP-to-TFPA mapping",
+        return Fail("payload.axes must use Project VDIF v1 TFP and Station-to-A semantics",
                     error);
     }
 
-    const std::uint64_t sample_bytes = config.sample_format == "CI8" ? 2U : 4U;
-    if (config.payload_bytes % sample_bytes != 0U) {
-        return Fail("record.payload_bytes must contain complete complex samples",
-                    error);
-    }
-    if (config.payload_bytes >
-        std::numeric_limits<std::uint64_t>::max() -
-            config.application_header_bytes) {
-        return Fail("Project VDIF frame byte count exceeds uint64 range", error);
-    }
-    const std::uint64_t frame_bytes =
-        config.application_header_bytes + config.payload_bytes;
-    if (frame_bytes % 8U != 0U) {
-        return Fail("Project VDIF frame byte count must be divisible by 8",
-                    error);
-    }
-    if (frame_bytes / 8U > UINT64_C(0xffffff)) {
-        return Fail(
-            "Project VDIF frame length exceeds the Word 2 24-bit unit field",
-            error);
-    }
-    if (all_extents_are_constant) {
-        std::uint64_t described_payload_bytes = 0;
-        if (!CheckedMultiply(constant_sample_count, sample_bytes,
-                             "constant payload byte count",
-                             &described_payload_bytes, error)) {
-            return false;
-        }
-        if (described_payload_bytes != config.payload_bytes) {
-            return Fail(
-                "constant payload axis geometry does not match record.payload_bytes",
-                error);
-        }
-    }
     return true;
 }
 
@@ -618,6 +562,13 @@ bool LoadPacketFormatConfig(const std::string& path,
                     error)) {
         return false;
     }
+    if (parsed.schema_version == 1U) {
+        return Fail("packet format schema_version 1 contains observation "
+                    "geometry; migrate to schema_version 2", error);
+    }
+    if (parsed.schema_version != 2U) {
+        return Fail("unsupported packet format schema_version", error);
+    }
 
     const json::Value::Object* record = NULL;
     const json::Value::Object* application_header = NULL;
@@ -629,13 +580,11 @@ bool LoadPacketFormatConfig(const std::string& path,
                        error)) {
         return false;
     }
-    static const char* const record_keys[] = {
-        "application_header_bytes", "payload_bytes"
-    };
+    static const char* const record_keys[] = {"application_header_bytes"};
     static const char* const header_keys[] = {"bit_numbering", "fields"};
     static const char* const payload_keys[] = {
         "sample_format", "sample_encoding", "component_order", "endian",
-        "packed_order", "output_order", "axes"
+        "packed_order", "axes"
     };
     if (!RequireExactKeys(*record, record_keys,
                           sizeof(record_keys) / sizeof(record_keys[0]),
@@ -648,8 +597,6 @@ bool LoadPacketFormatConfig(const std::string& path,
                           "payload", error) ||
         !ReadUint64(*record, "application_header_bytes", "record",
                     &parsed.application_header_bytes, error) ||
-        !ReadUint64(*record, "payload_bytes", "record", &parsed.payload_bytes,
-                    error) ||
         !ReadString(*application_header, "bit_numbering",
                     "application_header", &parsed.bit_numbering, error) ||
         !ReadString(*payload, "sample_format", "payload",
@@ -665,9 +612,7 @@ bool LoadPacketFormatConfig(const std::string& path,
         !ParseEndianness(payload_endian, "payload.endian",
                          &parsed.payload_endianness, error) ||
         !ReadStringArray(Field(*payload, "packed_order"),
-                         "payload.packed_order", &parsed.packed_order, error) ||
-        !ReadStringArray(Field(*payload, "output_order"),
-                         "payload.output_order", &parsed.output_order, error)) {
+                         "payload.packed_order", &parsed.packed_order, error)) {
         return false;
     }
 

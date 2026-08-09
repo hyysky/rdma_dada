@@ -2,6 +2,7 @@
 
 #include "rdma_dada/config/packet_format_config.h"
 #include "rdma_dada/config/pipeline_config.h"
+#include "rdma_dada/config/resolved_observation_plan.h"
 
 #include <cstdint>
 #include <string>
@@ -12,6 +13,8 @@ namespace modules {
 namespace vdif_unpack {
 
 struct VdifUnpackConfig {
+    std::string config_id;
+    std::string geometry_id;
     std::uint32_t input_key;
     std::uint32_t output_key;
     std::string pipeline_config_path;
@@ -42,6 +45,14 @@ bool ComputeVdifUnpackLayout(const VdifUnpackConfig& config,
                              const PacketFormatConfig& packet,
                              VdifUnpackLayout* layout,
                              std::string* error);
+
+bool BuildVdifUnpackRuntimeFromResolvedPlan(
+    const ResolvedObservationPlan& plan,
+    VdifUnpackConfig* config,
+    PipelineConfig* pipeline,
+    PipelineLayout* pipeline_layout,
+    VdifUnpackLayout* unpack_layout,
+    std::string* error);
 
 }  // namespace vdif_unpack
 }  // namespace modules

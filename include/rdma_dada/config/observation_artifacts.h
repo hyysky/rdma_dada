@@ -1,0 +1,34 @@
+#pragma once
+
+#include "rdma_dada/config/resolved_observation_plan.h"
+#include "rdma_dada/pipeline/metadata.h"
+
+#include <string>
+
+namespace rdma_dada {
+
+struct ObservationArtifacts {
+    ResolvedObservationPlan plan;
+    pipeline::Metadata raw_header;
+    pipeline::Metadata unpacked_header;
+    std::string resolved_plan_json;
+    std::string ring_plan_json;
+    std::string validation_report_json;
+};
+
+bool BuildObservationArtifacts(const std::string& observation_path,
+                               ObservationArtifacts* artifacts,
+                               std::string* error);
+
+bool BuildObservationArtifactsFromResolvedPlan(
+    const ResolvedObservationPlan& plan,
+    ObservationArtifacts* artifacts,
+    std::string* error);
+
+// Writes a new artifact directory through a sibling staging directory. The
+// destination must not already exist.
+bool WriteObservationArtifacts(const ObservationArtifacts& artifacts,
+                               const std::string& output_directory,
+                               std::string* error);
+
+}  // namespace rdma_dada

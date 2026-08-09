@@ -1,13 +1,54 @@
 # Pipeline configuration
 
+## Unified observation configuration
+
+`observation.example.json` is the schema-v1 user input for the ongoing unified
+configuration migration; `observation-v1.schema.json` documents the same strict
+contract. The production C++ parser rejects missing and unknown fields.
+
+User-entered fields cover observation timing, ordered Station IDs, channel and
+polarization selection, telescope/frequency metadata, packet samples, block and
+ring policy, receiver endpoint, storage policy and algorithm selection. Paths
+are resolved relative to the observation JSON. Byte sizes and DADA headers are
+not user inputs; `observation_config_compile` derives them from this file and
+the fixed wire profile.
+
+Preflight only:
+
+```sh
+build/observation_config_compile \
+  --config config/observation.example.json \
+  --preflight-only
+```
+
+Generate a new atomic artifact directory:
+
+```sh
+build/observation_config_compile \
+  --config config/observation.example.json \
+  --output-dir observation-artifacts
+```
+
+The destination must not already exist. It contains the verified resolved
+configuration, ring plan, 4096-byte RAW/UNPACKED DADA headers, validation report
+and `MANIFEST.sha256`.
+
+`station_ids` order defines the A axis. `duration_seconds` and beamformer
+`weights_scale` are decimal strings so they can be parsed without binary
+floating-point rounding. `metadata.telescope`, `bandwidth_hz` and
+`center_frequency_hz` are required and will propagate to generated DADA
+headers.
+
+The older pipeline/unpack/worker JSON examples below remain temporary migration
+fixtures until all consumers use the resolved observation plan.
+
 Runtime configuration uses strict JSON. `pipeline.example.json` is schema
 version 1 and has four sections:
 
 前端 packet 的静态 byte/bit 定义与观测配置分开，存放在
-[`packet_formats/`](packet_formats/README.md)。其中包含 v1 JSON Schema、机器可读 profile
+[`packet_formats/`](packet_formats/README.md)。其中包含 schema-v2 JSON Schema、机器可读 profile
 和 `packet_format_inspect` 的调用说明。Project VDIF v1 的 32-byte header 与 TFP payload
-布局是正式 wire contract；profile 中的 `payload_bytes` 是可由具体观测替换的 record
-几何值。
+布局是正式 wire contract；schema-v2 profile 不包含观测相关的 payload 大小或轴长度。
 
 - `observation`: externally supplied observation geometry and start time.
 - `packet`: raw record geometry and per-sample interval in microseconds.
@@ -27,7 +68,7 @@ fall back to a default. Integer fields must use integer JSON syntax.
   unpack JSON 所在目录为基准；
 - `selection.first_channel_id` 是该 worker 处理的最小频率编号；
 - `selection.antenna_map[A]` 按 A 轴顺序列出 Station ID，长度必须等于 `NANT`，且不允许重复；
-- `window.blocks` 第一版至少为 2，表示允许跨两个 raw block 重排；
+- `window.blocks` 第一版至少为 2，表示私有环形窗口容纳的 compute block 数；
 - `window.max_bytes` 是 payload-only 滑动窗的硬内存上限；
 - `output.memory` 当前固定为 `HOST`，输出继续写入 host PSRDADA ring。
 - `runtime.run_once=false` 时每个 transfer 完成后重新等待下一次 header；功能测试可设为
@@ -47,6 +88,10 @@ group_bytes = packet_payload_bytes * NANT
 window_bytes = window.blocks * records_per_block * packet_payload_bytes
 compute_block_bytes = records_per_block * packet_payload_bytes
 ```
+
+窗口内部按 `[A,circular_group,T,F,P]` 排列，不保存 packet header；输出 compute block
+采用 `ORDER=ATFP`、`LAYOUT_SCOPE=BLOCK`。packet-format profile 只描述 wire TFP，不包含
+下游 `output_order`。
 
 ## FPGA sender simulator 配置
 

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "observation": {
+    "observation_id": "ca-functional-v1",
+    "utc_start": "2026-08-08-00:00:00",
+    "duration_seconds": "7.752192",
+    "station_ids": [101, 102],
+    "first_channel_id": 100,
+    "nchan": 2,
+    "npol": 2,
+    "sample_interval_ps": 1000000
+  },
+  "metadata": {
+    "telescope": "CA",
+    "bandwidth_hz": 300000000,
+    "center_frequency_hz": 1250000000
+  },
+  "wire": {
+    "profile": "packet_formats/frontend.example-v1.json",
+    "samples_per_packet": 512
+  },
+  "blocks": {
+    "groups_per_block": 1024,
+    "raw_ring_blocks": 8,
+    "compute_ring_blocks": 8,
+    "window_blocks": 2
+  },
+  "rings": {
+    "raw_key": "0x00d2",
+    "compute_key": "0x00d4"
+  },
+  "storage": {
+    "enabled": false,
+    "blocks_per_file": 0,
+    "direct_io": false
+  },
+  "receiver": {
+    "device": "mlx5_0",
+    "destination_mac": "98:03:9b:aa:99:d8",
+    "destination_ip": "174.0.1.111",
+    "destination_port": 1000
+  },
+  "processing": {
+    "backend": "CUDA",
+    "cuda_device": 0,
+    "run_once": true,
+    "modules": []
+  }
+}

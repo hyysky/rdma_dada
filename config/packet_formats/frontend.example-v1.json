@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "format_id": "project-vdif-v1",
   "record": {
-    "application_header_bytes": 32,
-    "payload_bytes": 12288
+    "application_header_bytes": 32
   },
   "application_header": {
     "bit_numbering": "LSB0",
@@ -38,7 +37,6 @@
     "component_order": "IQ",
     "endian": "LITTLE",
     "packed_order": ["T", "F", "P"],
-    "output_order": ["T", "F", "P", "A"],
     "axes": [
       {
         "name": "T",

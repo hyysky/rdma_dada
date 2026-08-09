@@ -2,7 +2,6 @@
 
 #include <cstdlib>
 #include <iostream>
-#include <limits>
 #include <sstream>
 #include <string>
 
@@ -55,26 +54,16 @@ int main(int argc, char** argv) {
         std::cerr << "invalid packet format: " << error << '\n';
         return EXIT_FAILURE;
     }
-    if (config.payload_bytes > std::numeric_limits<std::uint64_t>::max() -
-                                   config.application_header_bytes) {
-        std::cerr << "invalid packet format: record byte count exceeds uint64 range\n";
-        return EXIT_FAILURE;
-    }
-
     const std::uint64_t sample_bytes = config.sample_format == "CI8" ? 2U : 4U;
     std::cout << "FORMAT_ID=" << config.format_id << '\n'
               << "APPLICATION_HEADER_BYTES="
               << config.application_header_bytes << '\n'
-              << "PAYLOAD_BYTES=" << config.payload_bytes << '\n'
-              << "RECORD_BYTES="
-              << config.application_header_bytes + config.payload_bytes << '\n'
               << "HEADER_FIELD_COUNT=" << config.header_fields.size() << '\n'
               << "SAMPLE_FORMAT=" << config.sample_format << '\n'
               << "SAMPLE_ENCODING=" << config.sample_encoding << '\n'
               << "COMPONENT_ORDER=" << config.component_order << '\n'
               << "SAMPLE_BYTES=" << sample_bytes << '\n'
-              << "PACKED_ORDER=" << Join(config.packed_order) << '\n'
-              << "OUTPUT_ORDER=" << Join(config.output_order) << '\n';
+              << "PACKED_ORDER=" << Join(config.packed_order) << '\n';
     for (std::size_t index = 0; index < config.axes.size(); ++index) {
         std::cout << "AXIS_" << config.axes[index].name
                   << "_EXTENT=" << AxisValueText(config.axes[index].extent)
