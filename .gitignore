@@ -1,5 +1,5 @@
 # Build outputs
-build*/
+/build*/
 CMakeFiles/
 CMakeCache.txt
 *.o
@@ -14,10 +14,33 @@ CMakeCache.txt
 *.out
 *.app
 
+# CMake and Ninja in-source artifacts
+/Testing/
+/CTestTestfile.cmake
+/cmake_install.cmake
+/DartConfiguration.tcl
+/compile_commands.json
+/install_manifest.txt
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/rules.ninja
+
 # Generated logs and runtime data
 data_out/
 *.log
 logs/
+*.dada
+
+# Profiling and crash artifacts
+core
+core.*
+perf.data
+perf.data.*
+*.profraw
+*.profdata
+*.nsys-rep
+*.qdrep
 
 # IDE and editor settings
 .DS_Store
@@ -28,8 +51,25 @@ logs/
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Local environment files
+.env
+.env.*
+!.env.example
 
 # Backup files
 *~
 *.swp
 *.swo
+*.tmp
+*.bak
+*.orig
+*.rej
