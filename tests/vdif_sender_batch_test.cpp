@@ -75,6 +75,10 @@ void TestStableRepeatBatch() {
     Expect(std::equal(batch.packet(0).data + 32, batch.packet(0).data + 40,
                       batch.packet(1).data + 32),
            "repeat mode reuses identical payload across groups");
+    const std::uint8_t expected_prefix[] = {0x65U, 0x66U, 0x70U, 0x71U};
+    Expect(std::equal(expected_prefix, expected_prefix + 4,
+                      batch.packet(0).data + 32),
+           "Station 101 TFP payload begins with both polarization IQ pairs");
 
     Expect(batch.Prepare(4, 4, &error), "second batch prepares: " + error);
     for (std::uint32_t i = 0; i < 4U; ++i) {

@@ -51,7 +51,9 @@ Linux `PACED` 路径预分配 `batch_packets` 个 record 和 `mmsghdr/iovec` 描
 不同 FPGA 流，所有流仍发送到同一个接收端口。
 
 进程结束时输出一行 JSON，包含 source/destination、Station ID、target/actual payload
-Gbps、PPS、packet/byte/batch/retry/failure/overrun 计数和 `SEND`/`SENDMMSG` backend。
+Gbps、PPS、packet/byte/batch/retry/failure/overrun 计数、实际发送模板的
+`payload_prefix_hex` 和 `SEND`/`SENDMMSG` backend。接收端验收应使用该前缀核对首个
+Station 的 ATFP 数据，不能在控制器中写死某个 payload 值。
 测速必须使用足够长的窗口；2% 速率门禁由测试控制端执行。
 
 ## 故障注入

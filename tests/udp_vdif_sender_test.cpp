@@ -40,6 +40,7 @@ void TestMachineReadableStatistics() {
     stats.short_batches = 1;
     stats.overrun_batches = 3;
     stats.backend = "SENDMMSG";
+    stats.payload_prefix_hex = "65667071";
 
     const std::string text = sim::FormatVdifSenderStatsJson(config, stats);
     json::Value root;
@@ -59,6 +60,8 @@ void TestMachineReadableStatistics() {
            "statistics reconcile sent and failed counts");
     Expect(object.find("backend")->second.text() == "SENDMMSG",
            "statistics identify the UDP batch backend");
+    Expect(object.find("payload_prefix_hex")->second.text() == "65667071",
+           "statistics expose the transmitted payload prefix");
 }
 
 }  // namespace

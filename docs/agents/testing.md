@@ -16,11 +16,13 @@ inputs through explicit CLI arguments or a recorded configuration file. It
 must create a unique run ID, persist its state, produce a machine-readable
 result and clean only resources owned by that run.
 
-Finite network fixtures must align their record count to both the sender batch
-and the raw-ring block geometry. With two mandatory Stations and 2,048 records
-per raw block, the group count is a multiple of 1,024 so EOD does not strand an
-unpublished partial raw block. Partial-block behavior is tested separately and
-must not be confused with packet loss or throughput failure.
+Finite network fixtures must preserve the requested observation stop boundary;
+they must not round `group_count` to a sender batch or raw-ring block. On
+orderly stop, every accepted complete record is published, including CQ entries
+below `send_n` and the final partial raw block. Acceptance requires
+`sender sent = receiver accepted = receiver published = unpack records`; a
+partial final block is normal finite-transfer behavior and must not be counted
+as packet loss or a throughput failure.
 
 ## Phase 0: target-server environment preflight
 
@@ -123,6 +125,21 @@ controller must:
    early sender failure, expired start-time regeneration, resume and cleanup;
 10. fail closed when counts, headers, EOD, logs or result artifacts are missing.
 
+An executable acceptance run must receive the tested qths1 binary directory as
+an explicit argument. It must not fall back to a conventional directory such
+as `build-linux`, because that directory may contain a valid but stale build.
+The manifest records the selected directory and binary hashes before resources
+are created.
+
+For the current three-host topology, the declared control host is `HF`.
+`HF` must open independent SSH sessions to `qths1`, `qtpulsar1` and
+`qtpulsar2`; `qths1` must never be used as a jump host or asked to SSH back to
+either sender. Controller-owned `known_hosts` files also live on `HF` unless a
+versioned controller explicitly transfers and verifies a scoped copy. A test
+that requires receiver-to-sender SSH is not an acceptance entry point for this
+topology and must be reported as not applicable rather than changing server
+authentication to accommodate the harness.
+
 The controller itself is reviewed and tested like project code. A controller
 created only in `/tmp` is diagnostic material and cannot authorize final
 acceptance.
@@ -150,6 +167,12 @@ acceptance.
   insufficient, regenerate and redistribute both Station configs.
 - All enabled Stations participate in the same repetition. Never combine a
   successful Station from one attempt with another Station from a later run.
+- Multi-host fixtures derive a distinct pair of UDP source ports from the
+  unique run identity and record them in the generated configs and manifest.
+  Before any receiver ring is created, the controller probes each source
+  IP/port on its sender host. An occupied bind endpoint is `ENV_BLOCKED`; a
+  bind race detected when the sender starts has the same classification and
+  still aborts the complete observation.
 
 ## Astronomy observation semantics
 
@@ -212,3 +235,27 @@ self-test claims, swallowed exceptions and cleanup overwriting failure state.
 These are harness failures, not evidence that UDP sender, RDMA ingest or VDIF
 unpack failed. The policy above exists so the same mistakes become automated
 regression cases and cannot recur as undocumented manual knowledge.
+
+The receiver-focused `rdma_receiver_integration.sh` additionally assumes that
+the machine executing it can SSH directly to both sender hosts. The deployed
+topology does not satisfy that assumption: only `HF` is the controller. Remote
+multi-host acceptance therefore uses `scripts/task8c_rate_point.py` from `HF`;
+copying the shell test to `qths1` and attempting `qths1 -> qtpulsar*` is a
+harness topology error, not an environment requirement or product failure.
+
+The versioned controller accepts one observation JSON and the
+`observation_config_compile` binary. It verifies the compiler artifact
+manifest, transfers the same resolved plan to `rdma2dada` and
+`vdif_unpack_worker`, and derives ring creation and acceptance counters from
+that plan. It must not generate runtime `pipeline.json`, `packet.json` or
+`worker.json` geometry files. Run `--preflight-only` before `--execute`; the
+preflight follows the same compiler, synchronization, binary and endpoint gate
+but creates no ring, capability or data process.
+Both receiver-side and sender-side Release build directories are explicit
+formal-run arguments. The controller must not silently select `build-linux`
+for either `rdma2dada`/`vdif_unpack_worker` or `fpga_sender_sim`.
+
+Failure-time diagnostic collection and resource cleanup are reported
+separately. A missing artifact that was never expected to exist after an early
+worker failure belongs in `diagnostic_errors`; it does not turn an otherwise
+verified process/ring/capability cleanup into `CLEANUP_RESULT=FAIL`.

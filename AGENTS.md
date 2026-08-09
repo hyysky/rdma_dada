@@ -1,5 +1,11 @@
 # Repository agent instructions
 
+## Communication style
+
+- Answer the user's questions concisely and directly by default. Include only
+  the information needed to answer the question, unless the user explicitly
+  requests additional explanation, analysis or detail.
+
 ## Visual generation validation
 
 - After every image or diagram generation/edit, inspect the resulting artifact
@@ -65,6 +71,12 @@
   servers. Verify synchronized sources using the file SHA256 manifest supplied
   by the development task; record configuration and binary SHA256 values in
   the test artifacts.
+- Treat the local development worktree as the sole source-of-truth mirror for
+  test-host source synchronization. Mirror the complete current source tree
+  and remove stale source/configuration files; exclude `.git`, `build*`, test
+  result directories and data files so remote build/results/data are retained.
+  Do not assemble a test checkout through manual per-file copies. After the
+  mirror completes, verify the supplied SHA256 manifest before configuring.
 - A delegated test request contains a `codex_delegation.source_thread_id`.
   The `GPU服务器代码测试` task must copy that exact ID and, after every test
   run, call the Codex app `send_message_to_thread` operation with the complete
@@ -123,6 +135,39 @@
 
 ### Reproducible test acceptance
 
+#### Test failure memory and preflight guardrails
+
+- Before every remote run, verify the exact handoff-file SHA256 and the selected binary directory. Never let a default `build-linux` path silently replace an explicitly validated build.
+- Use the topology documented for the task: HF is the orchestration/control host; do not make qths1 SSH to sender hosts unless the task explicitly authorizes that topology. Keep sender SSH and host-key files scoped and non-persistent.
+- Avoid nested SSH/heredoc quoting. Pass commands as argument arrays or use independently transferred scripts; validate remote `python3 -c`/JSON arguments before creating rings.
+- After controller self-tests, inspect qths1 for test-owned processes and rings. Self-tests must not leave `dada_db`, `dada_dbdisk`, `rdma2dada`, worker, IPC segments, or capabilities; clean exact recorded PIDs/keys before any formal run.
+- Treat harness/configuration failures separately from product failures: stale binaries, missing required arguments, source-port preflight command parsing, missing diagnostic artifacts, and SSH/authentication failures are `SYNC_FAIL`, `HARNESS_FAIL`, or `ENV_BLOCKED`, never product-performance results.
+- For source-port tests, perform the endpoint bind preflight before ring creation and preserve the exact endpoint, argv, stderr, and cleanup evidence in the result artifact.
+- Whenever a remote test creates a directory, record its task name, source thread ID, purpose, creation time, and retention/cleanup condition in the run manifest or an adjacent task ledger. Reuse that record when deciding whether a later directory is safe to remove.
+- On qths1, use the validated CMake toolchain pair `/home/user/wy/tools/cmake-3.31.12/bin/cmake` and `/home/user/wy/tools/cmake-3.31.12/bin/ctest` for configure, build, test listing, and execution. `/usr/bin/cmake` and `/usr/bin/ctest` are older system tools (currently 3.16.3) and must not be mixed with the validated pair.
+- Failure memory from server acceptance: never embed shell variables, command
+  substitutions, pipes, heredocs, redirects, or backticks inside nested
+  `ssh HF "ssh qths1 ..."` strings. The outer shell can consume them or run
+  the wrong host's BSD/GNU tools (for example `find`/`stat`), producing a
+  harness failure. Prefer `ssh host -- argv...`, fixed absolute paths, or a
+  separately transferred script; record the command and exit code.
+- A multi-file `rsync` invocation can silently omit files or flatten them when
+  source and destination paths are mixed. After any mirror, verify every
+  manifest path on the target, including headers and source files used by the
+  new target, before configuring. Do not classify missing/old sources as a
+  product compile failure; report `SYNC_FAIL` and re-mirror the complete tree.
+- Never reuse a failed or stale build directory to diagnose synchronization.
+  Once the source manifest is corrected, configure exactly one new, uniquely
+  named build directory and record its CMakeCache and configure exit status.
+- For artifact/CLI checks, use the versioned test script first, then run any
+  extra checks as independent commands with fixed absolute output directories.
+  Verify file sets, sizes, manifests, and overwrite/preflight behavior before
+  deleting the task-owned directories. A failed hand-written orchestration
+  attempt is `HARNESS_FAIL` and must not contaminate the product result.
+- When a header or binary contains NUL-padded metadata, `grep` may report a
+  binary match without showing fields. Use `strings` or the format-aware test
+  instead of treating a non-readable grep result as missing data.
+
 - A one-off successful command is development evidence, not final acceptance.
   Final CPU, GPU, RDMA/PSRDADA, integration and performance tests must use a
   versioned repository test runner and follow `docs/agents/testing.md`.
@@ -152,6 +197,34 @@
   materialized compute `.dada` file. For high-throughput pipeline measurements,
   use `dada_dbnull -s -z` to drain the compute ring without introducing disk
   throughput as an unrelated bottleneck, and validate its clean EOD exit.
+
+### Real-time pipeline performance
+
+- This repository implements a continuous real-time antenna-array data-flow
+  pipeline. Functional and numerical correctness are necessary but are not
+  sufficient for accepting a module, layout or process boundary. A component
+  is incomplete if it cannot sustain the required stream rate in the assembled
+  pipeline without unbounded ring growth, backpressure or data loss.
+- Before implementation, record the target payload bit rate, packet rate,
+  block geometry, observation duration and required operating headroom. Test
+  with the real packet layout and realistic process/ring boundaries; a small
+  correctness fixture or isolated kernel result does not establish real-time
+  capability.
+- Measure each stage's service time and sustained throughput together with ring
+  occupancy, wait/backpressure time, packet and block accounting, CPU/NUMA/GPU
+  utilization and memory-transfer volume. Preserve these measurements in the
+  reproducible test artifacts so the first saturated stage can be identified.
+- Increasing a ring's size provides burst tolerance only. It is not a valid
+  fix when a downstream stage's steady-state service rate is below the input
+  rate.
+- Treat per-sample copies, tree lookups, heap allocation, small CQ/WR batches,
+  repeated full-buffer passes and unconditional device/stream synchronization
+  as performance risks. Prefer contiguous or batched work and overlap where it
+  preserves the pipeline contract, but retain a correctness reference path for
+  byte-for-byte or tolerance-based comparison.
+- Performance acceptance must demonstrate repeatable sustained operation at
+  the target rate with headroom, not merely one successful finite transfer or
+  a reported sender rate.
 
 ### Issue tracker
 

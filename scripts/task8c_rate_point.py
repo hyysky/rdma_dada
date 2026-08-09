@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import decimal
 import datetime as dt
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
 import subprocess
@@ -48,6 +50,27 @@ class StageError(RuntimeError):
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class RateRequest:
+    aggregate_gbps: float
+    duration_seconds: float
+    batch_packets: int = 16
+    compute_consumer: str = "dbdisk"
+
+    def validate(self) -> None:
+        if (
+            not math.isfinite(self.aggregate_gbps)
+            or not math.isfinite(self.duration_seconds)
+            or self.aggregate_gbps <= 0
+            or self.duration_seconds <= 0
+        ):
+            raise ValueError("rate and duration must be positive")
+        if self.batch_packets <= 0:
+            raise ValueError("batch_packets must be positive")
+        if self.compute_consumer not in ("dbdisk", "dbnull"):
+            raise ValueError("compute_consumer must be dbdisk or dbnull")
+
+
 def build_ssh_argv(
     host: str, remote_argv: Sequence[str], known_hosts: str | None = None
 ) -> list[str]:
@@ -78,64 +101,329 @@ class RatePlan:
     batch_packets: int
     per_station_gbps: float
     group_count: int
-    compute_consumer: str = "dbdisk"
-    record_bytes: int = 4128
-    raw_key: str = "00d2"
-    compute_key: str = "00d4"
-    records_per_block: int = 2048
-    ring_blocks: int = 8
+    compute_consumer: str
+    record_bytes: int
+    raw_key: str
+    compute_key: str
+    records_per_block: int
+    resolved_plan: dict[str, Any]
+    ring_plan: dict[str, Any]
+    artifact_files: dict[str, bytes]
 
     @property
     def raw_block_bytes(self) -> int:
-        return self.records_per_block * self.record_bytes
+        return int(self.resolved_plan["resolved"]["raw_block_bytes"])
 
     @property
     def compute_block_bytes(self) -> int:
-        groups = self.records_per_block // 2
-        return groups * 4096 * 2
+        return int(self.resolved_plan["resolved"]["compute_block_bytes"])
+
+    @property
+    def raw_ring_blocks(self) -> int:
+        return int(self.ring_plan["rings"]["raw"]["blocks"])
+
+    @property
+    def compute_ring_blocks(self) -> int:
+        return int(self.ring_plan["rings"]["compute"]["blocks"])
+
+    @property
+    def config_id(self) -> str:
+        return str(self.resolved_plan["config_id"])
+
+    @property
+    def geometry_id(self) -> str:
+        return str(self.resolved_plan["geometry_id"])
+
+    @property
+    def source(self) -> dict[str, Any]:
+        value = json.loads(str(self.resolved_plan["source_json"]))
+        if not isinstance(value, dict):
+            raise ValueError("resolved source_json must contain an object")
+        return value
+
+    @property
+    def nant(self) -> int:
+        return len(self.source["observation"]["station_ids"])
+
+    @property
+    def nchan(self) -> int:
+        return int(self.source["observation"]["nchan"])
+
+    @property
+    def npol(self) -> int:
+        return int(self.source["observation"]["npol"])
+
+    @property
+    def payload_bytes(self) -> int:
+        return int(self.resolved_plan["resolved"]["payload_bytes"])
 
     @classmethod
-    def create(
+    def from_artifact_directory(
         cls,
+        artifact_directory: pathlib.Path,
         aggregate_gbps: float,
         duration_seconds: float,
         batch_packets: int = 16,
         compute_consumer: str = "dbdisk",
     ) -> "RatePlan":
-        if aggregate_gbps <= 0 or duration_seconds <= 0:
-            raise ValueError("rate and duration must be positive")
-        if batch_packets <= 0:
-            raise ValueError("batch_packets must be positive")
+        root = pathlib.Path(artifact_directory)
+        required = (
+            "resolved_observation.json",
+            "ring_plan.json",
+            "raw.header",
+            "unpacked.header",
+            "validation_report.json",
+        )
+        files = {name: (root / name).read_bytes() for name in required}
+        manifest_path = root / "MANIFEST.sha256"
+        manifest = manifest_path.read_text()
+        expected_manifest: dict[str, str] = {}
+        for line in manifest.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError("invalid compiler MANIFEST.sha256 line")
+            expected_manifest[parts[1]] = parts[0]
+        if set(expected_manifest) != set(required):
+            raise ValueError("compiler manifest file set is incomplete")
+        for name, contents in files.items():
+            if hashlib.sha256(contents).hexdigest() != expected_manifest[name]:
+                raise ValueError(f"compiler artifact SHA256 mismatch: {name}")
+        files["MANIFEST.sha256"] = manifest.encode("ascii")
+        resolved = json.loads(files["resolved_observation.json"])
+        rings = json.loads(files["ring_plan.json"])
+        report = json.loads(files["validation_report.json"])
+        derived = resolved["resolved"]
+        raw = rings["rings"]["raw"]
+        compute = rings["rings"]["compute"]
+        if (
+            raw["block_bytes"] != derived["raw_block_bytes"]
+            or compute["block_bytes"] != derived["compute_block_bytes"]
+            or rings.get("config_id") != resolved.get("config_id")
+            or rings.get("geometry_id") != resolved.get("geometry_id")
+        ):
+            raise ValueError("ring plan conflicts with resolved observation")
+        if (
+            report.get("valid") is not True
+            or report.get("config_id") != resolved.get("config_id")
+            or report.get("geometry_id") != resolved.get("geometry_id")
+        ):
+            raise ValueError("validation report conflicts with resolved observation")
+        for name, expected_stage in (
+            ("raw.header", "RAW"),
+            ("unpacked.header", "UNPACKED"),
+        ):
+            header_text = files[name].split(b"\0", 1)[0].decode("ascii")
+            fields = {}
+            for line in header_text.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    fields[parts[0]] = parts[1].strip()
+            if (
+                fields.get("DATA_STAGE") != expected_stage
+                or fields.get("CONFIG_ID") != resolved.get("config_id")
+                or fields.get("GEOMETRY_ID") != resolved.get("geometry_id")
+            ):
+                raise ValueError(f"{name} conflicts with resolved observation")
+        if aggregate_gbps <= 0 or duration_seconds <= 0 or batch_packets <= 0:
+            raise ValueError("rate, duration and batch size must be positive")
         if compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
-        per_station = aggregate_gbps / 2.0
-        required_bytes = per_station * 1_000_000_000 * duration_seconds / 8.0
-        groups = math.ceil(required_bytes / 4128)
-        groups_per_raw_block = 2048 // 2
-        alignment = (
-            batch_packets
-            * groups_per_raw_block
-            // math.gcd(batch_packets, groups_per_raw_block)
-        )
-        groups = math.ceil(groups / alignment) * alignment
+        source = json.loads(resolved["source_json"])
+        station_count = len(source["observation"]["station_ids"])
+        if station_count == 0:
+            raise ValueError("resolved observation has no Stations")
+        def key_text(value: str) -> str:
+            parsed = int(value, 16)
+            return f"{parsed:04x}"
         return cls(
             aggregate_gbps=aggregate_gbps,
             duration_seconds=duration_seconds,
             batch_packets=batch_packets,
-            per_station_gbps=per_station,
-            group_count=groups,
+            per_station_gbps=aggregate_gbps / station_count,
+            group_count=int(derived["expected_groups"]),
             compute_consumer=compute_consumer,
+            record_bytes=int(derived["raw_record_bytes"]),
+            raw_key=key_text(str(raw["key"])),
+            compute_key=key_text(str(compute["key"])),
+            records_per_block=int(derived["records_per_block"]),
+            resolved_plan=resolved,
+            ring_plan=rings,
+            artifact_files=files,
         )
 
     def as_dict(self) -> dict[str, Any]:
         result = dataclasses.asdict(self)
+        result.pop("artifact_files")
         result.update(
             {
                 "raw_block_bytes": self.raw_block_bytes,
                 "compute_block_bytes": self.compute_block_bytes,
+                "raw_ring_blocks": self.raw_ring_blocks,
+                "compute_ring_blocks": self.compute_ring_blocks,
+                "config_id": self.config_id,
+                "geometry_id": self.geometry_id,
+                "artifact_sha256": {
+                    name: hashlib.sha256(contents).hexdigest()
+                    for name, contents in self.artifact_files.items()
+                },
             }
         )
         return result
+
+
+def _seconds_from_picoseconds(value: int) -> str:
+    if value <= 0:
+        raise ValueError("duration picoseconds must be positive")
+    whole, fraction = divmod(value, 1_000_000_000_000)
+    if fraction == 0:
+        return str(whole)
+    return f"{whole}.{fraction:012d}".rstrip("0")
+
+
+def _group_count_for_request(
+    request: RateRequest, station_count: int, payload_bytes: int
+) -> int:
+    request.validate()
+    if station_count <= 0 or payload_bytes <= 0:
+        raise ValueError("station count and payload bytes must be positive")
+    payload_bits = decimal.Decimal(payload_bytes * 8 * station_count)
+    requested_bits = (
+        decimal.Decimal(str(request.aggregate_gbps))
+        * decimal.Decimal(1_000_000_000)
+        * decimal.Decimal(str(request.duration_seconds))
+    )
+    return int(
+        (requested_bits / payload_bits).to_integral_value(
+            rounding=decimal.ROUND_CEILING
+        )
+    )
+
+
+def _run_observation_compiler(
+    compiler: pathlib.Path,
+    config_path: pathlib.Path,
+    output_directory: pathlib.Path | None,
+) -> None:
+    argv = [str(compiler), "--config", str(config_path)]
+    if output_directory is None:
+        argv.append("--preflight-only")
+    else:
+        argv += ["--output-dir", str(output_directory)]
+    completed = subprocess.run(argv, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise StageError(
+            "CONFIG_READY", argv, completed.returncode, completed.stdout,
+            completed.stderr, "HARNESS_FAIL"
+        )
+
+
+def compile_rate_plan(
+    request: RateRequest,
+    observation_template: pathlib.Path,
+    compiler: pathlib.Path,
+    run_directory: pathlib.Path,
+) -> RatePlan:
+    request.validate()
+    template_path = pathlib.Path(observation_template).resolve()
+    compiler_path = pathlib.Path(compiler).resolve()
+    if not template_path.is_file():
+        raise StageError(
+            "CONFIG_READY", ["read", str(template_path)], 2, "",
+            "observation template does not exist", "ENV_BLOCKED"
+        )
+    if not compiler_path.is_file() or not os.access(compiler_path, os.X_OK):
+        raise StageError(
+            "CONFIG_READY", [str(compiler_path), "--help"], 126, "",
+            "observation compiler is not executable", "ENV_BLOCKED"
+        )
+    root = pathlib.Path(run_directory)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        observation = json.loads(template_path.read_text())
+        wire_reference = pathlib.Path(observation["wire"]["profile"])
+        if not wire_reference.is_absolute():
+            observation["wire"]["profile"] = str(
+                (template_path.parent / wire_reference).resolve()
+            )
+        for module in observation["processing"]["modules"]:
+            if module.get("type") == "beamform":
+                weight = pathlib.Path(module["weights_file"])
+                if not weight.is_absolute():
+                    module["weights_file"] = str(
+                        (template_path.parent / weight).resolve()
+                    )
+        observation["observation"]["observation_id"] = root.name
+        observation["processing"]["run_once"] = True
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StageError(
+            "CONFIG_READY", ["parse", str(template_path)], 1, "", repr(error),
+            "HARNESS_FAIL"
+        ) from error
+
+    bootstrap_config = root / "observation.bootstrap.json"
+    bootstrap_config.write_text(json.dumps(observation, indent=2) + "\n")
+    bootstrap_artifacts = root / "observation-bootstrap-artifacts"
+    _run_observation_compiler(compiler_path, bootstrap_config, None)
+    _run_observation_compiler(
+        compiler_path, bootstrap_config, bootstrap_artifacts
+    )
+    bootstrap = RatePlan.from_artifact_directory(
+        bootstrap_artifacts, request.aggregate_gbps,
+        request.duration_seconds, request.batch_packets,
+        request.compute_consumer
+    )
+    group_count = _group_count_for_request(
+        request, bootstrap.nant, bootstrap.payload_bytes
+    )
+    group_period_ps = int(
+        bootstrap.resolved_plan["resolved"]["group_period_ps"]
+    )
+    observation["observation"]["duration_seconds"] = (
+        _seconds_from_picoseconds(group_count * group_period_ps)
+    )
+    final_config = root / "observation.json"
+    final_config.write_text(json.dumps(observation, indent=2) + "\n")
+    final_artifacts = root / "observation-artifacts"
+    _run_observation_compiler(compiler_path, final_config, None)
+    _run_observation_compiler(compiler_path, final_config, final_artifacts)
+    plan = RatePlan.from_artifact_directory(
+        final_artifacts, request.aggregate_gbps, request.duration_seconds,
+        request.batch_packets, request.compute_consumer
+    )
+    if plan.group_count != group_count:
+        raise StageError(
+            "CONFIG_READY", ["validate", "expected_groups"], 1,
+            str(plan.group_count), str(group_count), "HARNESS_FAIL"
+        )
+    return plan
+
+
+def derive_sender_source_ports(run_identity: str) -> tuple[int, int]:
+    if not run_identity:
+        raise ValueError("run identity must not be empty")
+    digest = hashlib.sha256(run_identity.encode("utf-8")).digest()
+    offset = int.from_bytes(digest[:2], byteorder="big") % 10000
+    return 40000 + offset, 50000 + offset
+
+
+def build_sender_endpoint_probe() -> str:
+    return '''#!/usr/bin/env python3
+import socket
+import sys
+
+if len(sys.argv) != 3:
+    raise SystemExit("usage: probe_sender_endpoint.py SOURCE_IP SOURCE_PORT")
+
+endpoint = (sys.argv[1], int(sys.argv[2]))
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    probe.bind(endpoint)
+except OSError as error:
+    print(f"sender endpoint unavailable: {endpoint[0]}:{endpoint[1]}: {error}", file=sys.stderr)
+    raise SystemExit(error.errno or 1)
+finally:
+    probe.close()
+'''
 
 
 def build_sender_config(
@@ -145,26 +433,33 @@ def build_sender_config(
     source_port: int,
     start_utc: str,
 ) -> dict[str, Any]:
+    if plan.resolved_plan is None:
+        raise ValueError("sender config requires a compiler-resolved plan")
+    source = plan.source
+    observation = source["observation"]
+    wire = source["wire"]
+    receiver = source["receiver"]
+    resolved = plan.resolved_plan["resolved"]
     return {
         "schema_version": 2,
         "source": {"ip": source_ip, "port": source_port},
         "destination": {
-            "ip": "174.0.1.111",
-            "port": 1000,
+            "ip": receiver["destination_ip"],
+            "port": receiver["destination_port"],
             "path_mtu": 9000,
         },
         "station": {"station_id": station_id},
         "packet": {
-            "first_channel_id": 100,
-            "nchan": 2,
-            "npol": 2,
-            "nsamp_per_packet": 512,
+            "first_channel_id": observation["first_channel_id"],
+            "nchan": observation["nchan"],
+            "npol": observation["npol"],
+            "nsamp_per_packet": wire["samples_per_packet"],
             "component_bits": 8,
-            "sample_interval_ps": "1000000",
+            "sample_interval_ps": str(observation["sample_interval_ps"]),
         },
         "time": {
-            "reference_epoch": 52,
-            "start_seconds": 1000,
+            "reference_epoch": resolved["group_start_reference_epoch"],
+            "start_seconds": resolved["group_start_seconds"],
             "group_count": plan.group_count,
             "mode": "PACED",
             "start_utc": start_utc,
@@ -185,53 +480,13 @@ def build_sender_config(
 def build_qths_bundle(
     plan: RatePlan,
     remote_run_dir: str,
-    start_utc: str,
-    packet_format: dict[str, Any] | None = None,
     dada_db_path: str = "dada_db",
     dbdisk_path: str = "dada_dbdisk",
     dbnull_path: str = "dada_dbnull",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
-) -> dict[str, str]:
-    pipeline = {
-        "schema_version": 1,
-        "observation": {
-            "nant": 2,
-            "nchan": 2,
-            "npol": 2,
-            "payload_order": "TFP",
-            "utc_start": start_utc,
-        },
-        "packet": {
-            "header_bytes": 32,
-            "payload_bytes": 4096,
-            "samples": 512,
-            "nbit": 16,
-            "sample_interval_us": 1.0,
-        },
-        "ring_buffers": {
-            "records_per_block": plan.records_per_block,
-            "raw_blocks": plan.ring_blocks,
-            "compute_blocks": plan.ring_blocks,
-        },
-        "disk": {"enabled": False, "blocks_per_file": 0, "direct_io": False},
-    }
-    packet = dict(packet_format or {"schema_version": 1, "format_id": "project-vdif-v1"})
-    packet["record"] = {"application_header_bytes": 32, "payload_bytes": 4096}
-    worker = {
-        "schema_version": 1,
-        "rings": {
-            "input_key": f"0x{plan.raw_key}",
-            "output_key": f"0x{plan.compute_key}",
-        },
-        "sources": {
-            "pipeline_config": f"{remote_run_dir}/pipeline.json",
-            "packet_format": f"{remote_run_dir}/packet.json",
-        },
-        "selection": {"first_channel_id": 100, "antenna_map": [101, 102]},
-        "window": {"blocks": 2, "max_bytes": plan.raw_block_bytes * 2},
-        "output": {"memory": "HOST"},
-        "runtime": {"run_once": True},
-    }
+) -> dict[str, str | bytes]:
+    if not plan.artifact_files:
+        raise ValueError("compiler artifact bundle is required")
     if plan.compute_consumer == "dbnull":
         reader_start = f'''(
   set +e
@@ -248,10 +503,10 @@ echo $! >"$run_dir/reader.pid"'''
 set -euo pipefail
 run_dir={remote_run_dir}
 mkdir -p "$run_dir/compute"
-{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
+{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
 echo $! >"$run_dir/raw-ring.pid"
 touch "$run_dir/raw-ring.created"
-{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
+{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
 echo $! >"$run_dir/compute-ring.pid"
 touch "$run_dir/compute-ring.created"
 sleep 1
@@ -263,9 +518,9 @@ set -euo pipefail
 run_dir={remote_run_dir}
 project={qths_binary_dir}
 {reader_start}
-"$project/vdif_unpack_worker" "$run_dir/worker.json" >"$run_dir/worker.log" 2>&1 &
+"$project/vdif_unpack_worker" --plan "$run_dir/resolved_observation.json" >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
-"$project/rdma2dada" --dmac 98:03:9b:aa:99:d8 --dip 174.0.1.111 --dport 1000 --device 0 --key {plan.raw_key} --send_n 64 --nsge 4 --config "$run_dir/pipeline.json" --dump-header "/home/user/wy/rdma_dada/header/array_GZNU.header" >"$run_dir/receiver.log" 2>&1 &
+"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n 64 --nsge 4 >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
   grep -q 'RDMA receiver running' "$run_dir/receiver.log" && exit 0
@@ -385,16 +640,15 @@ summary = {{
 }}
 (run_dir / "compute-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
 '''
-    return {
-        "pipeline.json": json.dumps(pipeline, indent=2) + "\n",
-        "packet.json": json.dumps(packet, indent=2) + "\n",
-        "worker.json": json.dumps(worker, indent=2) + "\n",
+    bundle: dict[str, str | bytes] = dict(plan.artifact_files)
+    bundle.update({
         "prepare.sh": prepare,
         "start.sh": start,
         "finish.sh": finish,
         "cleanup.sh": cleanup,
         "summarize.py": summarize,
-    }
+    })
+    return bundle
 
 
 class SubprocessTransport:
@@ -434,11 +688,15 @@ class SshBackend:
         project_root: pathlib.Path = pathlib.Path("/home/user/wy/rdma_dada"),
         known_hosts: pathlib.Path = pathlib.Path("/tmp/task8c-known-hosts"),
         qths_binary_dir: pathlib.Path | None = None,
+        sender_binary_dir: pathlib.Path | None = None,
     ) -> None:
         self.transport = transport or SubprocessTransport()
         self.project_root = pathlib.Path(project_root)
         self.qths_binary_dir = pathlib.Path(
             qths_binary_dir or self.project_root / "build-linux"
+        )
+        self.sender_binary_dir = pathlib.Path(
+            sender_binary_dir or self.project_root / "build-linux"
         )
         self.known_hosts = pathlib.Path(known_hosts)
         self.remote_run_dir = ""
@@ -447,6 +705,7 @@ class SshBackend:
         self._rings_acquired: list[str] = []
         self._capability_added = False
         self._sender_processes: list[Any] = []
+        self._sender_endpoints: list[tuple[str, str, int]] = []
         self._compute_consumer = "dbdisk"
         self._psrdada_paths = {
             "dada_db": "dada_db",
@@ -527,32 +786,41 @@ class SshBackend:
         return dict(self.preparation)
 
     def _write_bundle(self, plan: RatePlan, start_utc: str) -> pathlib.Path:
-        packet_path = (
-            self.project_root / "config" / "packet_formats" / "frontend.example-v1.json"
-        )
-        packet_format = json.loads(packet_path.read_text())
         bundle_root = self.local_run_dir / "bundle"
         qths_root = bundle_root / "qths"
         qths_root.mkdir(parents=True, exist_ok=True)
         for name, content in build_qths_bundle(
             plan,
             self.remote_run_dir,
-            start_utc,
-            packet_format,
             self._psrdada_paths["dada_db"],
             self._psrdada_paths["dada_dbdisk"],
             self._psrdada_paths["dada_dbnull"],
             str(self.qths_binary_dir),
         ).items():
             path = qths_root / name
-            path.write_text(content)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content)
             if path.suffix == ".sh":
                 path.chmod(0o755)
-        sender_specs = (
-            (101, "174.0.1.100", 41001, "sender101.json"),
-            (102, "174.0.1.101", 42001, "sender102.json"),
+        sender_a_port, sender_b_port = derive_sender_source_ports(
+            self.remote_run_dir
         )
-        for station, source_ip, source_port, name in sender_specs:
+        stations = plan.source.get("observation", {}).get("station_ids", [])
+        if len(stations) != 2:
+            raise StageError(
+                "CONFIG_READY", ["validate", "station_ids"], 1,
+                json.dumps(stations),
+                "Task 8C topology requires exactly two Stations",
+            )
+        sender_specs = (
+            (stations[0], "qtpulsar1", "174.0.1.100", sender_a_port, "sender101.json"),
+            (stations[1], "qtpulsar2", "174.0.1.101", sender_b_port, "sender102.json"),
+        )
+        self._sender_endpoints = []
+        for station, host, source_ip, source_port, name in sender_specs:
+            self._sender_endpoints.append((host, source_ip, source_port))
             (bundle_root / name).write_text(
                 json.dumps(
                     build_sender_config(
@@ -562,7 +830,30 @@ class SshBackend:
                 )
                 + "\n"
             )
+        (bundle_root / "probe_sender_endpoint.py").write_text(
+            build_sender_endpoint_probe()
+        )
         return bundle_root
+
+    def _preflight_sender_endpoint(
+        self, host: str, source_ip: str, source_port: int
+    ) -> None:
+        argv = [
+            "/usr/bin/python3",
+            f"{self.remote_run_dir}/probe_sender_endpoint.py",
+            source_ip,
+            str(source_port),
+        ]
+        completed = self._ssh(host, argv, "CONFIG_READY", check=False)
+        if completed.returncode != 0:
+            raise StageError(
+                "CONFIG_READY",
+                build_ssh_argv(host, argv, str(self.known_hosts)),
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+                "ENV_BLOCKED",
+            )
 
     def prepare_configs(
         self,
@@ -581,6 +872,31 @@ class SshBackend:
         bundle_root = self._write_bundle(plan, str(preparation["start_utc"]))
         for host in ("qths1", "qtpulsar1", "qtpulsar2"):
             self._ssh(host, ["mkdir", "-p", self.remote_run_dir], "CONFIG_READY")
+        probe_hashes: dict[str, str] = {}
+        probe_path = bundle_root / "probe_sender_endpoint.py"
+        local_probe_sha = self.transport.run(
+            ["sha256sum", str(probe_path)], "CONFIG_READY", True
+        ).stdout.split()[0]
+        for host, source_ip, source_port in self._sender_endpoints:
+            remote_probe = f"{self.remote_run_dir}/probe_sender_endpoint.py"
+            self.transport.run(
+                self._scp_argv(str(probe_path), f"{host}:{remote_probe}"),
+                "CONFIG_READY",
+                True,
+            )
+            remote_probe_sha = self._ssh(
+                host, ["sha256sum", remote_probe], "CONFIG_READY"
+            ).stdout.split()[0]
+            if local_probe_sha != remote_probe_sha:
+                raise StageError(
+                    "CONFIG_READY",
+                    ["sha256sum", host, remote_probe],
+                    1,
+                    f"local={local_probe_sha} remote={remote_probe_sha}",
+                    "sender endpoint probe SHA mismatch",
+                )
+            probe_hashes[f"{host}:probe_sender_endpoint.py"] = local_probe_sha
+            self._preflight_sender_endpoint(host, source_ip, source_port)
         qths_files = sorted((bundle_root / "qths").iterdir())
         qths_hashes: dict[str, str] = {}
         for path in qths_files:
@@ -607,12 +923,13 @@ class SshBackend:
                 )
             qths_hashes[f"qths1:{path.name}"] = local_sha
         hashes = dict(qths_hashes)
+        hashes.update(probe_hashes)
         hashes.update(self._transfer_sender_configs(bundle_root))
         binaries = (
             ("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),
             ("qths1", "vdif_unpack_worker", self.qths_binary_dir / "vdif_unpack_worker"),
-            ("qtpulsar1", "fpga_sender_sim", self.project_root / "build-linux" / "fpga_sender_sim"),
-            ("qtpulsar2", "fpga_sender_sim", self.project_root / "build-linux" / "fpga_sender_sim"),
+            ("qtpulsar1", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
+            ("qtpulsar2", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
         )
         binary_hashes = {}
         binary_paths = {}
@@ -645,10 +962,26 @@ class SshBackend:
                     f"missing {tool} SHA256",
                 )
             binary_hashes[f"qths1:{tool}"] = output[0]
+        preflight_argv = [
+            str(self.qths_binary_dir / "rdma2dada"),
+            "--plan",
+            f"{self.remote_run_dir}/resolved_observation.json",
+            "--preflight-only",
+        ]
+        receiver_preflight = self._ssh(
+            "qths1", preflight_argv, "CONFIG_READY"
+        )
         return {
             "config_sha": hashes,
             "binary_sha": binary_hashes,
             "binary_path": binary_paths,
+            "source_ports": [item[2] for item in self._sender_endpoints],
+            "sender_endpoints": [
+                f"{item[1]}:{item[2]}" for item in self._sender_endpoints
+            ],
+            "config_id": plan.config_id,
+            "geometry_id": plan.geometry_id,
+            "receiver_preflight": receiver_preflight.stdout,
         }
 
     def _resolve_psrdada_tool(self, tool: str) -> str:
@@ -814,7 +1147,7 @@ class SshBackend:
                     "refreshed start_utc margin is below 90 seconds",
                     "ENV_BLOCKED",
                 )
-        binary = str(self.project_root / "build-linux" / "fpga_sender_sim")
+        binary = str(self.sender_binary_dir / "fpga_sender_sim")
         commands = (
             (
                 "qtpulsar1",
@@ -883,13 +1216,18 @@ class SshBackend:
                 outputs[index] = output
                 if returncode != 0:
                     terminate_running()
+                    classification = (
+                        "ENV_BLOCKED"
+                        if "bind source endpoint:" in output
+                        else "PRODUCT_FAIL"
+                    )
                     raise StageError(
                         "SENDERS_RUNNING",
                         ["fpga_sender_sim", str(index)],
                         int(returncode),
                         output,
                         "sender exited non-zero; aborting all Station streams",
-                        "PRODUCT_FAIL",
+                        classification,
                     )
             if not pending:
                 break
@@ -925,9 +1263,12 @@ class SshBackend:
             "worker.log",
             "reader.log",
             "compute-summary.json",
-            "pipeline.json",
-            "worker.json",
-            "packet.json",
+            "MANIFEST.sha256",
+            "resolved_observation.json",
+            "ring_plan.json",
+            "raw.header",
+            "unpacked.header",
+            "validation_report.json",
         ]
         if plan.compute_consumer == "dbnull":
             artifact_names.append("reader.exit")
@@ -947,20 +1288,27 @@ class SshBackend:
 
     def cleanup(self, resources: RunResources, run_dir: pathlib.Path) -> dict[str, Any]:
         errors: list[str] = []
+        diagnostic_errors: list[str] = []
+
+        def nonzero_diagnostic(
+            completed: subprocess.CompletedProcess[str],
+        ) -> str | None:
+            if completed.returncode != 0:
+                return json.dumps(
+                    {
+                        "argv": list(completed.args),
+                        "exit_code": completed.returncode,
+                        "stdout": completed.stdout,
+                        "stderr": completed.stderr,
+                    },
+                    sort_keys=True,
+                )
+            return None
 
         def record_nonzero(completed: subprocess.CompletedProcess[str]) -> None:
-            if completed.returncode != 0:
-                errors.append(
-                    json.dumps(
-                        {
-                            "argv": list(completed.args),
-                            "exit_code": completed.returncode,
-                            "stdout": completed.stdout,
-                            "stderr": completed.stderr,
-                        },
-                        sort_keys=True,
-                    )
-                )
+            diagnostic = nonzero_diagnostic(completed)
+            if diagnostic is not None:
+                errors.append(diagnostic)
 
         owned_processes: list[Any] = []
         for process in list(resources.processes) + self._sender_processes:
@@ -1000,9 +1348,11 @@ class SshBackend:
                         "CLEANUP",
                         check=False,
                     )
-                    record_nonzero(completed)
+                    diagnostic = nonzero_diagnostic(completed)
+                    if diagnostic is not None:
+                        diagnostic_errors.append(diagnostic)
                 except Exception as error:
-                    errors.append(repr(error))
+                    diagnostic_errors.append(repr(error))
         if self.remote_run_dir and (owned_rings or capability_added):
             try:
                 completed = self._ssh(
@@ -1046,6 +1396,7 @@ class SshBackend:
             "rings_destroyed": owned_rings,
             "capability_removed": capability_added,
             "errors": errors,
+            "diagnostic_errors": diagnostic_errors,
             "CLEANUP_RESULT": "PASS" if not errors else "FAIL",
         }
 
@@ -1077,14 +1428,25 @@ def _parse_sender_summary(output: str) -> dict[str, Any]:
     )
 
 
-def _validate_sender(summary: dict[str, Any], target: float) -> None:
+def _validate_sender(
+    summary: dict[str, Any], target: float, expected_station: int
+) -> None:
     scheduled = int(summary.get("scheduled_packets", -1))
     sent = int(summary.get("sent_packets", -2))
     failed = int(summary.get("failed_packets", -1))
     backend = summary.get("backend")
+    station_id = int(summary.get("station_id", -1))
+    payload_prefix = str(summary.get("payload_prefix_hex", ""))
     actual = float(summary.get("actual_payload_gbps", -1.0))
     error = abs(actual - target) / target if target else float("inf")
-    if scheduled != sent or failed != 0 or backend != "SENDMMSG" or error > 0.02:
+    if (
+        scheduled != sent
+        or failed != 0
+        or backend != "SENDMMSG"
+        or station_id != expected_station
+        or re.fullmatch(r"[0-9a-f]{8}", payload_prefix) is None
+        or error > 0.02
+    ):
         raise StageError(
             "SENDERS_RUNNING",
             ["fpga_sender_sim"],
@@ -1095,11 +1457,14 @@ def _validate_sender(summary: dict[str, Any], target: float) -> None:
         )
 
 
-def _validate_statistics(statistics: dict[str, Any], plan: RatePlan) -> None:
-    expected_records = plan.group_count * 2
-    expected_data_bytes = plan.group_count * 8192
+def _validate_statistics(
+    statistics: dict[str, Any], plan: RatePlan, expected_sample_prefix: str
+) -> None:
+    expected_records = plan.group_count * plan.nant
+    expected_data_bytes = plan.group_count * plan.payload_bytes * plan.nant
     required = {
         ("receiver", "accepted"): expected_records,
+        ("receiver", "published"): expected_records,
         ("receiver", "wrong_length"): 0,
         ("receiver", "cq_errors"): 0,
         ("unpack", "records"): expected_records,
@@ -1109,8 +1474,10 @@ def _validate_statistics(statistics: dict[str, Any], plan: RatePlan) -> None:
         ("unpack", "unknown_station"): 0,
         ("unpack", "duplicate"): 0,
         ("unpack", "late"): 0,
+        ("unpack", "out_of_range"): 0,
         ("unpack", "complete_groups"): plan.group_count,
         ("unpack", "incomplete_groups"): 0,
+        ("unpack", "fully_missing_groups"): 0,
         ("unpack", "missing_station"): 0,
     }
     if plan.compute_consumer == "dbnull":
@@ -1127,11 +1494,13 @@ def _validate_statistics(statistics: dict[str, Any], plan: RatePlan) -> None:
             {
                 ("compute", "data_bytes"): expected_data_bytes,
                 ("compute", "DATA_STAGE"): "UNPACKED",
-                ("compute", "ORDER"): "TFPA",
-                ("compute", "NANT"): 2,
-                ("compute", "NCHAN"): 2,
-                ("compute", "NPOL"): 2,
-                ("compute", "sample_prefix_hex"): "65666667",
+                ("compute", "ORDER"): "ATFP",
+                ("compute", "NANT"): plan.nant,
+                ("compute", "NCHAN"): plan.nchan,
+                ("compute", "NPOL"): plan.npol,
+                ("compute", "CONFIG_ID"): plan.config_id,
+                ("compute", "GEOMETRY_ID"): plan.geometry_id,
+                ("compute", "sample_prefix_hex"): expected_sample_prefix,
             }
         )
     mismatches = []
@@ -1158,7 +1527,9 @@ def parse_qths_statistics(
     compute_summary: dict[str, Any],
 ) -> dict[str, Any]:
     receiver_match = re.search(
-        r"Receive summary:\s*accepted=(\d+),\s*wrong_length=(\d+)",
+        r"Receive summary:\s*accepted=(\d+),\s*wrong_length=(\d+),\s*"
+        r"published=(\d+),\s*blocks=(\d+),\s*partial_blocks=(\d+),\s*"
+        r"cq_tail_records=(\d+)",
         receiver_log,
     )
     if not receiver_match:
@@ -1172,8 +1543,9 @@ def parse_qths_statistics(
     unpack_match = re.search(
         r"VDIF unpack statistics:\s*records=(\d+)\s+accepted=(\d+)\s+"
         r"bad_header=(\d+)\s+invalid_data=(\d+)\s+unknown_station=(\d+)\s+"
-        r"duplicate=(\d+)\s+late=(\d+)\s+complete_groups=(\d+)\s+"
-        r"incomplete_groups=(\d+)\s+missing_station=(\d+)/(\d+)",
+        r"duplicate=(\d+)\s+late=(\d+)\s+out_of_range=(\d+)\s+"
+        r"complete_groups=(\d+)\s+incomplete_groups=(\d+)\s+"
+        r"fully_missing_groups=(\d+)\s+missing_station=(\d+)/(\d+)",
         worker_log,
     )
     if not unpack_match or "VDIF unpack transfer completed" not in worker_log:
@@ -1192,8 +1564,10 @@ def parse_qths_statistics(
         "unknown_station",
         "duplicate",
         "late",
+        "out_of_range",
         "complete_groups",
         "incomplete_groups",
+        "fully_missing_groups",
         "missing_station",
         "expected_station",
     )
@@ -1223,6 +1597,8 @@ def parse_qths_statistics(
                 "NANT": int(header["NANT"]),
                 "NCHAN": int(header["NCHAN"]),
                 "NPOL": int(header["NPOL"]),
+                "CONFIG_ID": header["CONFIG_ID"],
+                "GEOMETRY_ID": header["GEOMETRY_ID"],
                 "sample_hex": str(compute_summary.get("sample_hex", "")),
                 "sample_prefix_hex": str(compute_summary.get("sample_hex", ""))[:8],
             }
@@ -1244,6 +1620,10 @@ def parse_qths_statistics(
         "receiver": {
             "accepted": int(receiver_match.group(1)),
             "wrong_length": int(receiver_match.group(2)),
+            "published": int(receiver_match.group(3)),
+            "blocks": int(receiver_match.group(4)),
+            "partial_blocks": int(receiver_match.group(5)),
+            "cq_tail_records": int(receiver_match.group(6)),
             "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
         },
         "unpack": {
@@ -1287,6 +1667,49 @@ class RatePointController:
             "python_version": sys.version,
         }
 
+    def _compile_failure_result(
+        self,
+        request: RateRequest,
+        error: StageError | Exception,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        failure = (
+            error
+            if isinstance(error, StageError)
+            else StageError(
+                "CONFIG_READY",
+                ["observation_config_compile"],
+                1,
+                "",
+                repr(error),
+                "HARNESS_FAIL",
+            )
+        )
+        try:
+            cleanup = self.backend.cleanup(RunResources(), self.run_dir)
+        except Exception as cleanup_error:
+            cleanup = {
+                "CLEANUP_RESULT": "FAIL",
+                "rings_destroyed": [],
+                "capability_removed": False,
+                "errors": [repr(cleanup_error)],
+            }
+        result = {
+            "TEST_RESULT": failure.classification,
+            "run_id": self.run_id,
+            "request": dataclasses.asdict(request),
+            "failure": failure.as_dict(),
+            "cleanup": cleanup,
+        }
+        if mode is not None:
+            result["mode"] = mode
+        _atomic_json(self.run_dir / "result.json", result)
+        state = {"test_result": failure.classification}
+        if mode is not None:
+            state["mode"] = mode
+        self._state("CLEANED", **state)
+        return result
+
     def run(self, plan: RatePlan) -> dict[str, Any]:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         _atomic_json(self.run_dir / "manifest.json", self._manifest(plan))
@@ -1315,11 +1738,23 @@ class RatePointController:
             sender_outputs = self.backend.wait_senders(plan, processes)
             self._state("SENDERS_RUNNING")
             summaries = [_parse_sender_summary(output) for output in sender_outputs]
-            for summary in summaries:
-                _validate_sender(summary, plan.per_station_gbps)
+            stations = plan.source["observation"]["station_ids"]
+            if len(summaries) != len(stations):
+                raise StageError(
+                    "SENDERS_RUNNING",
+                    ["validate", "sender-count"],
+                    1,
+                    str(len(summaries)),
+                    str(len(stations)),
+                    "PRODUCT_FAIL",
+                )
+            for summary, station in zip(summaries, stations):
+                _validate_sender(summary, plan.per_station_gbps, int(station))
             self._state("COLLECTING")
             statistics = self.backend.collect(plan, self.run_dir)
-            _validate_statistics(statistics, plan)
+            _validate_statistics(
+                statistics, plan, str(summaries[0]["payload_prefix_hex"])
+            )
             result.update(
                 {
                     "TEST_RESULT": "PASS",
@@ -1361,6 +1796,114 @@ class RatePointController:
             _atomic_json(self.run_dir / "result.json", result)
             self._state("CLEANED", test_result=result["TEST_RESULT"])
         return result
+
+    def preflight(self, plan: RatePlan) -> dict[str, Any]:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_json(self.run_dir / "manifest.json", self._manifest(plan))
+        result: dict[str, Any] = {
+            "TEST_RESULT": "HARNESS_FAIL",
+            "run_id": self.run_id,
+            "mode": "preflight-only",
+            "plan": plan.as_dict(),
+        }
+        try:
+            self._state("PREPARE", mode="preflight-only")
+            preparation = self.backend.prepare(plan, self.run_dir)
+            self._state("CONFIG_READY", mode="preflight-only", **preparation)
+            config = self.backend.prepare_configs(plan, self.run_dir, preparation)
+            manifest = json.loads((self.run_dir / "manifest.json").read_text())
+            manifest.update({"preparation": preparation, "config": config})
+            _atomic_json(self.run_dir / "manifest.json", manifest)
+            result.update(
+                {
+                    "TEST_RESULT": "PASS",
+                    "preparation": preparation,
+                    "config": config,
+                }
+            )
+            self._state("PASS", mode="preflight-only", test_result="PASS")
+        except StageError as error:
+            result["TEST_RESULT"] = error.classification
+            result["failure"] = error.as_dict()
+            self._state(
+                "FAIL",
+                mode="preflight-only",
+                test_result=error.classification,
+                failure=error.as_dict(),
+            )
+        except Exception as error:
+            failure = {
+                "stage": "INTERNAL",
+                "argv": [],
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": repr(error),
+            }
+            result["failure"] = failure
+            self._state(
+                "FAIL",
+                mode="preflight-only",
+                test_result="HARNESS_FAIL",
+                failure=failure,
+            )
+        finally:
+            try:
+                cleanup = self.backend.cleanup(RunResources(), self.run_dir)
+            except Exception as error:
+                cleanup = {
+                    "CLEANUP_RESULT": "FAIL",
+                    "rings_destroyed": [],
+                    "capability_removed": False,
+                    "errors": [repr(error)],
+                }
+            result["cleanup"] = cleanup
+            _atomic_json(self.run_dir / "result.json", result)
+            self._state(
+                "CLEANED",
+                mode="preflight-only",
+                test_result=result["TEST_RESULT"],
+            )
+        return result
+
+    def run_request(
+        self,
+        request: RateRequest,
+        observation_template: pathlib.Path,
+        compiler: pathlib.Path,
+    ) -> dict[str, Any]:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._state("CONFIG_PREFLIGHT")
+        try:
+            plan = compile_rate_plan(
+                request, observation_template, compiler, self.run_dir
+            )
+        except StageError as error:
+            return self._compile_failure_result(request, error)
+        except Exception as error:
+            return self._compile_failure_result(request, error)
+        return self.run(plan)
+
+    def preflight_request(
+        self,
+        request: RateRequest,
+        observation_template: pathlib.Path,
+        compiler: pathlib.Path,
+    ) -> dict[str, Any]:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._state("CONFIG_PREFLIGHT", mode="preflight-only")
+        try:
+            plan = compile_rate_plan(
+                request, observation_template, compiler, self.run_dir
+            )
+        except StageError as error:
+            return self._compile_failure_result(
+                request, error, mode="preflight-only"
+            )
+        except Exception as error:
+            return self._compile_failure_result(
+                request, error, mode="preflight-only"
+            )
+        return self.preflight(plan)
 
 
 def run_rate_sequence(
@@ -1450,6 +1993,88 @@ def run_rate_sequence(
     return summary
 
 
+def run_rate_request_sequence(
+    request: RateRequest,
+    observation_template: pathlib.Path,
+    compiler: pathlib.Path,
+    backend_factory: Any,
+    result_root: pathlib.Path,
+    warmup_runs: int,
+    measured_runs: int,
+    suite_id: str | None = None,
+) -> dict[str, Any]:
+    if warmup_runs < 0 or measured_runs <= 0:
+        raise ValueError("warmup_runs must be non-negative and measured_runs positive")
+    resolved_suite_id = suite_id or (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        + f"-{uuid.uuid4().hex[:8]}"
+    )
+    suite_root = pathlib.Path(result_root) / resolved_suite_id
+    suite_root.mkdir(parents=True, exist_ok=True)
+    runs: list[dict[str, Any]] = []
+    for role, count in (("warmup", warmup_runs), ("measured", measured_runs)):
+        for index in range(1, count + 1):
+            run_id = f"{role}-{index:02d}"
+            result = RatePointController(
+                backend_factory(), suite_root, run_id=run_id
+            ).run_request(request, observation_template, compiler)
+            run = {
+                "role": role,
+                "index": index,
+                "run_id": run_id,
+                "TEST_RESULT": result["TEST_RESULT"],
+                "CLEANUP_RESULT": result.get("cleanup", {}).get(
+                    "CLEANUP_RESULT", "FAIL"
+                ),
+                "result_path": f"{run_id}/result.json",
+            }
+            runs.append(run)
+            if run["TEST_RESULT"] != "PASS" or run["CLEANUP_RESULT"] != "PASS":
+                break
+        if runs and (
+            runs[-1]["TEST_RESULT"] != "PASS"
+            or runs[-1]["CLEANUP_RESULT"] != "PASS"
+        ):
+            break
+    measured_rates = []
+    for run in runs:
+        if run["role"] != "measured" or run["TEST_RESULT"] != "PASS":
+            continue
+        result = json.loads((suite_root / run["result_path"]).read_text())
+        measured_rates.append(
+            sum(float(sender["actual_payload_gbps"]) for sender in result["senders"])
+        )
+    failures = [
+        run for run in runs
+        if run["TEST_RESULT"] != "PASS" or run["CLEANUP_RESULT"] != "PASS"
+    ]
+    aggregate = None
+    if len(measured_rates) == measured_runs:
+        aggregate = {
+            "median": statistics.median(measured_rates),
+            "minimum": min(measured_rates),
+            "maximum": max(measured_rates),
+            "spread": max(measured_rates) - min(measured_rates),
+        }
+    summary = {
+        "TEST_RESULT": (
+            failures[0]["TEST_RESULT"]
+            if failures and failures[0]["TEST_RESULT"] != "PASS"
+            else "HARNESS_FAIL"
+            if failures
+            else "PASS"
+        ),
+        "suite_id": resolved_suite_id,
+        "request": dataclasses.asdict(request),
+        "warmup_count": warmup_runs,
+        "measured_count": measured_runs,
+        "runs": runs,
+        "actual_aggregate_gbps": aggregate,
+    }
+    _atomic_json(suite_root / "summary.json", summary)
+    return summary
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aggregate-gbps", type=float, required=True)
@@ -1460,8 +2085,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default="dbdisk",
     )
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--execute", action="store_true")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--preflight-only", action="store_true")
+    mode.add_argument("--execute", action="store_true")
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--measured-runs", type=int, default=1)
     parser.add_argument("--suite-id")
@@ -1478,38 +2105,86 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--qths-binary-dir",
         type=pathlib.Path,
-        help="qths1 directory containing rdma2dada and vdif_unpack_worker",
+        help=(
+            "required with --execute: qths1 directory containing the exact "
+            "rdma2dada and vdif_unpack_worker build under test"
+        ),
+    )
+    parser.add_argument(
+        "--sender-binary-dir",
+        type=pathlib.Path,
+        help=(
+            "required with --preflight-only or --execute: identical directory "
+            "on qtpulsar1/2 containing the exact fpga_sender_sim build under test"
+        ),
+    )
+    parser.add_argument(
+        "--observation-config",
+        type=pathlib.Path,
+        help="required with --execute: unified observation JSON template",
+    )
+    parser.add_argument(
+        "--config-compiler",
+        type=pathlib.Path,
+        help="required with --execute: observation_config_compile executable",
     )
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    plan = RatePlan.create(
+    request = RateRequest(
         args.aggregate_gbps,
         args.duration_seconds,
         compute_consumer=args.compute_consumer,
     )
     if args.dry_run:
-        print(json.dumps(plan.as_dict(), indent=2, sort_keys=True))
+        request.validate()
+        print(json.dumps(dataclasses.asdict(request), indent=2, sort_keys=True))
         return 0
-    if not args.execute:
-        print("choose exactly one of --dry-run or --execute", file=sys.stderr)
+    if args.qths_binary_dir is None or args.sender_binary_dir is None:
+        print(
+            "--qths-binary-dir and --sender-binary-dir are required with "
+            "--preflight-only or --execute",
+            file=sys.stderr,
+        )
+        return 2
+    if args.observation_config is None or args.config_compiler is None:
+        print(
+            "--observation-config and --config-compiler are required with --execute",
+            file=sys.stderr,
+        )
         return 2
     backend = SshBackend(
         project_root=args.project_root,
         known_hosts=args.known_hosts,
         qths_binary_dir=args.qths_binary_dir,
+        sender_binary_dir=args.sender_binary_dir,
     )
-    if args.warmup_runs == 0 and args.measured_runs == 1:
-        result = RatePointController(backend, args.result_root).run(plan)
+    if args.preflight_only:
+        if args.warmup_runs != 0 or args.measured_runs != 1:
+            print(
+                "--preflight-only does not accept repetition counts",
+                file=sys.stderr,
+            )
+            return 2
+        result = RatePointController(backend, args.result_root).preflight_request(
+            request, args.observation_config, args.config_compiler
+        )
+    elif args.warmup_runs == 0 and args.measured_runs == 1:
+        result = RatePointController(backend, args.result_root).run_request(
+            request, args.observation_config, args.config_compiler
+        )
     else:
-        result = run_rate_sequence(
-            plan,
+        result = run_rate_request_sequence(
+            request,
+            args.observation_config,
+            args.config_compiler,
             lambda: SshBackend(
                 project_root=args.project_root,
                 known_hosts=args.known_hosts,
                 qths_binary_dir=args.qths_binary_dir,
+                sender_binary_dir=args.sender_binary_dir,
             ),
             args.result_root,
             args.warmup_runs,

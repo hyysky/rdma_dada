@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import hashlib
 import json
+import math
 import pathlib
 import os
 import subprocess
@@ -16,6 +18,111 @@ SPEC = importlib.util.spec_from_file_location("task8c_rate_point", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+def make_plan(
+    aggregate_gbps=1.0,
+    duration_seconds=10.0,
+    batch_packets=16,
+    compute_consumer="dbdisk",
+    raw_ring_blocks=8,
+    compute_ring_blocks=8,
+):
+    per_station = aggregate_gbps / 2.0
+    group_count = math.ceil(
+        per_station * 1_000_000_000 * duration_seconds / 8.0 / 4096
+    )
+    source = {
+        "observation": {
+            "station_ids": [101, 102],
+            "first_channel_id": 100,
+            "nchan": 2,
+            "npol": 2,
+            "sample_interval_ps": 1000000,
+        },
+        "wire": {"samples_per_packet": 512},
+        "receiver": {
+            "device": "mlx5_0",
+            "destination_mac": "98:03:9b:aa:99:d8",
+            "destination_ip": "174.0.1.111",
+            "destination_port": 1000,
+        },
+    }
+    resolved = {
+        "schema_version": 1,
+        "config_id": "a" * 64,
+        "geometry_id": "b" * 64,
+        "source_json": json.dumps(source),
+        "resolved": {
+            "expected_groups": group_count,
+            "group_period_ps": 512000000,
+            "group_start_reference_epoch": 53,
+            "group_start_seconds": 3283200,
+            "group_start_frame": 0,
+            "payload_bytes": 4096,
+            "raw_record_bytes": 4128,
+            "records_per_block": 2048,
+            "raw_block_bytes": 8454144,
+            "compute_block_bytes": 8388608,
+        },
+    }
+    rings = {
+        "config_id": resolved["config_id"],
+        "geometry_id": resolved["geometry_id"],
+        "rings": {
+            "raw": {
+                "key": "0x00d2",
+                "blocks": raw_ring_blocks,
+                "block_bytes": 8454144,
+            },
+            "compute": {
+                "key": "0x00d4",
+                "blocks": compute_ring_blocks,
+                "block_bytes": 8388608,
+            },
+        },
+    }
+    artifacts = {
+        "resolved_observation.json": (json.dumps(resolved) + "\n").encode(),
+        "ring_plan.json": (json.dumps(rings) + "\n").encode(),
+        "raw.header": (
+            f"DATA_STAGE RAW\nCONFIG_ID {resolved['config_id']}\n"
+            f"GEOMETRY_ID {resolved['geometry_id']}\n"
+        ).encode(),
+        "unpacked.header": (
+            f"DATA_STAGE UNPACKED\nCONFIG_ID {resolved['config_id']}\n"
+            f"GEOMETRY_ID {resolved['geometry_id']}\n"
+        ).encode(),
+        "validation_report.json": (
+            json.dumps(
+                {
+                    "valid": True,
+                    "config_id": resolved["config_id"],
+                    "geometry_id": resolved["geometry_id"],
+                }
+            )
+            + "\n"
+        ).encode(),
+    }
+    artifacts["MANIFEST.sha256"] = "".join(
+        f"{hashlib.sha256(value).hexdigest()}  {name}\n"
+        for name, value in sorted(artifacts.items())
+    ).encode()
+    return MODULE.RatePlan(
+        aggregate_gbps=aggregate_gbps,
+        duration_seconds=duration_seconds,
+        batch_packets=batch_packets,
+        per_station_gbps=per_station,
+        group_count=group_count,
+        compute_consumer=compute_consumer,
+        record_bytes=4128,
+        raw_key="00d2",
+        compute_key="00d4",
+        records_per_block=2048,
+        resolved_plan=resolved,
+        ring_plan=rings,
+        artifact_files=artifacts,
+    )
 
 
 class FakeProcess:
@@ -53,8 +160,8 @@ class FakeBackend:
         self.fail_stage = fail_stage
         self.calls = []
         self.processes = [
-            FakeProcess(output='{"sent_packets":10,"scheduled_packets":10,"failed_packets":0,"backend":"SENDMMSG","actual_payload_gbps":0.5}'),
-            FakeProcess(output='{"sent_packets":10,"scheduled_packets":10,"failed_packets":0,"backend":"SENDMMSG","actual_payload_gbps":0.5}'),
+            FakeProcess(output='{"station_id":101,"sent_packets":10,"scheduled_packets":10,"failed_packets":0,"backend":"SENDMMSG","actual_payload_gbps":0.5,"payload_prefix_hex":"65667071"}'),
+            FakeProcess(output='{"station_id":102,"sent_packets":10,"scheduled_packets":10,"failed_packets":0,"backend":"SENDMMSG","actual_payload_gbps":0.5,"payload_prefix_hex":"66677172"}'),
         ]
 
     def _stage(self, name, value):
@@ -94,6 +201,7 @@ class FakeBackend:
             {
                 "receiver": {
                     "accepted": plan.group_count * 2,
+                    "published": plan.group_count * 2,
                     "wrong_length": 0,
                     "cq_errors": 0,
                 },
@@ -105,18 +213,22 @@ class FakeBackend:
                     "unknown_station": 0,
                     "duplicate": 0,
                     "late": 0,
+                    "out_of_range": 0,
                     "complete_groups": plan.group_count,
                     "incomplete_groups": 0,
+                    "fully_missing_groups": 0,
                     "missing_station": 0,
                 },
                 "compute": {
                     "data_bytes": plan.group_count * 8192,
                     "DATA_STAGE": "UNPACKED",
-                    "ORDER": "TFPA",
+                    "ORDER": "ATFP",
                     "NANT": 2,
                     "NCHAN": 2,
                     "NPOL": 2,
-                    "sample_prefix_hex": "65666667",
+                    "CONFIG_ID": plan.config_id,
+                    "GEOMETRY_ID": plan.geometry_id,
+                    "sample_prefix_hex": "65667071",
                 },
             },
         )
@@ -182,6 +294,38 @@ class CleanupFailureTransport(RecordingTransport):
         if stage == "CLEANUP" and any("cleanup.sh" in item for item in argv):
             return MODULE.subprocess.CompletedProcess(
                 argv, 23, "cleanup stdout", "ring 00d4 still exists"
+            )
+        return MODULE.subprocess.CompletedProcess(argv, 0, "", "")
+
+
+class BusySenderEndpointTransport(RecordingTransport):
+    def run(self, argv, stage, check=True):
+        self.calls.append(("run", stage, list(argv)))
+        if (
+            stage == "CONFIG_READY"
+            and "/usr/bin/python3" in argv
+            and any("probe_sender_endpoint.py" in item for item in argv)
+        ):
+            return MODULE.subprocess.CompletedProcess(
+                argv, 98, "", "Address already in use"
+            )
+        if "date" in argv:
+            return MODULE.subprocess.CompletedProcess(argv, 0, "1893456000\n", "")
+        if "sha256sum" in argv:
+            return MODULE.subprocess.CompletedProcess(argv, 0, "abc123  fixture\n", "")
+        return MODULE.subprocess.CompletedProcess(argv, 0, "", "")
+
+
+class MissingDiagnosticTransport(RecordingTransport):
+    def run(self, argv, stage, check=True):
+        self.calls.append(("run", stage, list(argv)))
+        if (
+            stage == "CLEANUP"
+            and argv[0] == "scp"
+            and any("compute-summary.json" in item for item in argv)
+        ):
+            return MODULE.subprocess.CompletedProcess(
+                argv, 1, "", "compute-summary.json does not exist"
             )
         return MODULE.subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -264,6 +408,136 @@ class SecondSenderStartFailureTransport(ExpiringStartTransport):
 
 
 class Task8cRatePointTest(unittest.TestCase):
+    def test_group_count_uses_exact_decimal_rate_arithmetic(self):
+        request = MODULE.RateRequest(
+            aggregate_gbps=0.1,
+            duration_seconds=10.0,
+        )
+        self.assertEqual(
+            MODULE._group_count_for_request(request, 2, 4096),
+            15259,
+        )
+
+    def test_rate_plan_loads_all_geometry_from_compiler_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = {
+                "observation": {
+                    "station_ids": [101, 102],
+                    "first_channel_id": 100,
+                    "nchan": 2,
+                    "npol": 2,
+                    "sample_interval_ps": 1000000,
+                },
+                "wire": {"samples_per_packet": 512},
+            }
+            resolved = {
+                "schema_version": 1,
+                "config_id": "a" * 64,
+                "geometry_id": "b" * 64,
+                "source_json": json.dumps(source),
+                "resolved": {
+                    "expected_groups": 15141,
+                    "group_period_ps": 512000000,
+                    "group_start_reference_epoch": 53,
+                    "group_start_seconds": 3283200,
+                    "group_start_frame": 0,
+                    "payload_bytes": 4096,
+                    "raw_record_bytes": 4128,
+                    "records_per_block": 2048,
+                    "raw_block_bytes": 8454144,
+                    "compute_block_bytes": 8388608,
+                },
+            }
+            ring_plan = {
+                "config_id": "a" * 64,
+                "geometry_id": "b" * 64,
+                "rings": {
+                    "raw": {"key": "0x00d2", "blocks": 8,
+                            "block_bytes": 8454144},
+                    "compute": {"key": "0x00d4", "blocks": 6,
+                                "block_bytes": 8388608},
+                }
+            }
+            contents = {
+                "resolved_observation.json": json.dumps(resolved).encode(),
+                "ring_plan.json": json.dumps(ring_plan).encode(),
+                "raw.header": (
+                    f"DATA_STAGE RAW\nCONFIG_ID {resolved['config_id']}\n"
+                    f"GEOMETRY_ID {resolved['geometry_id']}\n"
+                ).encode(),
+                "unpacked.header": (
+                    f"DATA_STAGE UNPACKED\nCONFIG_ID {resolved['config_id']}\n"
+                    f"GEOMETRY_ID {resolved['geometry_id']}\n"
+                ).encode(),
+                "validation_report.json": json.dumps(
+                    {
+                        "valid": True,
+                        "config_id": resolved["config_id"],
+                        "geometry_id": resolved["geometry_id"],
+                    }
+                ).encode(),
+            }
+            manifest = []
+            for name, value in sorted(contents.items()):
+                (root / name).write_bytes(value)
+                manifest.append(f"{hashlib.sha256(value).hexdigest()}  {name}")
+            (root / "MANIFEST.sha256").write_text("\n".join(manifest) + "\n")
+            plan = MODULE.RatePlan.from_artifact_directory(
+                root, aggregate_gbps=1.0, duration_seconds=10.0,
+                batch_packets=16, compute_consumer="dbdisk"
+            )
+            (root / "raw.header").write_bytes(b"modified")
+            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                MODULE.RatePlan.from_artifact_directory(
+                    root,
+                    aggregate_gbps=1.0,
+                    duration_seconds=10.0,
+                    batch_packets=16,
+                    compute_consumer="dbdisk",
+                )
+        self.assertEqual(plan.group_count, 15141)
+        self.assertEqual(plan.raw_key, "00d2")
+        self.assertEqual(plan.compute_key, "00d4")
+        self.assertEqual(plan.raw_ring_blocks, 8)
+        self.assertEqual(plan.compute_ring_blocks, 6)
+        self.assertEqual(plan.config_id, "a" * 64)
+        self.assertEqual(plan.geometry_id, "b" * 64)
+
+    def test_qths_bundle_uses_resolved_plan_and_no_legacy_geometry_json(self):
+        plan = make_plan(0.1, 10.0)
+        bundle = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-test"
+        )
+        self.assertIn("resolved_observation.json", bundle)
+        self.assertIn("ring_plan.json", bundle)
+        self.assertNotIn("pipeline.json", bundle)
+        self.assertNotIn("packet.json", bundle)
+        self.assertNotIn("worker.json", bundle)
+        self.assertIn(
+            'vdif_unpack_worker" --plan "$run_dir/resolved_observation.json"',
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            'rdma2dada" --plan "$run_dir/resolved_observation.json"',
+            bundle["start.sh"],
+        )
+
+    def test_ring_creation_uses_compiler_ring_plan_values(self):
+        plan = make_plan(0.1, 10.0)
+        bundle = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-test"
+        )
+        prepare = bundle["prepare.sh"]
+        self.assertIn(
+            f"-k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 "
+            f"-n {plan.raw_ring_blocks}", prepare
+        )
+        self.assertIn(
+            f"-k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 "
+            f"-n {plan.compute_ring_blocks}", prepare
+        )
+
     def test_hf_controller_does_not_ssh_back_through_hf(self):
         argv = MODULE.build_ssh_argv(
             "qths1", ["date", "-u", "+%s"], "/tmp/task8c-known-hosts"
@@ -273,17 +547,17 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertNotIn("HF", argv)
         self.assertEqual(argv[-3:], ["date", "-u", "+%s"])
 
-    def test_rate_plan_rounds_groups_to_complete_sender_batches(self):
-        plan = MODULE.RatePlan.create(1.0, 10.0, batch_packets=16)
+    def test_rate_plan_preserves_unaligned_finite_transfer_boundary(self):
+        plan = make_plan(1.0, 10.0, batch_packets=16)
         self.assertEqual(plan.per_station_gbps, 0.5)
         self.assertEqual(plan.record_bytes, 4128)
-        self.assertEqual(plan.group_count % 16, 0)
-        self.assertEqual(plan.group_count % (plan.records_per_block // 2), 0)
-        self.assertEqual((plan.group_count * 2) % plan.records_per_block, 0)
+        self.assertEqual(plan.group_count, math.ceil(625_000_000 / 4096))
+        self.assertNotEqual(plan.group_count % 16, 0)
+        self.assertNotEqual((plan.group_count * 2) % plan.records_per_block, 0)
         self.assertGreaterEqual(plan.group_count * plan.record_bytes * 8, 5_000_000_000)
 
     def test_sender_configs_share_geometry_and_start_time(self):
-        plan = MODULE.RatePlan.create(1.0, 10.0, batch_packets=16)
+        plan = make_plan(1.0, 10.0, batch_packets=16)
         first = MODULE.build_sender_config(
             plan, 101, "174.0.1.100", 41001, "2030-01-01-00:03:00"
         )
@@ -297,12 +571,24 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(second["station"]["station_id"], 102)
         self.assertEqual(first["destination"], second["destination"])
 
+    def test_sender_source_ports_are_deterministic_per_run_and_distinct(self):
+        first = MODULE.derive_sender_source_ports("suite-a-measured-01")
+        repeated = MODULE.derive_sender_source_ports("suite-a-measured-01")
+        second_run = MODULE.derive_sender_source_ports("suite-a-measured-02")
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, second_run)
+        self.assertTrue(40000 <= first[0] < 50000)
+        self.assertTrue(50000 <= first[1] < 60000)
+        self.assertNotEqual(first[0], first[1])
+
     def test_qths_bundle_uses_exact_pid_files_and_no_wildcard_kill(self):
-        plan = MODULE.RatePlan.create(1.0, 10.0)
+        plan = make_plan(1.0, 10.0)
         bundle = MODULE.build_qths_bundle(
-            plan, "/tmp/task8c-run-abc", "2030-01-01-00:03:00"
+            plan, "/tmp/task8c-run-abc"
         )
-        combined = "\n".join(bundle.values())
+        combined = "\n".join(
+            value for value in bundle.values() if isinstance(value, str)
+        )
         self.assertIn("receiver.pid", combined)
         self.assertIn("worker.pid", combined)
         self.assertIn("reader.pid", combined)
@@ -313,12 +599,25 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn(str(plan.raw_block_bytes), bundle["prepare.sh"])
         self.assertIn(str(plan.compute_block_bytes), bundle["prepare.sh"])
 
+    def test_qths_bundle_does_not_regenerate_wire_or_geometry(self):
+        plan = make_plan(0.1, 10.0)
+        bundle = MODULE.build_qths_bundle(
+            plan,
+            "/tmp/task8c-wire-only",
+        )
+        self.assertEqual(
+            bundle["resolved_observation.json"],
+            plan.artifact_files["resolved_observation.json"],
+        )
+        self.assertNotIn("packet.json", bundle)
+        self.assertNotIn("pipeline.json", bundle)
+        self.assertNotIn("worker.json", bundle)
+
     def test_qths_bundle_can_select_an_isolated_release_binary_directory(self):
-        plan = MODULE.RatePlan.create(0.1, 10.0)
+        plan = make_plan(0.1, 10.0)
         bundle = MODULE.build_qths_bundle(
             plan,
             "/tmp/task8c-release",
-            "2030-01-01-00:03:00",
             qths_binary_dir="/home/user/wy/rdma_dada/build-task8c-release",
         )
         self.assertIn(
@@ -332,12 +631,41 @@ class Task8cRatePointTest(unittest.TestCase):
             bundle["cleanup.sh"],
         )
 
+    def test_backend_uses_explicit_release_sender_binary_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "suite" / "measured-01"
+            run_dir.mkdir(parents=True)
+            transport = RecordingTransport()
+            backend = MODULE.SshBackend(
+                transport=transport,
+                project_root=root,
+                known_hosts=root / "known-hosts",
+                sender_binary_dir=pathlib.Path(
+                    "/home/user/wy/rdma_dada/build-observation-task7-release"
+                ),
+            )
+            plan = make_plan(0.1, 10.0)
+            preparation = backend.prepare(plan, run_dir)
+            evidence = backend.prepare_configs(plan, run_dir, preparation)
+            backend.start_senders(plan, run_dir)
+        expected = (
+            "/home/user/wy/rdma_dada/"
+            "build-observation-task7-release/fpga_sender_sim"
+        )
+        self.assertEqual(evidence["binary_path"]["qtpulsar1:fpga_sender_sim"], expected)
+        sender_commands = [
+            call[2] for call in transport.calls if call[0] == "start"
+        ]
+        self.assertEqual(len(sender_commands), 2)
+        self.assertTrue(all(expected in command for command in sender_commands))
+
     def test_dbnull_consumer_uses_single_transfer_zero_copy_without_disk_output(self):
-        plan = MODULE.RatePlan.create(
+        plan = make_plan(
             5.0, 10.0, compute_consumer="dbnull"
         )
         bundle = MODULE.build_qths_bundle(
-            plan, "/tmp/task8c-dbnull", "2030-01-01-00:03:00"
+            plan, "/tmp/task8c-dbnull"
         )
         self.assertIn("dada_dbnull -k 00d4 -s -z -q", bundle["start.sh"])
         self.assertIn(
@@ -347,19 +675,21 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn('"consumer": "dada_dbnull"', bundle["summarize.py"])
 
     def test_dbnull_statistics_require_consumer_eod_and_exact_unpack_counts(self):
-        plan = MODULE.RatePlan.create(
+        plan = make_plan(
             5.0, 10.0, compute_consumer="dbnull"
         )
         records = plan.group_count * 2
         receiver = (
-            f"[RDMA] Receive summary: accepted={records}, wrong_length=0 "
-            "(0.000000%)\n"
+            f"[RDMA] Receive summary: accepted={records}, wrong_length=0, "
+            f"published={records}, blocks=149, partial_blocks=1, "
+            "cq_tail_records=12, wrong_length_ratio=0.000000000\n"
         )
         worker = (
             "VDIF unpack statistics: "
             f"records={records} accepted={records} bad_header=0 invalid_data=0 "
-            "unknown_station=0 duplicate=0 late=0 "
+            "unknown_station=0 duplicate=0 late=0 out_of_range=0 "
             f"complete_groups={plan.group_count} incomplete_groups=0 "
+            "fully_missing_groups=0 "
             f"missing_station=0/{records} (0.000000%)\n"
             "VDIF unpack transfer completed\n"
         )
@@ -373,10 +703,10 @@ class Task8cRatePointTest(unittest.TestCase):
                 "single_transfer": True,
             },
         )
-        MODULE._validate_statistics(statistics, plan)
+        MODULE._validate_statistics(statistics, plan, "65667071")
         statistics["compute"]["exit_code"] = 1
         with self.assertRaises(MODULE.StageError) as raised:
-            MODULE._validate_statistics(statistics, plan)
+            MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
 
     def test_live_backend_builds_direct_host_commands_and_local_bundle(self):
@@ -401,7 +731,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 project_root=root,
                 known_hosts=root / "known-hosts",
             )
-            plan = MODULE.RatePlan.create(1.0, 10.0)
+            plan = make_plan(1.0, 10.0)
             run_dir = root / "results" / "run"
             run_dir.mkdir(parents=True)
             preparation = backend.prepare(plan, run_dir)
@@ -415,16 +745,21 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(
             sorted(config_evidence["config_sha"]),
             [
+                "qths1:MANIFEST.sha256",
                 "qths1:cleanup.sh",
                 "qths1:finish.sh",
-                "qths1:packet.json",
-                "qths1:pipeline.json",
                 "qths1:prepare.sh",
+                "qths1:raw.header",
+                "qths1:resolved_observation.json",
+                "qths1:ring_plan.json",
                 "qths1:start.sh",
                 "qths1:summarize.py",
-                "qths1:worker.json",
+                "qths1:unpacked.header",
+                "qths1:validation_report.json",
                 "qtpulsar1:101.json",
+                "qtpulsar1:probe_sender_endpoint.py",
                 "qtpulsar2:102.json",
+                "qtpulsar2:probe_sender_endpoint.py",
             ],
         )
         self.assertEqual(
@@ -439,6 +774,60 @@ class Task8cRatePointTest(unittest.TestCase):
             ],
         )
 
+    def test_prepare_configs_preflights_each_sender_source_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            packet_dir = root / "config" / "packet_formats"
+            packet_dir.mkdir(parents=True)
+            (packet_dir / "frontend.example-v1.json").write_text(
+                json.dumps({"schema_version": 1, "format_id": "project-vdif-v1"})
+            )
+            transport = RecordingTransport()
+            backend = MODULE.SshBackend(
+                transport=transport,
+                project_root=root,
+                known_hosts=root / "known-hosts",
+            )
+            run_dir = root / "suite" / "measured-01"
+            run_dir.mkdir(parents=True)
+            plan = make_plan(0.1, 10.0)
+            preparation = backend.prepare(plan, run_dir)
+            evidence = backend.prepare_configs(plan, run_dir, preparation)
+        probes = [
+            call
+            for call in transport.calls
+            if call[0] == "run"
+            and call[1] == "CONFIG_READY"
+            and "/usr/bin/python3" in call[2]
+            and any("probe_sender_endpoint.py" in item for item in call[2])
+        ]
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(all("-c" not in probe[2] for probe in probes))
+        self.assertEqual(len(evidence["sender_endpoints"]), 2)
+        self.assertEqual(len(evidence["source_ports"]), 2)
+
+    def test_busy_sender_endpoint_is_environment_blocker_before_rings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            packet_dir = root / "config" / "packet_formats"
+            packet_dir.mkdir(parents=True)
+            (packet_dir / "frontend.example-v1.json").write_text(
+                json.dumps({"schema_version": 1, "format_id": "project-vdif-v1"})
+            )
+            backend = MODULE.SshBackend(
+                transport=BusySenderEndpointTransport(),
+                project_root=root,
+                known_hosts=root / "known-hosts",
+            )
+            run_dir = root / "suite" / "measured-01"
+            run_dir.mkdir(parents=True)
+            plan = make_plan(0.1, 10.0)
+            preparation = backend.prepare(plan, run_dir)
+            with self.assertRaises(MODULE.StageError) as raised:
+                backend.prepare_configs(plan, run_dir, preparation)
+        self.assertEqual(raised.exception.classification, "ENV_BLOCKED")
+        self.assertEqual(raised.exception.stage, "CONFIG_READY")
+
     def test_remote_run_directory_includes_suite_and_run_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -450,7 +839,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 known_hosts=root / "known-hosts",
             )
             preparation = backend.prepare(
-                MODULE.RatePlan.create(1.0, 10.0), run_dir
+                make_plan(1.0, 10.0), run_dir
             )
         self.assertEqual(
             preparation["remote_run_dir"],
@@ -470,7 +859,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 known_hosts=root / "known-hosts",
             )
             preparation = backend.prepare(
-                MODULE.RatePlan.create(1.0, 10.0), run_dir
+                make_plan(1.0, 10.0), run_dir
             )
         self.assertEqual(preparation["start_utc"], "2030-01-01-00:03:00")
         date_commands = [
@@ -494,7 +883,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 project_root=root,
                 known_hosts=root / "known-hosts",
             )
-            plan = MODULE.RatePlan.create(
+            plan = make_plan(
                 5.0, 10.0, compute_consumer="dbnull"
             )
             preparation = backend.prepare(plan, run_dir)
@@ -516,7 +905,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 project_root=root,
                 known_hosts=root / "known-hosts",
             )
-            plan = MODULE.RatePlan.create(
+            plan = make_plan(
                 5.0, 10.0, compute_consumer="dbnull"
             )
             preparation = backend.prepare(plan, run_dir)
@@ -543,7 +932,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 project_root=root,
                 known_hosts=root / "known-hosts",
             )
-            plan = MODULE.RatePlan.create(
+            plan = make_plan(
                 1.0, 10.0, compute_consumer="dbdisk"
             )
             preparation = backend.prepare(plan, run_dir)
@@ -597,7 +986,7 @@ class Task8cRatePointTest(unittest.TestCase):
             controller = MODULE.RatePointController(
                 backend, pathlib.Path(directory), run_id="success"
             )
-            result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            result = controller.run(make_plan(1.0, 10.0))
             saved = json.loads(
                 (pathlib.Path(directory) / "success" / "result.json").read_text()
             )
@@ -616,7 +1005,7 @@ class Task8cRatePointTest(unittest.TestCase):
             controller = MODULE.RatePointController(
                 backend, pathlib.Path(directory), run_id="failure"
             )
-            result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            result = controller.run(make_plan(1.0, 10.0))
             saved = json.loads(
                 (pathlib.Path(directory) / "failure" / "result.json").read_text()
             )
@@ -643,7 +1032,7 @@ class Task8cRatePointTest(unittest.TestCase):
             controller = MODULE.RatePointController(
                 backend, pathlib.Path(directory), run_id="sender-failure"
             )
-            result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            result = controller.run(make_plan(1.0, 10.0))
         self.assertEqual(result["TEST_RESULT"], "PRODUCT_FAIL")
         self.assertEqual(result["failure"]["stage"], "SENDERS_RUNNING")
 
@@ -658,7 +1047,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 pathlib.Path(directory),
                 run_id="missing-statistics",
             )
-            result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            result = controller.run(make_plan(1.0, 10.0))
         self.assertEqual(result["TEST_RESULT"], "PRODUCT_FAIL")
         self.assertEqual(result["failure"]["stage"], "COLLECTING")
 
@@ -685,10 +1074,10 @@ class Task8cRatePointTest(unittest.TestCase):
                 "remote_run_dir": backend.remote_run_dir,
             }
             backend._write_bundle(
-                MODULE.RatePlan.create(1.0, 10.0),
+                make_plan(1.0, 10.0),
                 backend.preparation["start_utc"],
             )
-            backend.start_senders(MODULE.RatePlan.create(1.0, 10.0), run_dir)
+            backend.start_senders(make_plan(1.0, 10.0), run_dir)
             first = json.loads((run_dir / "bundle" / "sender101.json").read_text())
             second = json.loads((run_dir / "bundle" / "sender102.json").read_text())
         self.assertEqual(first["time"]["start_utc"], "2030-01-01-00:05:50")
@@ -716,7 +1105,7 @@ class Task8cRatePointTest(unittest.TestCase):
             run_dir = root / "results"
             run_dir.mkdir()
             with self.assertRaises(MODULE.StageError) as raised:
-                backend.start_pipeline(MODULE.RatePlan.create(1.0, 10.0), run_dir)
+                backend.start_pipeline(make_plan(1.0, 10.0), run_dir)
             cleanup = backend.cleanup(MODULE.RunResources(), run_dir)
         cleanup_commands = [
             call[2]
@@ -746,6 +1135,22 @@ class Task8cRatePointTest(unittest.TestCase):
             any("ring 00d4 still exists" in error for error in cleanup["errors"])
         )
 
+    def test_missing_early_failure_diagnostic_does_not_fail_resource_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backend = MODULE.SshBackend(
+                transport=MissingDiagnosticTransport(),
+                project_root=root,
+                known_hosts=root / "known-hosts",
+            )
+            backend.remote_run_dir = "/tmp/task8c-missing-diagnostic"
+            backend._rings_acquired = ["00d2", "00d4"]
+            cleanup = backend.cleanup(MODULE.RunResources(), root)
+        self.assertEqual(cleanup["CLEANUP_RESULT"], "PASS")
+        self.assertEqual(cleanup["errors"], [])
+        self.assertEqual(len(cleanup["diagnostic_errors"]), 1)
+        self.assertIn("compute-summary.json", cleanup["diagnostic_errors"][0])
+
     def test_second_sender_start_failure_terminates_first_sender(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -766,11 +1171,11 @@ class Task8cRatePointTest(unittest.TestCase):
             backend.remote_run_dir = "/tmp/task8c-partial-senders"
             backend.preparation = {"start_utc": "2030-01-01-00:06:00"}
             backend._write_bundle(
-                MODULE.RatePlan.create(1.0, 10.0),
+                make_plan(1.0, 10.0),
                 backend.preparation["start_utc"],
             )
             with self.assertRaises(MODULE.StageError):
-                backend.start_senders(MODULE.RatePlan.create(1.0, 10.0), run_dir)
+                backend.start_senders(make_plan(1.0, 10.0), run_dir)
             backend.cleanup(MODULE.RunResources(), run_dir)
         self.assertTrue(transport.started_process.terminated)
 
@@ -780,9 +1185,22 @@ class Task8cRatePointTest(unittest.TestCase):
         failed = PolledProcess(7, "SEND_ERROR: source stream unavailable")
         with self.assertRaises(MODULE.StageError) as raised:
             backend.wait_senders(
-                MODULE.RatePlan.create(1.0, 10.0), [running, failed]
+                make_plan(1.0, 10.0), [running, failed]
             )
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
+        self.assertTrue(running.terminated)
+
+    def test_sender_bind_collision_is_environment_blocker_and_aborts_peer(self):
+        failed = PolledProcess(
+            1, "SEND_ERROR: bind source endpoint: Address already in use"
+        )
+        running = FakeProcess()
+        backend = MODULE.SshBackend(transport=RecordingTransport())
+        with self.assertRaises(MODULE.StageError) as raised:
+            backend.wait_senders(
+                make_plan(0.1, 10.0), [failed, running]
+            )
+        self.assertEqual(raised.exception.classification, "ENV_BLOCKED")
         self.assertTrue(running.terminated)
 
     def test_finish_script_fails_when_owned_process_does_not_exit(self):
@@ -791,9 +1209,8 @@ class Task8cRatePointTest(unittest.TestCase):
             for name in ("receiver", "worker", "reader"):
                 (root / f"{name}.pid").write_text("12345\n")
             bundle = MODULE.build_qths_bundle(
-                MODULE.RatePlan.create(1.0, 10.0),
+                make_plan(1.0, 10.0),
                 str(root),
-                "2030-01-01-00:03:00",
             )
             finish = root / "finish.sh"
             finish.write_text(bundle["finish.sh"])
@@ -819,17 +1236,19 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn("did not exit", completed.stderr)
 
     def test_qths_logs_are_parsed_into_reconciled_statistics(self):
-        plan = MODULE.RatePlan.create(1.0, 10.0)
+        plan = make_plan(1.0, 10.0)
         records = plan.group_count * 2
         receiver = (
-            f"[RDMA] Receive summary: accepted={records}, wrong_length=0 "
-            "(0.000000%)\n"
+            f"[RDMA] Receive summary: accepted={records}, wrong_length=0, "
+            f"published={records}, blocks=149, partial_blocks=1, "
+            "cq_tail_records=12, wrong_length_ratio=0.000000000\n"
         )
         worker = (
             "VDIF unpack statistics: "
             f"records={records} accepted={records} bad_header=0 invalid_data=0 "
-            "unknown_station=0 duplicate=0 late=0 "
+            "unknown_station=0 duplicate=0 late=0 out_of_range=0 "
             f"complete_groups={plan.group_count} incomplete_groups=0 "
+            "fully_missing_groups=0 "
             "missing_station=0/302816 (0.000000%)\n"
             "VDIF unpack transfer completed\n"
         )
@@ -837,23 +1256,56 @@ class Task8cRatePointTest(unittest.TestCase):
             "data_bytes": plan.group_count * 8192,
             "header": {
                 "DATA_STAGE": "UNPACKED",
-                "ORDER": "TFPA",
+                "ORDER": "ATFP",
                 "NANT": "2",
                 "NCHAN": "2",
                 "NPOL": "2",
+                "CONFIG_ID": plan.config_id,
+                "GEOMETRY_ID": plan.geometry_id,
             },
-            "sample_hex": "65666667",
+            "sample_hex": "65667071",
         }
         statistics = MODULE.parse_qths_statistics(receiver, worker, compute)
-        MODULE._validate_statistics(statistics, plan)
+        MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(statistics["receiver"]["accepted"], records)
         self.assertEqual(statistics["unpack"]["complete_groups"], plan.group_count)
-        self.assertEqual(statistics["compute"]["sample_hex"], "65666667")
+        self.assertEqual(statistics["compute"]["sample_hex"], "65667071")
+
+    def test_dbdisk_statistics_reject_mixed_configuration_identity(self):
+        plan = make_plan(0.1, 10.0)
+        backend = FakeBackend()
+        statistics = backend.collect(plan, pathlib.Path("unused"))
+        statistics["compute"]["CONFIG_ID"] = "c" * 64
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "65667071")
+        self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
+
+    def test_preflight_only_runs_configuration_gate_without_starting_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = FakeBackend()
+            controller = MODULE.RatePointController(
+                backend, pathlib.Path(directory), run_id="preflight"
+            )
+            result = controller.preflight(make_plan(0.1, 10.0))
+            saved = json.loads(
+                (pathlib.Path(directory) / "preflight" / "result.json").read_text()
+            )
+        self.assertEqual(result["TEST_RESULT"], "PASS")
+        self.assertEqual(saved["mode"], "preflight-only")
+        self.assertEqual(
+            backend.calls,
+            ["PREPARE", "CONFIG_READY", "CLEANUP"],
+        )
 
     def test_execute_cli_routes_through_real_controller_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             original = MODULE.SshBackend
+            original_compile = MODULE.compile_rate_plan
             MODULE.SshBackend = lambda **_kwargs: FakeBackend()
+            MODULE.compile_rate_plan = lambda request, *_args: make_plan(
+                request.aggregate_gbps, request.duration_seconds,
+                request.batch_packets, request.compute_consumer
+            )
             try:
                 return_code = MODULE.main(
                     [
@@ -863,16 +1315,64 @@ class Task8cRatePointTest(unittest.TestCase):
                         "10",
                         "--result-root",
                         directory,
+                        "--qths-binary-dir",
+                        "/tmp/task8c-release",
+                        "--sender-binary-dir",
+                        "/tmp/task8c-sender-release",
+                        "--observation-config",
+                        "/tmp/observation.json",
+                        "--config-compiler",
+                        "/tmp/observation_config_compile",
                         "--execute",
                     ]
                 )
             finally:
                 MODULE.SshBackend = original
+                MODULE.compile_rate_plan = original_compile
             results = list(pathlib.Path(directory).glob("*/result.json"))
             self.assertEqual(len(results), 1)
             result = json.loads(results[0].read_text())
         self.assertEqual(return_code, 0)
         self.assertEqual(result["TEST_RESULT"], "PASS")
+
+    def test_preflight_cli_runs_same_gate_without_runtime_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = MODULE.SshBackend
+            original_compile = MODULE.compile_rate_plan
+            backend = FakeBackend()
+            MODULE.SshBackend = lambda **_kwargs: backend
+            MODULE.compile_rate_plan = lambda request, *_args: make_plan(
+                request.aggregate_gbps,
+                request.duration_seconds,
+                request.batch_packets,
+                request.compute_consumer,
+            )
+            try:
+                return_code = MODULE.main(
+                    [
+                        "--aggregate-gbps",
+                        "0.1",
+                        "--result-root",
+                        directory,
+                        "--qths-binary-dir",
+                        "/tmp/task8c-release",
+                        "--sender-binary-dir",
+                        "/tmp/task8c-sender-release",
+                        "--observation-config",
+                        "/tmp/observation.json",
+                        "--config-compiler",
+                        "/tmp/observation_config_compile",
+                        "--preflight-only",
+                    ]
+                )
+            finally:
+                MODULE.SshBackend = original
+                MODULE.compile_rate_plan = original_compile
+            results = list(pathlib.Path(directory).glob("*/result.json"))
+            result = json.loads(results[0].read_text())
+        self.assertEqual(return_code, 0)
+        self.assertEqual(result["mode"], "preflight-only")
+        self.assertEqual(backend.calls, ["PREPARE", "CONFIG_READY", "CLEANUP"])
 
     def test_execute_cli_returns_nonzero_when_cleanup_fails(self):
         class CleanupFailedBackend(FakeBackend):
@@ -886,7 +1386,12 @@ class Task8cRatePointTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             original = MODULE.SshBackend
+            original_compile = MODULE.compile_rate_plan
             MODULE.SshBackend = lambda **_kwargs: CleanupFailedBackend()
+            MODULE.compile_rate_plan = lambda request, *_args: make_plan(
+                request.aggregate_gbps, request.duration_seconds,
+                request.batch_packets, request.compute_consumer
+            )
             try:
                 return_code = MODULE.main(
                     [
@@ -894,18 +1399,32 @@ class Task8cRatePointTest(unittest.TestCase):
                         "1",
                         "--result-root",
                         directory,
+                        "--qths-binary-dir",
+                        "/tmp/task8c-release",
+                        "--sender-binary-dir",
+                        "/tmp/task8c-sender-release",
+                        "--observation-config",
+                        "/tmp/observation.json",
+                        "--config-compiler",
+                        "/tmp/observation_config_compile",
                         "--execute",
                     ]
                 )
             finally:
                 MODULE.SshBackend = original
+                MODULE.compile_rate_plan = original_compile
         self.assertEqual(return_code, 1)
 
     def test_sequence_cli_returns_nonzero_on_harness_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             original = MODULE.SshBackend
+            original_compile = MODULE.compile_rate_plan
             MODULE.SshBackend = lambda **_kwargs: FakeBackend(
                 fail_stage="PREPARE"
+            )
+            MODULE.compile_rate_plan = lambda request, *_args: make_plan(
+                request.aggregate_gbps, request.duration_seconds,
+                request.batch_packets, request.compute_consumer
             )
             try:
                 return_code = MODULE.main(
@@ -918,12 +1437,62 @@ class Task8cRatePointTest(unittest.TestCase):
                         "1",
                         "--result-root",
                         directory,
+                        "--qths-binary-dir",
+                        "/tmp/task8c-release",
+                        "--sender-binary-dir",
+                        "/tmp/task8c-sender-release",
+                        "--observation-config",
+                        "/tmp/observation.json",
+                        "--config-compiler",
+                        "/tmp/observation_config_compile",
                         "--execute",
                     ]
                 )
             finally:
                 MODULE.SshBackend = original
+                MODULE.compile_rate_plan = original_compile
         self.assertEqual(return_code, 1)
+
+    def test_request_compile_exception_persists_harness_failure_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = FakeBackend()
+            controller = MODULE.RatePointController(
+                backend, pathlib.Path(directory), run_id="bad-artifacts"
+            )
+            original_compile = MODULE.compile_rate_plan
+            MODULE.compile_rate_plan = lambda *_args: (_ for _ in ()).throw(
+                ValueError("compiler manifest mismatch")
+            )
+            try:
+                result = controller.run_request(
+                    MODULE.RateRequest(0.1, 10.0),
+                    pathlib.Path("observation.json"),
+                    pathlib.Path("observation_config_compile"),
+                )
+            finally:
+                MODULE.compile_rate_plan = original_compile
+            saved = json.loads(
+                (pathlib.Path(directory) / "bad-artifacts" / "result.json").read_text()
+            )
+        self.assertEqual(result["TEST_RESULT"], "HARNESS_FAIL")
+        self.assertEqual(saved["failure"]["stage"], "CONFIG_READY")
+        self.assertIn("compiler manifest mismatch", saved["failure"]["stderr"])
+        self.assertEqual(saved["cleanup"]["CLEANUP_RESULT"], "PASS")
+
+    def test_execute_requires_explicit_qths_binary_directory(self):
+        class MustNotConstructBackend:
+            def __init__(self, **_kwargs):
+                raise AssertionError("backend must not use an implicit stale build")
+
+        original = MODULE.SshBackend
+        MODULE.SshBackend = MustNotConstructBackend
+        try:
+            return_code = MODULE.main(
+                ["--aggregate-gbps", "0.1", "--execute"]
+            )
+        finally:
+            MODULE.SshBackend = original
+        self.assertEqual(return_code, 2)
 
     def test_acceptance_sequence_runs_one_warmup_and_three_fresh_measurements(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -935,7 +1504,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 return backend
 
             summary = MODULE.run_rate_sequence(
-                MODULE.RatePlan.create(1.0, 10.0),
+                make_plan(1.0, 10.0),
                 backend_factory,
                 pathlib.Path(directory),
                 warmup_runs=1,
@@ -975,7 +1544,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 return backend
 
             summary = MODULE.run_rate_sequence(
-                MODULE.RatePlan.create(5.0, 10.0),
+                make_plan(5.0, 10.0),
                 backend_factory,
                 pathlib.Path(directory),
                 warmup_runs=1,
@@ -1009,7 +1578,7 @@ class Task8cRatePointTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             summary = MODULE.run_rate_sequence(
-                MODULE.RatePlan.create(1.0, 10.0),
+                make_plan(1.0, 10.0),
                 CleanupFailedBackend,
                 pathlib.Path(directory),
                 warmup_runs=0,
@@ -1020,12 +1589,48 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(summary["runs"][0]["TEST_RESULT"], "PASS")
         self.assertEqual(summary["runs"][0]["CLEANUP_RESULT"], "FAIL")
 
+    def test_request_sequence_classifies_cleanup_failure_as_harness_failure(self):
+        class CleanupFailedBackend(FakeBackend):
+            def cleanup(self, resources, run_dir):
+                return {
+                    "CLEANUP_RESULT": "FAIL",
+                    "rings_destroyed": [],
+                    "capability_removed": False,
+                    "errors": ["ring remains"],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_compile = MODULE.compile_rate_plan
+            MODULE.compile_rate_plan = lambda request, *_args: make_plan(
+                request.aggregate_gbps,
+                request.duration_seconds,
+                request.batch_packets,
+                request.compute_consumer,
+            )
+            try:
+                summary = MODULE.run_rate_request_sequence(
+                    MODULE.RateRequest(0.1, 10.0),
+                    pathlib.Path("observation.json"),
+                    pathlib.Path("observation_config_compile"),
+                    CleanupFailedBackend,
+                    pathlib.Path(directory),
+                    warmup_runs=0,
+                    measured_runs=3,
+                    suite_id="cleanup-failure",
+                )
+            finally:
+                MODULE.compile_rate_plan = original_compile
+        self.assertEqual(summary["TEST_RESULT"], "HARNESS_FAIL")
+        self.assertEqual(len(summary["runs"]), 1)
+        self.assertEqual(summary["runs"][0]["TEST_RESULT"], "PASS")
+        self.assertEqual(summary["runs"][0]["CLEANUP_RESULT"], "FAIL")
+
     def test_every_run_persists_a_manifest_before_remote_work(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = MODULE.RatePointController(
                 FakeBackend(), pathlib.Path(directory), run_id="manifest"
             )
-            controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            controller.run(make_plan(1.0, 10.0))
             manifest = json.loads(
                 (pathlib.Path(directory) / "manifest" / "manifest.json").read_text()
             )
@@ -1045,7 +1650,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 "run",
                 side_effect=FileNotFoundError("git executable is unavailable"),
             ) as git_probe:
-                result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+                result = controller.run(make_plan(1.0, 10.0))
             manifest = json.loads(
                 (pathlib.Path(directory) / "without-git" / "manifest.json").read_text()
             )
@@ -1063,7 +1668,7 @@ class Task8cRatePointTest(unittest.TestCase):
             controller = MODULE.RatePointController(
                 CleanupRaisesBackend(), pathlib.Path(directory), run_id="cleanup-raises"
             )
-            result = controller.run(MODULE.RatePlan.create(1.0, 10.0))
+            result = controller.run(make_plan(1.0, 10.0))
             saved = json.loads(
                 (pathlib.Path(directory) / "cleanup-raises" / "result.json").read_text()
             )

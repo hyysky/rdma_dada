@@ -10,6 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+PACED_START_MARGIN_SECONDS = 5
+
+
 def fail(message: str) -> None:
     raise AssertionError(message)
 
@@ -80,14 +83,15 @@ def run_v2(executable: Path, source_config: Path) -> None:
     source_port = reserve_source_port()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
         receiver.bind(("127.0.0.1", 0))
-        receiver.settimeout(4.0)
+        receiver.settimeout(PACED_START_MARGIN_SECONDS + 5.0)
         destination_port = receiver.getsockname()[1]
         config = json.loads(source_config.read_text(encoding="utf-8"))
         config["source"]["port"] = source_port
         config["destination"]["port"] = destination_port
         config["time"]["group_count"] = 320
         config["time"]["start_utc"] = (
-            datetime.now(timezone.utc) + timedelta(seconds=1)
+            datetime.now(timezone.utc)
+            + timedelta(seconds=PACED_START_MARGIN_SECONDS)
         ).strftime("%Y-%m-%d-%H:%M:%S")
         config["transmit"]["target_gbps"] = 0.01
 
@@ -132,6 +136,13 @@ def run_v2(executable: Path, source_config: Path) -> None:
         fail(f"summary source port mismatch: {summary}")
     if summary["backend"] not in {"SEND", "SENDMMSG"}:
         fail(f"unexpected UDP backend: {summary}")
+    expected_prefix = received[0][0][32:36].hex()
+    if summary.get("payload_prefix_hex") != expected_prefix:
+        fail(
+            "sender summary payload prefix differs from transmitted bytes: "
+            f"summary={summary.get('payload_prefix_hex')} "
+            f"packet={expected_prefix}"
+        )
     if not 0.0098 <= summary["actual_payload_gbps"] <= 0.0102:
         fail(f"paced sender rate is outside 2% tolerance: {summary}")
 

@@ -19,6 +19,7 @@ struct VdifSenderStats {
     std::uint64_t short_batches;
     std::uint64_t overrun_batches;
     std::string backend;
+    std::string payload_prefix_hex;
 };
 
 bool RunUdpVdifSender(const VdifSenderSimConfig& config,

@@ -47,21 +47,29 @@ ctest --test-dir build-linux --output-on-failure
 
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
-| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类和幂次日志限频 | `BUILD_TESTING=ON` |
+| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类、幂次日志限频，以及 zero/one/batch/partial raw tail 的完整-record 发布判定 | `BUILD_TESTING=ON` |
 | `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_config_test` | `vdif_unpack_config_test.cpp` | 校验 ring key、Station ID→A 映射、两 block payload-only 窗口几何、profile 冲突、内存上限与溢出错误路径 | `BUILD_TESTING=ON` |
-| `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、未知字段保留、TFPA/无包头几何、零填充策略及输入冲突不发布输出 | `BUILD_TESTING=ON` |
-| `vdif_unpack_engine_test` | `vdif_unpack_engine_test.cpp` | 校验任意 Station 顺序和跨 block 的 TFP→TFPA 重排、完整 group 稳定等待、超时/EOD 零填充、arena 淘汰、坏包/重复/late 统计及 partial-block 契约 | `BUILD_TESTING=ON` |
+| `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、观测 timeline 原样传播、按 `EXPECTED_GROUPS` 计算 `TRANSFER_SIZE`、未知字段保留、block-scoped ATFP/无包头几何及输入冲突不发布输出 | `BUILD_TESTING=ON` |
+| `vdif_timeline_test` | `vdif_timeline_test.cpp` | 校验整数皮秒 group 时间轴解析、非整数 groups/s 跨秒、ordinal↔VDIF seconds/frame 严格逆映射、exclusive stop boundary、字段范围及算术溢出 | `BUILD_TESTING=ON` |
+| `vdif_unpack_engine_test` | `vdif_unpack_engine_test.cpp` | 保留旧 TFP→TFPA scatter 作为正确性参考，校验任意 Station 顺序、跨 block、零填充及错误统计 | `BUILD_TESTING=ON` |
+| `vdif_atfp_engine_test` | `vdif_atfp_engine_test.cpp` | 校验固定环形 slot、直接 Station lookup、每包单次 payload memcpy、ATFP block view、group-distance watermark、完全缺失/部分缺失补零、large gap、wrap/partial EOD 及与旧 TFPA reference 的等价性 | `BUILD_TESTING=ON` |
+| `atfp_block_writer_test` | `atfp_block_writer_test.cpp` | 验证每个 compute block 只 Acquire/Commit 一次、每个 A 平面无回绕一次复制/回绕最多两段复制、partial block 紧凑布局及 sink 失败路径 | `BUILD_TESTING=ON` |
 | `group_block_writer_test` | `group_block_writer_test.cpp` | 用内存 block sink 验证有序 group 直接填充满 block、EOD 精确提交部分 block、空传输不提交，以及 group/sink 容量错误不发布数据 | `BUILD_TESTING=ON` |
 | `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 schema v1/v2 sender JSON、显式 source、PACED/batch/payload mode、整数皮秒跨秒/frame 重置、双 Station、CI8/CI16、MTU 和 fault | `BUILD_TESTING=ON` |
 | `vdif_sender_rate_test` | `vdif_sender_rate_test.cpp` | 校验等速 Station 整数分配、固定点累计字节 deadline、零值和 uint64 overflow | `BUILD_TESTING=ON` |
 | `vdif_sender_batch_test` | `vdif_sender_batch_test.cpp` | 校验固定 packet pool 地址、连续 header、Station 模板、repeat payload 和 deterministic reference 一致性 | `BUILD_TESTING=ON` |
-| `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source 字段一致 | `BUILD_TESTING=ON` |
+| `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
-| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 Task 8C 控制器的无 Git 测试主机、直接 SSH、配置/二进制 SHA、sender batch 与 raw-block 对齐、共同启动时间刷新、双 sender 并发、dbdisk/dbnull consumer、结果分类、manifest、定向清理和 warm-up+三次测量汇总 | 找到 Python 3；不连接远端服务器 |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证控制器只消费统一 observation/compiler artifacts，并覆盖 preflight-only、配置/二进制 SHA、有限 observation stop、计数守恒、CONFIG_ID/GEOMETRY_ID、双 sender、ATFP/dbdisk/dbnull、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `observation_config_test` | `observation_config_test.cpp` | 校验统一观测 JSON、精确皮秒时长、Station/A 轴顺序、metadata、ring/receiver 参数、相对路径、算法顺序及严格缺失/未知字段拒绝 | `BUILD_TESTING=ON` |
+| `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置和固定 wire profile 精确派生 payload、timeline、block/window/ring/file/rate，并校验溢出、duration 整除、VDIF 和 direct-I/O 边界 | `BUILD_TESTING=ON` |
+| `config_identity_test` | `config_identity_test.cpp` | 校验标准 SHA256、配置规范化、路径无关的 CONFIG_ID/GEOMETRY_ID、权重内容摘要、resolved plan 往返及派生值/ID 篡改拒绝 | `BUILD_TESTING=ON` |
+| `observation_artifacts_test` | `observation_artifacts_test.cpp` | 校验统一观测配置生成 RAW/ATFP DADA header、resolved/ring/report 内容、4096-byte header、manifest 和原子拒绝覆盖 | `BUILD_TESTING=ON` |
+| `observation_config_compile_test` | `observation_config_compile_test.py` | 验证 compiler preflight、无输出副作用、原子 artifact 目录、SHA256 manifest、无覆盖和无效配置拒绝 | 找到 Python 3 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
-| `packet_format_config_test` | `packet_format_config_test.cpp` | 加载固定 32-byte/8-word Project VDIF profile，逐字段校验 bit layout、TFP→TFPA axis、HEADER/DERIVED/LOOKUP 引用和 payload 几何 | `BUILD_TESTING=ON` |
+| `packet_format_config_test` | `packet_format_config_test.cpp` | 加载 schema-v2、固定 32-byte/8-word Project VDIF wire profile，逐字段校验 bit layout、TFP axis、HEADER/DERIVED/LOOKUP 引用，并拒绝 schema-v1 `payload_bytes`、观测轴常量和 downstream `output_order` | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
 | `pipeline_config_inspect_test` | `pipeline_config_inspect` 工具 | 确认示例 JSON 能通过用户侧配置检查工具 | `BUILD_TESTING=ON` |
 | `pipeline_worker_config_inspect_test` | `pipeline_worker_config_inspect` 工具 | 从 F/A/P、UDP 分组、product 和积分参数计算 input/product/scratch/output block bytes | `BUILD_TESTING=ON` |
@@ -83,9 +91,9 @@ ctest --test-dir build-linux --output-on-failure
 | `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
 | `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→Beamform→Power→TimeIntegrate→D2H、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
-| `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 通过 PSRDADA ASCII header 完成 RAW/TFP/32-byte 与 COMPUTE/TFPA/无包头双阶段 round-trip，验证未知字段保留及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
-| `rdma_receiver_integration_test` | `rdma_receiver_integration.sh` + `rdma_udp_probe.py` | 从两台远端服务器发送不同源 MAC/IP/port 的正常 UDP record，并在正常包之间插入短包；验证 raw ring 只含 8 个完整 record、接收持续运行且统计为 accepted=8/wrong_length=1 | `BUILD_RDMA_PIPELINE=ON`、真实 RDMA NIC/PSRDADA/SSH sender 环境；未配置时 skip 77 |
-| `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 创建精确 raw/compute rings，经 `dada_diskdb` 输入跨 block Project VDIF transfer，并用 `dada_dbdisk` 验证 full/partial compute block、TFPA 字节、完整 header、EOD 及同一 worker 的连续双 transfer | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
+| `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 从统一 observation 配置生成 RAW header，经 PSRDADA ASCII codec 验证 Project VDIF 几何、CONFIG_ID、GEOMETRY_ID 及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
+| `rdma_receiver_integration_test` | `rdma_receiver_integration.sh` + `rdma_udp_probe.py` | 两台远端发送 11 个正常 record 与 1 个短包；以 `records_per_block=16/send_n=4` 验证 2 个完整 batch + 3-record CQ tail 在停止时发布为一个无截断 partial raw block，并满足 accepted=published=11、wrong_length=1 | `BUILD_RDMA_PIPELINE=ON`、真实 RDMA NIC/PSRDADA/SSH sender 环境；未配置时 skip 77 |
+| `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 从统一 observation 编译 plan/header/ring 几何，验证 full/partial/完全缺失 group、连续双 transfer、ATFP 字节及 EOD，并拒绝错误 CONFIG_ID 和 raw/compute ring block capacity | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
 
 ## 单项调用
 
@@ -98,7 +106,8 @@ ctest --test-dir build-linux --output-on-failure
 ctest --test-dir build -R '^rdma_receive_policy_test$' --output-on-failure
 ```
 
-真实 NIC 测试需要接收服务器能够免交互 SSH 到两台已同步本项目的发送服务器：
+这个小型真实 NIC 测试要求“执行该脚本的主机”能够免交互 SSH 到两台已同步本项目的
+发送服务器：
 
 ```bash
 export RDMA_TEST_DEVICE=1
@@ -123,11 +132,44 @@ record 后插入一个少 1 byte 的 record；B 发送端随后补足第二种�
 `RDMA_TEST_SSH_KNOWN_HOSTS` 应是本次测试专用文件；脚本启用严格 host-key 校验，不会
 读取或修改运行账户的永久 `~/.ssh/known_hosts`。
 
+当前部署中只有 HF 能分别直连 qths1、qtpulsar1 和 qtpulsar2，qths1 不能反向 SSH
+两台 sender。因此不要把本脚本复制到 qths1 作为正式验收入口，也不要为适配脚本修改
+服务器认证。当前三机正式测试必须从 HF 运行版本化
+`scripts/task8c_rate_point.py`；该控制器分别连接接收端和两个发送端，并覆盖有限传输
+CQ tail、partial raw block、unpack 计数守恒和 compute 输出验证。
+
 ### `pipeline_config_test`
 
 ```bash
 ./build/pipeline_config_test config/pipeline.example.json
 ctest --test-dir build -R '^pipeline_config_test$' --output-on-failure
+```
+
+### `observation_config_test`
+
+```bash
+./build/observation_config_test config/observation.example.json
+ctest --test-dir build -R '^observation_config_test$' --output-on-failure
+```
+
+### `config_identity_test`
+
+```bash
+./build/config_identity_test \
+  config/observation.example.json \
+  config/packet_formats/frontend.example-v1.json
+ctest --test-dir build -R '^config_identity_test$' --output-on-failure
+```
+
+### `observation_artifacts_test`
+
+```bash
+./build/observation_artifacts_test config/observation.example.json
+python3 tests/observation_config_compile_test.py \
+  build/observation_config_compile config/observation.example.json
+ctest --test-dir build \
+  -R '^(observation_artifacts_test|observation_config_compile_test)$' \
+  --output-on-failure
 ```
 
 ### Packet format profile 测试
@@ -145,8 +187,8 @@ ctest --test-dir build \
   -R '^packet_format_(config|inspect)_test$' --output-on-failure
 ```
 
-该 profile 是 Project VDIF v1 的机器可读 wire contract；测试中的 `payload_bytes` 是一组
-CI8/NCHAN=3 几何示例，实际观测仍须与 packet header 逐包交叉校验。
+该 profile 是 Project VDIF v1 的机器可读 wire contract；schema v2 不再保存
+`payload_bytes`，实际观测几何由统一观测配置计算并与 packet header 逐包交叉校验。
 
 ### VDIF unpack 配置与 header 测试
 
@@ -154,26 +196,33 @@ CI8/NCHAN=3 几何示例，实际观测仍须与 packet header 逐包交叉校�
 ./build/vdif_unpack_config_test config/vdif_unpack.example.json
 ./build/vdif_unpack_header_test
 ./build/vdif_unpack_engine_test
+./build/vdif_atfp_engine_test
+./build/atfp_block_writer_test
 ctest --test-dir build \
-  -R '^vdif_unpack_(config|header|engine)_test$' --output-on-failure
+  -R '^(vdif_(unpack_(config|header|engine)|atfp_engine)|atfp_block_writer)_test$' \
+  --output-on-failure
 ```
 
-前者加载 unpack、pipeline 和 packet-format 三份配置并检查 payload-only 窗口；后者验证
-compute header 更新前会先完整检查 raw header 几何，失败时不会覆盖调用者已有 metadata。
-engine 测试使用独立生成的 40-byte 小型 Project VDIF record，以手工已知字节验证 TFPA
-位置和缺失 Station 的零区间，不依赖未来 UDP/RDMA adapter。
+配置测试同时加载旧格式回归 fixture 和统一 observation/resolved plan，验证两者得到一致
+的 payload-only 窗口；header 测试验证 compute header 更新前会先完整检查 raw header
+几何与两个 identity，失败时不会覆盖调用者已有 metadata。
+engine 测试使用独立生成的 40-byte 小型 Project VDIF record。旧 engine 保留 TFPA
+reference；新 engine 以手工 ATFP oracle 验证位置、完全缺失 group、缺失 Station 零区间，
+并在测试中独立转置后与旧 TFPA 结果逐字节比较，不依赖 UDP/RDMA adapter。
 
 Linux 上的真实双 ring 测试：
 
 ```bash
 tests/vdif_unpack_worker_integration.sh \
-  build-linux/vdif_unpack_worker "$(pwd)"
+  build-linux/vdif_unpack_worker \
+  build-linux/observation_config_compile "$(pwd)"
 ctest --test-dir build-linux \
   -R '^vdif_unpack_worker_integration_test$' --output-on-failure
 ```
 
-该脚本的测试 sample 间隔固定为 `1 us`，分别验证末尾为完整 compute block、部分
-compute block，以及 `runtime.run_once=false` 时同一 worker 的两个连续 transfer；缺少
+该脚本的测试 sample 间隔固定为 `1 us`，分别验证末尾为完整 compute block、partial
+compute block、完全缺失 group，以及 `processing.run_once=false` 时同一 worker 的两个
+连续 transfer；同时验证错误 identity 和 ring block capacity 会在数据处理前失败。缺少
 `dada_db`、`dada_diskdb`、`dada_dbdisk` 等工具时返回 CTest skip code 77。
 
 ### Compute group block writer 测试
@@ -210,19 +259,42 @@ python3 tests/task8c_rate_point_test.py
 ctest --test-dir build-linux -R '^task8c_rate_point_test$' --output-on-failure
 ```
 
-正式测试在 HF 控制机的项目根目录执行。下面一条命令会依次执行一次 warm-up 和三次
-独立测量；每次都重新创建 ring、启动 receiver/unpack/consumer 和两个 sender，最后定向
-清理本次资源。结果保存在项目目录之外的持久路径，不能使用临时手写控制器代替：
+正式测试在 HF 控制机的项目根目录执行。先运行同路径预检；它会生成并核对 compiler
+artifacts、检查二进制和 sender endpoint，但不创建 ring、capability 或数据进程：
 
 ```bash
 python3 -u scripts/task8c_rate_point.py \
-  --aggregate-gbps 1 \
+  --aggregate-gbps 0.1 \
   --duration-seconds 10 \
-  --warmup-runs 1 \
+  --qths-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --sender-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --observation-config config/observation.example.json \
+  --config-compiler /home/user/wy/rdma_dada/build-observation-task7-release/observation_config_compile \
+  --result-root /home/user/wy/task8c-results \
+  --preflight-only
+```
+
+预检通过后运行三次独立的 0.1 Gbps 正确性测量：
+
+```bash
+python3 -u scripts/task8c_rate_point.py \
+  --aggregate-gbps 0.1 \
+  --duration-seconds 10 \
+  --warmup-runs 0 \
   --measured-runs 3 \
+  --qths-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --sender-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --observation-config config/observation.example.json \
+  --config-compiler /home/user/wy/rdma_dada/build-observation-task7-release/observation_config_compile \
   --result-root /home/user/wy/task8c-results \
   --execute
 ```
+
+`--qths-binary-dir` 和 `--sender-binary-dir` 在正式预检与执行模式下都是必填项，必须
+分别指向本轮已经完成 SHA、编译选项和动态库核对的 Release 构建。控制器不会默认使用
+可能残留旧二进制的 `build-linux`。`--observation-config` 是唯一用户几何输入；控制器使用
+`--config-compiler` 产生并校验 resolved plan、ring plan、DADA headers、validation report
+和 manifest，不再生成 `pipeline.json`、`packet.json`、`worker.json`。
 
 每次运行产生 `manifest.json`、`state.json`、`result.json` 和分组件日志；suite 目录的
 `summary.json` 汇总三次实测速率的 median/minimum/maximum/spread。只有四次运行清理均
@@ -231,6 +303,10 @@ python3 -u scripts/task8c_rate_point.py \
 创建后续 run 的进程、ring 或结果目录。
 任一 Station 无法启动或提前异常退出时，控制器会立即终止另一 Station，并停止
 receiver、unpack 和 consumer；不会把单 Station 数据当作有效观测继续处理。
+每个 run 从其唯一 ID 确定性生成一对不同的 UDP source port，并在创建 qths1 rings 前
+分别到 qtpulsar1/2 探测 source IP/port 是否可绑定。端口已占用会以 `ENV_BLOCKED`
+停止本轮，不会误报为算法或吞吐失败，也不会重复使用固定 `41001/42001` 与其他任务
+争抢。
 
 1 Gbps correctness gate 保持默认 `--compute-consumer dbdisk`，以检查实际 `.dada` 文件。
 后续高速 rate point 使用：
@@ -242,6 +318,10 @@ python3 -u scripts/task8c_rate_point.py \
   --compute-consumer dbnull \
   --warmup-runs 1 \
   --measured-runs 3 \
+  --qths-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --sender-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
+  --observation-config config/observation.example.json \
+  --config-compiler /home/user/wy/rdma_dada/build-observation-task7-release/observation_config_compile \
   --result-root /home/user/wy/task8c-results \
   --execute
 ```

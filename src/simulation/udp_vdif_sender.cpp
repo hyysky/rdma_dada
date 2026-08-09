@@ -237,6 +237,18 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
 
     VdifSenderBatch batch;
     if (!batch.Initialize(config, error)) return false;
+    {
+        const VdifPacketView& first = batch.packet(0);
+        const std::size_t prefix_bytes = std::min<std::size_t>(
+            4U, first.bytes - 32U);
+        std::ostringstream prefix;
+        prefix << std::hex << std::setfill('0');
+        for (std::size_t index = 0; index < prefix_bytes; ++index) {
+            prefix << std::setw(2)
+                   << static_cast<unsigned int>(first.data[32U + index]);
+        }
+        stats->payload_prefix_hex = prefix.str();
+    }
     std::chrono::system_clock::time_point realtime_start;
     if (!ParseUtc(config.start_utc, &realtime_start, error)) return false;
     if (realtime_start <= std::chrono::system_clock::now())
@@ -344,6 +356,7 @@ std::string FormatVdifSenderStatsJson(const VdifSenderSimConfig& config,
            << "\"overrun_batches\":" << stats.overrun_batches << ','
            << "\"batch_packets\":" << config.batch_packets << ','
            << "\"payload_mode\":\"" << config.payload_mode << "\","
+           << "\"payload_prefix_hex\":\"" << stats.payload_prefix_hex << "\","
            << "\"backend\":\"" << stats.backend << "\"}"
            << std::endl;
     return output.str();
