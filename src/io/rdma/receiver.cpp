@@ -499,6 +499,7 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                            time_buffer, this_ptr->param.gpu_id,
                            (unsigned long)(total_recv * ring_pkt_len / 1024),
                            bandwidth, (unsigned long)(ns_elapsed / 1000));
+                    fflush(stdout);
                     total_recv_pre = total_recv;
                 }
             }

@@ -273,6 +273,14 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
     if (!CheckedMultiply(groups_per_block, 2U, &minimum_window_groups) ||
         layout.window_capacity_groups < minimum_window_groups)
         return Fail("ATFP window must hold at least two compute blocks", error);
+    const std::uint64_t maximum_reorder_horizon =
+        layout.window_capacity_groups - groups_per_block;
+    const std::uint64_t reorder_horizon_groups =
+        config.reorder_horizon_groups == 0U
+            ? maximum_reorder_horizon
+            : config.reorder_horizon_groups;
+    if (reorder_horizon_groups > maximum_reorder_horizon)
+        return Fail("ATFP reorder horizon exceeds window lookahead", error);
     if (layout.window_bytes > config.max_window_bytes ||
         layout.window_bytes > std::numeric_limits<std::size_t>::max() ||
         layout.window_capacity_groups > std::numeric_limits<std::size_t>::max() ||
@@ -299,8 +307,7 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
     next->timeline = timeline;
     next->raw_block_bytes = pipeline_layout.raw_block_bytes;
     next->groups_per_compute_block = groups_per_block;
-    next->reorder_horizon_groups =
-        layout.window_capacity_groups - groups_per_block;
+    next->reorder_horizon_groups = reorder_horizon_groups;
     next->geometry.first_channel_id = config.first_channel_id;
     next->geometry.nchan = static_cast<std::uint8_t>(pipeline.nchan);
     next->geometry.npol = static_cast<std::uint8_t>(pipeline.npol);

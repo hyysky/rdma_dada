@@ -117,6 +117,7 @@ int SendBuffPtr(std::uint64_t valid_bytes) {
         printf("[Progress] Blocks written: %" PRIu64
                " | Ring buffer: %.1f%% full (%" PRIu64 "/%" PRIu64 " MB)\n",
                total_blocks, fill_percent, used / 1024 / 1024, total / 1024 / 1024);
+        fflush(stdout);
     }
     return 0;
 }

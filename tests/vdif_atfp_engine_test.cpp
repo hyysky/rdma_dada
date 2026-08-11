@@ -402,6 +402,40 @@ void TestOneLeadingStationCannotEvictLaggingStations() {
            "multi-Station watermark does not create artificial late packets");
 }
 
+void TestExplicitMissingWaitLeavesStationSkewReserve() {
+    unpack::VdifAtfpUnpackEngine engine;
+    unpack::VdifUnpackConfig config = MakeConfig();
+    config.window_blocks = 3;
+    config.max_window_bytes = 720;
+    config.reorder_horizon_groups = 2;
+    unpack::VdifUnpackLayout layout = MakeLayout();
+    layout.window_capacity_groups = 6;
+    layout.window_bytes = 720;
+    std::string error;
+    Expect(engine.Configure(config, MakePipeline(), layout, MakeTimeline(8),
+                            &error),
+           "explicit missing-wait engine configures: " + error);
+    std::vector<CollectedBlock> output;
+    const unpack::VdifAtfpBlockEmitter emit = Collect(&output);
+
+    std::vector<std::uint8_t> records;
+    Append(&records, MakeRecord(0, 101, 0));
+    AppendCompleteGroup(&records, 1);
+    Append(&records, MakeRecord(5, 101, 0));
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 50, emit,
+                                  &error),
+           "leading Station fits in dedicated skew reserve: " + error);
+    Expect(output.empty(), "incomplete group still waits two groups");
+
+    records.clear();
+    AppendCompleteGroup(&records, 2);
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 51, emit,
+                                  &error),
+           "missing wait expires independently of window capacity: " + error);
+    Expect(output.size() == 1U,
+           "explicit missing wait emits while skew reserve remains occupied");
+}
+
 void TestStationSkewAndRawBlockCompositionStatistics() {
     unpack::VdifAtfpUnpackEngine engine;
     std::string error;
@@ -531,6 +565,7 @@ int main() {
     TestWatermarkZeroFillAndSlotReuse();
     TestStationSkewAndRawBlockCompositionStatistics();
     TestOneLeadingStationCannotEvictLaggingStations();
+    TestExplicitMissingWaitLeavesStationSkewReserve();
     TestPacketClassificationAndPartialEod();
     TestMalformedRawBlockDoesNotPublish();
     TestExpectedTransferOverflowIsRejected();

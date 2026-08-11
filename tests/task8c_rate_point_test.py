@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import dataclasses
 import hashlib
+import io
 import json
 import math
 import pathlib
@@ -446,6 +448,19 @@ class SecondSenderStartFailureTransport(ExpiringStartTransport):
 
 
 class Task8cRatePointTest(unittest.TestCase):
+    def test_result_directory_name_contains_stage_rate_duration_and_utc_time(self):
+        request = MODULE.RateRequest(
+            aggregate_gbps=5.0,
+            duration_seconds=30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+
+        self.assertEqual(
+            MODULE.result_directory_name(request, "20260811T143000Z"),
+            "unpack-5Gbps-30s-20260811T143000Z",
+        )
+
     def test_remote_compiler_uses_qths_binary_and_scoped_artifacts(self):
         class RecordingTransport:
             def __init__(self):
@@ -498,6 +513,93 @@ class Task8cRatePointTest(unittest.TestCase):
             MODULE._group_count_for_request(request, 2, 4128),
             15141,
         )
+
+    def test_window_blocks_include_wait_and_skew_reserve_at_30gbps(self):
+        self.assertEqual(
+            MODULE._window_blocks_for_horizon(
+                aggregate_gbps=30.0,
+                missing_wait_ms=200.0,
+                station_skew_reserve_ms=200.0,
+                station_count=2,
+                record_bytes=4128,
+                groups_per_block=6400,
+            ),
+            (31, 96000),
+        )
+
+    def test_compile_rate_plan_renders_rate_derived_window_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            template = root / "observation.template.json"
+            template.write_text(json.dumps({
+                "observation": {"observation_id": "fixture"},
+                "wire": {"profile": "/tmp/wire.json"},
+                "blocks": {"window_blocks": 4},
+                "processing": {"modules": []},
+            }))
+            bootstrap = dataclasses.replace(
+                make_plan(
+                    aggregate_gbps=15.0,
+                    duration_seconds=30.0,
+                    compute_consumer="dbnull",
+                    pipeline_stage="unpack",
+                ),
+                records_per_block=12800,
+            )
+            final = dataclasses.replace(
+                bootstrap,
+                group_count=MODULE._group_count_for_request(
+                    MODULE.RateRequest(
+                        15.0,
+                        30.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                        missing_wait_ms=200.0,
+                        station_skew_reserve_ms=200.0,
+                    ),
+                    bootstrap.nant,
+                    bootstrap.record_bytes,
+                ),
+            )
+            with mock.patch.object(MODULE, "_run_observation_compiler"), \
+                    mock.patch.object(
+                        MODULE.RatePlan,
+                        "from_artifact_directory",
+                        side_effect=[bootstrap, final],
+                    ):
+                MODULE.compile_rate_plan(
+                    MODULE.RateRequest(
+                        15.0,
+                        30.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                        missing_wait_ms=200.0,
+                        station_skew_reserve_ms=200.0,
+                    ),
+                    template,
+                    pathlib.Path("/tmp/compiler"),
+                    root / "run",
+                    compiler_executor=object(),
+                )
+
+            rendered = json.loads((root / "run" / "observation.json").read_text())
+            self.assertEqual(rendered["blocks"]["window_blocks"], 17)
+
+    def test_dry_run_accepts_missing_wait_and_station_skew_times(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            return_code = MODULE.main([
+                "--aggregate-gbps", "15",
+                "--duration-seconds", "30",
+                "--compute-consumer", "dbnull",
+                "--pipeline-stage", "unpack",
+                "--missing-wait-ms", "200",
+                "--station-skew-reserve-ms", "200",
+                "--dry-run",
+            ])
+        self.assertEqual(return_code, 0)
+        request = json.loads(stdout.getvalue())
+        self.assertEqual(request["missing_wait_ms"], 200.0)
+        self.assertEqual(request["station_skew_reserve_ms"], 200.0)
 
     def test_rate_plan_loads_all_geometry_from_compiler_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -604,7 +706,10 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(plan.geometry_id, "b" * 64)
 
     def test_qths_bundle_uses_resolved_plan_and_no_legacy_geometry_json(self):
-        plan = make_plan(0.1, 10.0, compute_consumer="dbnull")
+        plan = dataclasses.replace(
+            make_plan(0.1, 10.0, compute_consumer="dbnull"),
+            reorder_horizon_groups=1234,
+        )
         bundle = MODULE.build_qths_bundle(
             plan, "/tmp/task8c-test"
         )
@@ -616,6 +721,9 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn(
             'vdif_unpack_worker" --plan "$run_dir/resolved_observation.json"',
             bundle["start.sh"],
+        )
+        self.assertIn(
+            '--reorder-horizon-groups 1234', bundle["start.sh"]
         )
         self.assertIn(
             'rdma2dada" --plan "$run_dir/resolved_observation.json"',
@@ -1737,6 +1845,10 @@ class Task8cRatePointTest(unittest.TestCase):
                 MODULE.compile_rate_plan = original_compile
             results = list(pathlib.Path(directory).glob("*/result.json"))
             self.assertEqual(len(results), 1)
+            self.assertRegex(
+                results[0].parent.name,
+                r"^full-1Gbps-10s-\d{8}T\d{6}Z$",
+            )
             result = json.loads(results[0].read_text())
         self.assertEqual(return_code, 0)
         self.assertEqual(result["TEST_RESULT"], "PASS")

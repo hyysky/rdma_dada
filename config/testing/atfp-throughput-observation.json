@@ -20,10 +20,10 @@
     "samples_per_packet": 1024
   },
   "blocks": {
-    "groups_per_block": 1024,
+    "groups_per_block": 6400,
     "raw_ring_blocks": 8,
     "compute_ring_blocks": 8,
-    "window_blocks": 2
+    "window_blocks": 4
   },
   "rings": {
     "raw_key": "0x00d2",

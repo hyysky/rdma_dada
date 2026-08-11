@@ -57,15 +57,24 @@ class RateRequest:
     batch_packets: int = 16
     compute_consumer: str = "dbdisk"
     pipeline_stage: str = "full"
+    missing_wait_ms: float = 200.0
+    station_skew_reserve_ms: float = 200.0
 
     def validate(self) -> None:
         if (
             not math.isfinite(self.aggregate_gbps)
             or not math.isfinite(self.duration_seconds)
+            or not math.isfinite(self.missing_wait_ms)
+            or not math.isfinite(self.station_skew_reserve_ms)
             or self.aggregate_gbps <= 0
             or self.duration_seconds <= 0
+            or self.missing_wait_ms <= 0
+            or self.station_skew_reserve_ms <= 0
         ):
-            raise ValueError("rate and duration must be positive")
+            raise ValueError(
+                "rate, duration, missing wait and Station skew reserve "
+                "must be positive"
+            )
         if self.batch_packets <= 0:
             raise ValueError("batch_packets must be positive")
         if self.compute_consumer not in ("dbdisk", "dbnull"):
@@ -74,6 +83,20 @@ class RateRequest:
             raise ValueError("pipeline_stage must be unpack or full")
         if self.pipeline_stage == "unpack" and self.compute_consumer != "dbnull":
             raise ValueError("unpack pipeline_stage requires dbnull")
+
+
+def result_directory_name(
+    request: RateRequest, timestamp_utc: str | None = None
+) -> str:
+    timestamp = timestamp_utc or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+    def compact(value: float) -> str:
+        return str(int(value)) if value.is_integer() else format(value, "g")
+
+    return (
+        f"{request.pipeline_stage}-{compact(request.aggregate_gbps)}Gbps-"
+        f"{compact(request.duration_seconds)}s-{timestamp}"
+    )
 
 
 def build_ssh_argv(
@@ -115,6 +138,7 @@ class RatePlan:
     ring_plan: dict[str, Any]
     artifact_files: dict[str, bytes]
     pipeline_stage: str = "full"
+    reorder_horizon_groups: int = 0
 
     @property
     def uses_pipeline_worker(self) -> bool:
@@ -362,6 +386,48 @@ def _group_count_for_request(
     )
 
 
+def _window_blocks_for_horizon(
+    aggregate_gbps: float,
+    missing_wait_ms: float,
+    station_skew_reserve_ms: float,
+    station_count: int,
+    record_bytes: int,
+    groups_per_block: int,
+) -> tuple[int, int]:
+    if (
+        not math.isfinite(aggregate_gbps)
+        or not math.isfinite(missing_wait_ms)
+        or not math.isfinite(station_skew_reserve_ms)
+        or aggregate_gbps <= 0
+        or missing_wait_ms <= 0
+        or station_skew_reserve_ms <= 0
+        or station_count <= 0
+        or record_bytes <= 0
+        or groups_per_block <= 0
+    ):
+        raise ValueError("window horizon inputs must be positive")
+    group_bits = decimal.Decimal(record_bytes * 8 * station_count)
+    groups_per_ms = (
+        decimal.Decimal(str(aggregate_gbps))
+        * decimal.Decimal(1_000_000)
+        / group_bits
+    )
+
+    def blocks_for(milliseconds: float) -> int:
+        groups = int(
+            (groups_per_ms * decimal.Decimal(str(milliseconds)))
+            .to_integral_value(rounding=decimal.ROUND_CEILING)
+        )
+        return (groups + groups_per_block - 1) // groups_per_block
+
+    missing_wait_blocks = blocks_for(missing_wait_ms)
+    station_skew_blocks = blocks_for(station_skew_reserve_ms)
+    return (
+        1 + missing_wait_blocks + station_skew_blocks,
+        missing_wait_blocks * groups_per_block,
+    )
+
+
 def _run_observation_compiler(
     compiler: pathlib.Path,
     config_path: pathlib.Path,
@@ -448,6 +514,22 @@ def compile_rate_plan(
     group_count = _group_count_for_request(
         request, bootstrap.nant, bootstrap.record_bytes
     )
+    if bootstrap.records_per_block % bootstrap.nant != 0:
+        raise StageError(
+            "CONFIG_READY", ["validate", "records_per_block"], 1, "",
+            "records_per_block is not divisible by Station count",
+            "HARNESS_FAIL",
+        )
+    groups_per_block = bootstrap.records_per_block // bootstrap.nant
+    window_blocks, reorder_horizon_groups = _window_blocks_for_horizon(
+        request.aggregate_gbps,
+        request.missing_wait_ms,
+        request.station_skew_reserve_ms,
+        bootstrap.nant,
+        bootstrap.record_bytes,
+        groups_per_block,
+    )
+    observation["blocks"]["window_blocks"] = window_blocks
     group_period_ps = int(
         bootstrap.resolved_plan["resolved"]["group_period_ps"]
     )
@@ -472,7 +554,9 @@ def compile_rate_plan(
             "CONFIG_READY", ["validate", "expected_groups"], 1,
             str(plan.group_count), str(group_count), "HARNESS_FAIL"
         )
-    return plan
+    return dataclasses.replace(
+        plan, reorder_horizon_groups=reorder_horizon_groups
+    )
 
 
 def derive_sender_source_ports(run_identity: str) -> tuple[int, int]:
@@ -724,7 +808,7 @@ project={qths_binary_dir}
  /usr/bin/python3 "$run_dir/capture_nic_counters.py" {receiver_device} {ethtool_path} "$run_dir/nic-before.json"
 {reader_start}
 {pipeline_worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" "$project/vdif_unpack_worker" --plan "$run_dir/resolved_observation.json" >"$run_dir/worker.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" "$project/vdif_unpack_worker" --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
 /usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n 64 --nsge 4 >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
@@ -2613,6 +2697,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aggregate-gbps", type=float, required=True)
     parser.add_argument("--duration-seconds", type=float, default=10.0)
     parser.add_argument(
+        "--missing-wait-ms",
+        type=float,
+        default=200.0,
+        help=(
+            "maximum wait for a missing Station packet in milliseconds"
+        ),
+    )
+    parser.add_argument(
+        "--station-skew-reserve-ms",
+        type=float,
+        default=200.0,
+        help=(
+            "additional window capacity for Station watermark skew in "
+            "milliseconds"
+        ),
+    )
+    parser.add_argument(
         "--compute-consumer",
         choices=("dbdisk", "dbnull"),
         default="dbdisk",
@@ -2677,6 +2778,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.duration_seconds,
         compute_consumer=args.compute_consumer,
         pipeline_stage=args.pipeline_stage,
+        missing_wait_ms=args.missing_wait_ms,
+        station_skew_reserve_ms=args.station_skew_reserve_ms,
     )
     if args.dry_run:
         request.validate()
@@ -2701,6 +2804,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         qths_binary_dir=args.qths_binary_dir,
         sender_binary_dir=args.sender_binary_dir,
     )
+    default_result_id = result_directory_name(request)
     if args.preflight_only:
         if args.warmup_runs != 0 or args.measured_runs != 1:
             print(
@@ -2708,11 +2812,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        result = RatePointController(backend, args.result_root).preflight_request(
+        result = RatePointController(
+            backend, args.result_root, run_id=f"{default_result_id}-preflight"
+        ).preflight_request(
             request, args.observation_config, args.config_compiler
         )
     elif args.warmup_runs == 0 and args.measured_runs == 1:
-        result = RatePointController(backend, args.result_root).run_request(
+        result = RatePointController(
+            backend, args.result_root, run_id=default_result_id
+        ).run_request(
             request, args.observation_config, args.config_compiler
         )
     else:
@@ -2729,7 +2837,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.result_root,
             args.warmup_runs,
             args.measured_runs,
-            args.suite_id,
+            args.suite_id or default_result_id,
         )
     print(json.dumps(result, sort_keys=True), flush=True)
     cleanup_passed = (

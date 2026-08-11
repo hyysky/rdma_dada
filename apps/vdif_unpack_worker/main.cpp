@@ -13,6 +13,7 @@
 #include <multilog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,17 @@ void HandleSignal(int) { stop_requested = 1; }
 bool FitsSizeT(std::uint64_t value) {
     return value <= static_cast<std::uint64_t>(
                         std::numeric_limits<std::size_t>::max());
+}
+
+bool ParsePositiveUint64(const char* text, std::uint64_t* value) {
+    if (!text || !value || text[0] == '\0' || text[0] == '-') return false;
+    errno = 0;
+    char* end = NULL;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || parsed == 0U)
+        return false;
+    *value = static_cast<std::uint64_t>(parsed);
+    return true;
 }
 
 bool LockHduRead(dada_hdu_t* hdu) {
@@ -475,13 +487,16 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
 
 void PrintUsage(const char* program) {
     std::cerr << "Usage: " << program
-              << " --plan resolved_observation.json\n";
+              << " --plan resolved_observation.json"
+              << " [--reorder-horizon-groups GROUPS]\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3 || std::string(argv[1]) != "--plan") {
+    if ((argc != 3 && argc != 5) || std::string(argv[1]) != "--plan" ||
+        (argc == 5 &&
+         std::string(argv[3]) != "--reorder-horizon-groups")) {
         PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -495,6 +510,12 @@ int main(int argc, char** argv) {
             resolved_plan, &runtime.config, &runtime.pipeline_config,
             &runtime.pipeline_layout, &runtime.unpack_layout, &error)) {
         std::cerr << "vdif_unpack_worker: " << error << '\n';
+        return EXIT_FAILURE;
+    }
+    if (argc == 5 && !ParsePositiveUint64(
+            argv[4], &runtime.config.reorder_horizon_groups)) {
+        std::cerr << "vdif_unpack_worker: reorder horizon must be a positive "
+                     "integer group count\n";
         return EXIT_FAILURE;
     }
 

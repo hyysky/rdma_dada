@@ -67,6 +67,10 @@ the best result.
 
 Each run directory contains at least:
 
+Rate-point result directories use
+`<pipeline-stage>-<aggregate-rate>Gbps-<duration>s-<UTC timestamp>` so rate and
+time are visible without opening the manifest.
+
 - `manifest.json`: Git commit, source manifest, binary origin, host names,
   toolchain versions, configuration hashes, command arguments and run ID;
 - `state.json`: current orchestration phase and owned resource identifiers;
@@ -209,7 +213,11 @@ Use two explicit compute-consumer modes:
 For receiver/unpack-only tests, use `task8c_rate_point.py --pipeline-stage
 unpack --compute-consumer dbnull`. The consumer attaches directly to the
 compute ring; no output ring, `pipeline_worker`, H2D, GPU algorithm or D2H is
-part of that result.
+part of that result. Set `--missing-wait-ms` and
+`--station-skew-reserve-ms` independently. The controller derives
+`window_blocks = 1 + missing-wait blocks + Station-skew-reserve blocks` from
+the requested aggregate rate and block geometry before creating either ring;
+the worker receives the missing-wait horizon explicitly.
 
 Do not compare a `dbdisk` throughput result with a `dbnull` result as if they
 measured the same pipeline boundary; always report the consumer mode.

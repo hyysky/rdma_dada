@@ -22,6 +22,7 @@ struct VdifUnpackConfig {
     std::uint16_t first_channel_id;
     std::vector<std::uint16_t> antenna_map;
     std::uint32_t window_blocks;
+    std::uint64_t reorder_horizon_groups;
     std::uint64_t max_window_bytes;
     std::string output_memory;
     bool run_once;
