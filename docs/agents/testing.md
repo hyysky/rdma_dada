@@ -206,8 +206,31 @@ Use two explicit compute-consumer modes:
   correctness is established by the preceding `dbdisk` gate plus exact
   receiver/unpack reconciliation for every measured run.
 
+For receiver/unpack-only tests, use `task8c_rate_point.py --pipeline-stage
+unpack --compute-consumer dbnull`. The consumer attaches directly to the
+compute ring; no output ring, `pipeline_worker`, H2D, GPU algorithm or D2H is
+part of that result.
+
 Do not compare a `dbdisk` throughput result with a `dbnull` result as if they
 measured the same pipeline boundary; always report the consumer mode.
+
+### ATFP full-pipeline wire-rate campaign
+
+Formal performance acceptance uses only `scripts/atfp_throughput_campaign.py`
+with `config/testing/atfp-throughput-campaign.json` and
+`config/testing/atfp-throughput-observation.json`. The path is UDP input, raw
+ring, ATFP unpack, compute ring, CUDA conversion/transpose and beamform, output
+ring, then `dada_dbnull -s -z -q`.
+
+The target is physical untagged-IPv4 Ethernet line rate. Fixed points are 1,
+5, 10, 20, 30, 35 and 40 Gbps. Every point runs one 30-second warm-up and three
+30-second measurements. After the first failure, bisect to a 0.5-Gbps maximum
+pass/fail interval. Forty Gbps is an upper probe, not a mandatory pass.
+
+The CLI requires explicit qths and sender Release directories plus a supplied
+source SHA256 manifest and must never fall back to `build-linux`. Run
+`--preflight-only` before `--execute`; hand-written single-rate commands are
+diagnostic only.
 
 For every measured rate and repetition, record:
 
@@ -224,6 +247,15 @@ Report median, minimum, maximum and spread across measured repetitions. A rate
 is stable only when every repetition satisfies correctness gates and the
 documented rate tolerance. The first saturated component must be supported by
 logs and counters, not inferred from sender rate alone.
+
+For every physical-wire rate run, capture receiver NIC counters immediately
+before the receiver-side processes start and immediately after both senders
+finish. Resolve the Linux netdev from the configured RDMA device through
+sysfs, and preserve both `/sys/class/net/<netdev>/statistics` and
+`ethtool -S <netdev>` snapshots plus their run-scoped deltas in `result.json`.
+Counter snapshots are required evidence: a missing tool, ambiguous RDMA-to-
+netdev mapping, empty snapshot, interface change, or counter reset must be
+reported explicitly and must not be interpreted as zero packet loss.
 
 ## Lessons retained from Task 8C
 
@@ -255,7 +287,26 @@ Both receiver-side and sender-side Release build directories are explicit
 formal-run arguments. The controller must not silently select `build-linux`
 for either `rdma2dada`/`vdif_unpack_worker` or `fpga_sender_sim`.
 
+Controller process wrappers must forward `SIGTERM`/`SIGINT` to the real child
+process and persist the child's exit status. Recording only a shell-wrapper PID
+is invalid: terminating that wrapper can orphan `rdma2dada`, prevent its
+signal handler from publishing raw-ring EOD, and leave every downstream worker
+waiting indefinitely. This signal-forwarding path requires an executable
+regression test before a formal finite-transfer run.
+
+Receiver readiness must use the flushed initialization marker
+`Initialization complete, ready to start`, not the later buffered
+`RDMA receiver running` message. A readiness timeout must print every managed
+process PID, running state, recorded exit code and log tail; a silent timeout is
+a harness failure and provides no product evidence.
+
 Failure-time diagnostic collection and resource cleanup are reported
 separately. A missing artifact that was never expected to exist after an early
 worker failure belongs in `diagnostic_errors`; it does not turn an otherwise
 verified process/ring/capability cleanup into `CLEANUP_RESULT=FAIL`.
+
+`dada_db -p` is not a read-only ring probe: it creates persistent DADA data and
+header blocks. Never use it during Phase 0 or diagnostics. Inspect existing IPC
+state with non-creating system evidence; if key attribution is unavailable,
+report it as unknown. Use `dada_db -d -k KEY` only for an exact ring whose test
+ownership has already been established.

@@ -53,7 +53,7 @@ ctest --test-dir build-linux --output-on-failure
 | `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、观测 timeline 原样传播、按 `EXPECTED_GROUPS` 计算 `TRANSFER_SIZE`、未知字段保留、block-scoped ATFP/无包头几何及输入冲突不发布输出 | `BUILD_TESTING=ON` |
 | `vdif_timeline_test` | `vdif_timeline_test.cpp` | 校验整数皮秒 group 时间轴解析、非整数 groups/s 跨秒、ordinal↔VDIF seconds/frame 严格逆映射、exclusive stop boundary、字段范围及算术溢出 | `BUILD_TESTING=ON` |
 | `vdif_unpack_engine_test` | `vdif_unpack_engine_test.cpp` | 保留旧 TFP→TFPA scatter 作为正确性参考，校验任意 Station 顺序、跨 block、零填充及错误统计 | `BUILD_TESTING=ON` |
-| `vdif_atfp_engine_test` | `vdif_atfp_engine_test.cpp` | 校验固定环形 slot、直接 Station lookup、每包单次 payload memcpy、ATFP block view、group-distance watermark、完全缺失/部分缺失补零、large gap、wrap/partial EOD 及与旧 TFPA reference 的等价性 | `BUILD_TESTING=ON` |
+| `vdif_atfp_engine_test` | `vdif_atfp_engine_test.cpp` | 校验固定环形 slot、直接 Station lookup、每包单次 payload memcpy、ATFP block view、多 Station 最小 watermark、领先 Station 不淘汰落后数据、完全缺失/部分缺失补零、large gap、Station skew/raw-block 组成统计、wrap/partial EOD 及与旧 TFPA reference 的等价性 | `BUILD_TESTING=ON` |
 | `atfp_block_writer_test` | `atfp_block_writer_test.cpp` | 验证每个 compute block 只 Acquire/Commit 一次、每个 A 平面无回绕一次复制/回绕最多两段复制、partial block 紧凑布局及 sink 失败路径 | `BUILD_TESTING=ON` |
 | `group_block_writer_test` | `group_block_writer_test.cpp` | 用内存 block sink 验证有序 group 直接填充满 block、EOD 精确提交部分 block、空传输不提交，以及 group/sink 容量错误不发布数据 | `BUILD_TESTING=ON` |
 | `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 schema v1/v2 sender JSON、显式 source、PACED/batch/payload mode、整数皮秒跨秒/frame 重置、双 Station、CI8/CI16、MTU 和 fault | `BUILD_TESTING=ON` |
@@ -62,7 +62,8 @@ ctest --test-dir build-linux --output-on-failure
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
-| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证控制器只消费统一 observation/compiler artifacts，并覆盖 preflight-only、配置/二进制 SHA、有限 observation stop、计数守恒、CONFIG_ID/GEOMETRY_ID、双 sender、ATFP/dbdisk/dbnull、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证控制器只消费统一 observation/compiler artifacts，并覆盖 preflight-only、配置/二进制 SHA、有限 observation stop、进程 supervisor 信号转发/退出码、计数守恒、CONFIG_ID/GEOMETRY_ID、双 sender、ATFP/dbdisk/dbnull、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `atfp_throughput_campaign_test` | `atfp_throughput_campaign_test.py` | 验证物理线速换算、1–40 Gbps 固定扫描、0.5 Gbps 二分、正式 CLI 和 source SHA 门禁 | 找到 Python 3；不连接远端服务器 |
 | `observation_config_test` | `observation_config_test.cpp` | 校验统一观测 JSON、精确皮秒时长、Station/A 轴顺序、metadata、ring/receiver 参数、相对路径、算法顺序及严格缺失/未知字段拒绝 | `BUILD_TESTING=ON` |
 | `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置、wire profile 和 `[F,P,A,B,2]` 权重精确派生 ingest 及 Beamform/Power/Stokes/Integration 的 block/output-ring 几何，并校验溢出、整除和权重 F/P/A 边界 | `BUILD_TESTING=ON` |
 | `beamform_weight_metadata_test` | `beamform_weight_metadata_test.cpp` | 校验 NPY v1/v2、C-order、`|i1`/`<i2`、严格 `[F,P,A,B,2]`、B/NBEAM 推导及 payload/trailing byte 检查 | `BUILD_TESTING=ON` |
@@ -320,6 +321,7 @@ python3 -u scripts/task8c_rate_point.py \
   --aggregate-gbps 5 \
   --duration-seconds 10 \
   --compute-consumer dbnull \
+  --pipeline-stage unpack \
   --warmup-runs 1 \
   --measured-runs 3 \
   --qths-binary-dir /home/user/wy/rdma_dada/build-observation-task7-release \
@@ -330,9 +332,9 @@ python3 -u scripts/task8c_rate_point.py \
   --execute
 ```
 
-`dbnull` 模式执行 `dada_dbnull -k 00d4 -s -z -q`，要求 EOD 后退出码为 0，并继续严格
-核对 sender、receiver 和 unpack 的全部计数；它不生成 `.dada` 文件，因此 header/sample
-的文件级检查由先前通过的 `dbdisk` correctness gate 提供。
+`--pipeline-stage unpack` 只创建 raw/compute ring，并执行
+`dada_dbnull -k 00d4 -s -z -q`；不创建 output ring，不启动 `pipeline_worker` 或 GPU。
+测试要求 EOD 后退出码为 0，并严格核对 sender、receiver 和 unpack 的全部计数。
 
 ### 配置检查工具测试
 

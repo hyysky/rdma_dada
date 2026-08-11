@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace rdma_dada {
 namespace modules {
@@ -29,10 +30,20 @@ struct VdifAtfpStatistics {
     std::uint64_t missing_station_packets;
     std::uint64_t expected_station_packets;
     std::uint64_t large_gap_advances;
+    std::uint64_t large_gap_advanced_groups;
+    std::uint64_t max_station_ordinal_skew;
+    std::uint64_t single_station_raw_blocks;
+    std::uint64_t mixed_station_raw_blocks;
+    std::uint64_t max_station_records_per_raw_block;
+    std::uint64_t max_consecutive_station_records;
     std::uint64_t payload_copy_calls;
     std::uint64_t payload_copy_bytes;
     std::uint64_t emitted_blocks;
     std::uint64_t emitted_bytes;
+    std::vector<std::uint64_t> station_observed_packets;
+    std::vector<std::uint64_t> station_accepted_packets;
+    std::vector<std::uint64_t> station_late_packets;
+    std::vector<std::uint64_t> station_highest_ordinals;
 };
 
 typedef std::function<bool(const AtfpBlockView&, std::string*)>

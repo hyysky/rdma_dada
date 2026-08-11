@@ -21,14 +21,27 @@ loaded from the strict packet-format profile described in
 - 固定环形 slot 以严格 ordinal 作 ownership tag，并用 65536 项 Station→A 直接查找表；
 - 每个 Station packet 的完整 TFP payload 只执行一次连续复制，写入天线平面
   `[A,circular_group,T,F,P]`，32-byte packet header 不进入窗口；
-- group-distance watermark、窗口压力或 EOD 会按 ordinal 顺序输出；部分缺失与完全没有
-  packet 到达的 group 均补零；
+- watermark 使用所有 Station 已到达 ordinal 的最小值；只有每个 Station 都越过重排
+  容限后，窗口压力才会按 ordinal 输出并对确认缺失的 Station 平面补零。单个领先
+  Station 不能淘汰落后 Station 的仍可能到达数据；某个 Station 整体停流则失败而非
+  静默推进；
+- 每个 raw block 先一次解析全部 header 并更新多 Station watermark，再按原记录顺序
+  放置 payload；描述符缓冲在配置时预留，不为每个 block 重复分配；
 - 每个 block 仅获取一个 compute ring writable block，按天线连续复制一次（环形回绕时
   最多两段），最终只提交一次，实际字节布局为 block-scoped `[A,T,F,P]`。
 
 统计项分别记录收到、接受、坏 header、VDIF invalid-data、未知 Station、重复、late、
-越界、large-gap 推进、完整/不完整/完全缺失 group、payload copy 次数与输出 block。
+越界、large-gap 推进、完整/不完整/完全缺失 group、payload copy 次数与输出 block；
+诊断项还按 Station 记录 observed/accepted/late/highest ordinal，并记录最大 Station
+ordinal 偏斜、large-gap 推进组数、单 Station/混合 raw block、单 block 最大 Station
+记录数和最长连续 Station run。
 丢包比例分母固定为 `EXPECTED_GROUPS*NANT`，因此完全缺失的 group 也纳入统计。
+
+CPU-only 性能与正确性验收使用独立的 `SyntheticVdifSource` 生成合法 Project VDIF
+record。它固定支持 `INTERLEAVED`、`STATION_BURST_425` 和
+`STATION_BURST_2112` 三种到达顺序；每条 record 的 Station、时间戳和 TFP payload
+均可确定性重放。手工 byte-level golden 负责验证 wire bytes，生产 codec 只作为附加
+round-trip 检查，不作为 expected 数据来源。
 
 窗口的默认跨度是两个 compute block，但它不是第二个 ring，也不保存 packet header。
 ATFP engine 将有序 block view 交给 `AtfpBlockWriter`；writer 不跨 callback 持有输出

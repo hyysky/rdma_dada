@@ -50,6 +50,7 @@ echo "  Parallel jobs: ${BUILD_JOBS}"
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
     -DBUILD_RDMA_PIPELINE=OFF \
     -DBUILD_SSD_BENCHMARK=OFF \
+    -DBUILD_ALGORITHM_BENCHMARKS=ON \
     -DBUILD_TESTING=ON \
     -DUSE_CUDA=ON
 
@@ -59,3 +60,7 @@ echo "Building GPU modules and tests (existing outputs are preserved)..."
 echo "GPU test build complete: ${BUILD_DIR}"
 echo "Run CUDA tests with:"
 echo "  ${CTEST_BIN} --test-dir ${BUILD_DIR} -L cuda --output-on-failure"
+echo "Run the CUDA ATFP transpose benchmark with:"
+echo "  ${BUILD_DIR}/complex_convert_transpose_cuda_benchmark CI8 256 65536 200 1.0 0"
+echo "Run the CUDA time-integration benchmark with:"
+echo "  ${BUILD_DIR}/time_integrate_cuda_benchmark 65536 180 128 200 MEAN 0"

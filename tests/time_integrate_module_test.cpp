@@ -214,6 +214,62 @@ void TestTfbsSumWithUpstreamIntegration() {
     }
 }
 
+void TestMultiAxisMeanPreservesFrameLayout() {
+    rdma_dada::pipeline::Metadata input_header;
+    input_header.SetString("DATA_STAGE", "POWER");
+    input_header.SetString("ORDER", "TFPB");
+    input_header.SetString("SAMPLE_FORMAT", "F32");
+    input_header.SetString("MEMORY", "HOST");
+    input_header.SetUint64("NCHAN", 2);
+    input_header.SetUint64("NPOL", 2);
+    input_header.SetUint64("NBEAM", 2);
+    input_header.SetUint64("RECORD_BYTES", 32);
+    input_header.SetUint64("RESOLUTION", 32);
+    input_header.SetUint64("BYTES_PER_SECOND", 96);
+    input_header.SetDouble("TSAMP", 1.0);
+
+    rdma_dada::pipeline::StageParameters parameters;
+    parameters.SetString("EXECUTION_BACKEND", "CPU_REFERENCE");
+    parameters.SetUint64("INTEGRATION_LENGTH", 3);
+    parameters.SetString("INTEGRATION_OPERATION", "MEAN");
+
+    rdma_dada::modules::time_integrate::TimeIntegrateModule module;
+    rdma_dada::pipeline::Metadata output_header;
+    rdma_dada::pipeline::StageStatus status =
+        module.ConfigureHeader(input_header, parameters, &output_header);
+    Expect(status.ok(), "multi-axis mean integration configures");
+    if (!status.ok()) return;
+
+    float input_data[48] = {};
+    for (std::size_t time = 0; time < 6; ++time) {
+        for (std::size_t element = 0; element < 8; ++element) {
+            input_data[time * 8 + element] =
+                static_cast<float>(time * 100 + element);
+        }
+    }
+    float output_data[16] = {};
+    const rdma_dada::pipeline::InputBlock input = {
+        reinterpret_cast<const std::uint8_t*>(input_data),
+        sizeof(input_data), 82,
+        rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    rdma_dada::pipeline::OutputBlock output = {
+        reinterpret_cast<std::uint8_t*>(output_data), sizeof(output_data),
+        0, 0, rdma_dada::pipeline::MemoryLocation::kHost
+    };
+    const rdma_dada::pipeline::BlockExecutionContext context = {
+        rdma_dada::pipeline::ExecutionBackend::kHost, -1, NULL
+    };
+    status = module.ProcessBlock(input, &output, context);
+    Expect(status.ok(), "multi-axis mean integrates one block");
+    for (std::size_t element = 0; element < 8; ++element) {
+        ExpectNear(output_data[element], 100.0 + element,
+                   "first integrated frame preserves FPB element order");
+        ExpectNear(output_data[8 + element], 400.0 + element,
+                   "second integrated frame preserves FPB element order");
+    }
+}
+
 void TestReintegrationStage() {
     rdma_dada::pipeline::Metadata input_header;
     input_header.SetString("DATA_STAGE", "POWER_INTEGRATED");
@@ -396,6 +452,7 @@ void TestRejectsInvalidBlocks() {
 int main() {
     TestTfpbMean();
     TestTfbsSumWithUpstreamIntegration();
+    TestMultiAxisMeanPreservesFrameLayout();
     TestReintegrationStage();
     TestRejectsMismatchedRecordBytes();
     TestRejectsZeroByteRate();

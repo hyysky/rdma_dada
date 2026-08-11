@@ -20,6 +20,9 @@ option(BUILD_RDMA_PIPELINE
 option(BUILD_SSD_BENCHMARK
        "Build the portable sequential-write benchmark"
        ON)
+option(BUILD_ALGORITHM_BENCHMARKS
+       "Build portable algorithm microbenchmarks"
+       OFF)
 option(USE_CUDA
        "Enable CUDA support in the RDMA pipeline"
        OFF)
@@ -238,6 +241,20 @@ target_link_libraries(pipeline_worker_config_inspect PRIVATE rdma_pipeline_core)
 
 add_executable(fpga_sender_sim apps/fpga_sender_sim/main.cpp)
 target_link_libraries(fpga_sender_sim PRIVATE rdma_vdif_sender_sim)
+
+if(BUILD_ALGORITHM_BENCHMARKS)
+    add_executable(time_integrate_benchmark
+        tools/time_integrate_benchmark.cpp)
+    target_link_libraries(time_integrate_benchmark PRIVATE
+        rdma_module_time_integrate)
+    if(USE_CUDA)
+        add_executable(time_integrate_cuda_benchmark
+            tools/time_integrate_cuda_benchmark.cpp)
+        target_link_libraries(time_integrate_cuda_benchmark PRIVATE
+            rdma_module_time_integrate
+            CUDA::cudart)
+    endif()
+endif()
 
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
@@ -490,6 +507,10 @@ if(BUILD_TESTING)
             NAME task8c_rate_point_test
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
+        add_test(
+            NAME atfp_throughput_campaign_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/atfp_throughput_campaign_test.py)
     endif()
     add_test(NAME pipeline_core_test COMMAND pipeline_core_test)
     add_test(NAME beamform_weight_metadata_test

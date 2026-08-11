@@ -97,6 +97,7 @@ int main() {
     ExpectUint(output, "RECORD_BYTES", 32768);
     ExpectUint(output, "RESOLUTION", 16);
     ExpectUint(output, "BLOCK_NTIME", 2048);
+    ExpectUint(output, "INPUT_BLOCK_BYTES", pipeline_layout.raw_block_bytes);
     ExpectUint(output, "OUTPUT_BLOCK_BYTES", 32768);
     ExpectUint(output, "BLOCK_BYTES", 32768);
     ExpectUint(output, "RING_BYTES", pipeline_layout.compute_ring_bytes);

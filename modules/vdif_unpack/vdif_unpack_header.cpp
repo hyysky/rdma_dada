@@ -102,6 +102,7 @@ bool BuildVdifUnpackOutputHeader(const pipeline::Metadata& input,
     result.SetUint64("RECORD_BYTES", unpack_layout.compute_block_bytes);
     result.SetUint64("RESOLUTION", pipeline_layout.compute_resolution);
     result.SetUint64("BLOCK_NTIME", pipeline_layout.samples_per_block);
+    result.SetUint64("INPUT_BLOCK_BYTES", pipeline_layout.raw_block_bytes);
     result.SetUint64("OUTPUT_BLOCK_BYTES", unpack_layout.compute_block_bytes);
     result.SetUint64("BLOCK_BYTES", unpack_layout.compute_block_bytes);
     result.SetUint64("RING_BYTES", pipeline_layout.compute_ring_bytes);

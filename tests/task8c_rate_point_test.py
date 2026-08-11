@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -27,10 +28,11 @@ def make_plan(
     compute_consumer="dbdisk",
     raw_ring_blocks=8,
     compute_ring_blocks=8,
+    pipeline_stage="full",
 ):
     per_station = aggregate_gbps / 2.0
     group_count = math.ceil(
-        per_station * 1_000_000_000 * duration_seconds / 8.0 / 4096
+        per_station * 1_000_000_000 * duration_seconds / 8.0 / 4128
     )
     source = {
         "observation": {
@@ -46,6 +48,22 @@ def make_plan(
             "destination_mac": "98:03:9b:aa:99:d8",
             "destination_ip": "174.0.1.111",
             "destination_port": 1000,
+        },
+        "rings": {"raw_key": "0x00d2", "compute_key": "0x00d4", "output_key": "0x00d6"},
+        "processing": {
+            "backend": "CUDA",
+            "cuda_device": 0,
+            "run_once": True,
+            "conversion": {"scale": "0.0078125"},
+            "modules": [{
+                "type": "beamform",
+                "weights_file": "/tmp/weights.npy",
+                "weights_order": "FPAB2",
+                "weights_id": "campaign-test",
+                "weights_scale": "0.5",
+                "compute_mode": "FP32",
+            }],
+            "output": {"sample_format": "AUTO"},
         },
     }
     resolved = {
@@ -64,6 +82,7 @@ def make_plan(
             "records_per_block": 2048,
             "raw_block_bytes": 8454144,
             "compute_block_bytes": 8388608,
+            "output_block_bytes": 33554432,
         },
     }
     rings = {
@@ -80,6 +99,11 @@ def make_plan(
                 "blocks": compute_ring_blocks,
                 "block_bytes": 8388608,
             },
+            "output": {
+                "key": "0x00d6",
+                "blocks": compute_ring_blocks,
+                "block_bytes": 33554432,
+            },
         },
     }
     artifacts = {
@@ -91,6 +115,10 @@ def make_plan(
         ).encode(),
         "unpacked.header": (
             f"DATA_STAGE UNPACKED\nCONFIG_ID {resolved['config_id']}\n"
+            f"GEOMETRY_ID {resolved['geometry_id']}\n"
+        ).encode(),
+        "output.header": (
+            f"DATA_STAGE BEAMFORMED\nCONFIG_ID {resolved['config_id']}\n"
             f"GEOMETRY_ID {resolved['geometry_id']}\n"
         ).encode(),
         "validation_report.json": (
@@ -108,7 +136,7 @@ def make_plan(
         f"{hashlib.sha256(value).hexdigest()}  {name}\n"
         for name, value in sorted(artifacts.items())
     ).encode()
-    return MODULE.RatePlan(
+    plan = MODULE.RatePlan(
         aggregate_gbps=aggregate_gbps,
         duration_seconds=duration_seconds,
         batch_packets=batch_packets,
@@ -122,7 +150,9 @@ def make_plan(
         resolved_plan=resolved,
         ring_plan=rings,
         artifact_files=artifacts,
+        pipeline_stage=pipeline_stage,
     )
+    return plan
 
 
 class FakeProcess:
@@ -345,6 +375,10 @@ class EpochTransport(RecordingTransport):
 class DbnullFallbackTransport(RecordingTransport):
     def run(self, argv, stage, check=True):
         self.calls.append(("run", stage, list(argv)))
+        if "which" in argv and "ethtool" in argv:
+            return MODULE.subprocess.CompletedProcess(
+                argv, 0, "/usr/sbin/ethtool\n", ""
+            )
         if "which" in argv and any(
             tool in argv for tool in ("dada_db", "dada_dbnull")
         ):
@@ -372,6 +406,10 @@ class DbnullFallbackTransport(RecordingTransport):
 class PsrdadaFallbackTransport(RecordingTransport):
     def run(self, argv, stage, check=True):
         self.calls.append(("run", stage, list(argv)))
+        if "which" in argv and "ethtool" in argv:
+            return MODULE.subprocess.CompletedProcess(
+                argv, 0, "/usr/sbin/ethtool\n", ""
+            )
         if "which" in argv and any(
             tool in argv for tool in ("dada_db", "dada_dbdisk", "dada_dbnull")
         ):
@@ -408,14 +446,57 @@ class SecondSenderStartFailureTransport(ExpiringStartTransport):
 
 
 class Task8cRatePointTest(unittest.TestCase):
+    def test_remote_compiler_uses_qths_binary_and_scoped_artifacts(self):
+        class RecordingTransport:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, stage, check=True):
+                self.calls.append((list(argv), stage, check))
+                return MODULE.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = root / "observation.json"
+            config.write_text("{}\n")
+            output = root / "artifacts"
+            transport = RecordingTransport()
+            compiler = MODULE.RemoteObservationCompiler(
+                transport,
+                root / "known-hosts",
+                pathlib.Path(
+                    "/home/user/wy/rdma_dada/build-release/observation_config_compile"
+                ),
+                root / "run",
+            )
+            compiler(config, None)
+            compiler(config, output)
+            compiler.close()
+
+        flattened = [call[0] for call in transport.calls]
+        remote_invocations = [
+            argv for argv in flattened
+            if "/home/user/wy/rdma_dada/build-release/observation_config_compile"
+            in argv and "--config" in argv
+        ]
+        self.assertEqual(len(remote_invocations), 2)
+        self.assertIn("--preflight-only", remote_invocations[0])
+        self.assertIn("--output-dir", remote_invocations[1])
+        self.assertTrue(
+            any(argv[0] == "scp" and "-r" in argv for argv in flattened)
+        )
+        self.assertTrue(
+            any("rm" in argv and "-rf" in argv for argv in flattened)
+        )
+
     def test_group_count_uses_exact_decimal_rate_arithmetic(self):
         request = MODULE.RateRequest(
             aggregate_gbps=0.1,
             duration_seconds=10.0,
         )
         self.assertEqual(
-            MODULE._group_count_for_request(request, 2, 4096),
-            15259,
+            MODULE._group_count_for_request(request, 2, 4128),
+            15141,
         )
 
     def test_rate_plan_loads_all_geometry_from_compiler_artifacts(self):
@@ -447,6 +528,7 @@ class Task8cRatePointTest(unittest.TestCase):
                     "records_per_block": 2048,
                     "raw_block_bytes": 8454144,
                     "compute_block_bytes": 8388608,
+                    "output_block_bytes": 33554432,
                 },
             }
             ring_plan = {
@@ -457,6 +539,8 @@ class Task8cRatePointTest(unittest.TestCase):
                             "block_bytes": 8454144},
                     "compute": {"key": "0x00d4", "blocks": 6,
                                 "block_bytes": 8388608},
+                    "output": {"key": "0x00d6", "blocks": 6,
+                               "block_bytes": 33554432},
                 }
             }
             contents = {
@@ -468,6 +552,18 @@ class Task8cRatePointTest(unittest.TestCase):
                 ).encode(),
                 "unpacked.header": (
                     f"DATA_STAGE UNPACKED\nCONFIG_ID {resolved['config_id']}\n"
+                    f"GEOMETRY_ID {resolved['geometry_id']}\n"
+                ).encode(),
+                "converted.header": (
+                    f"DATA_STAGE CONVERTED\nCONFIG_ID {resolved['config_id']}\n"
+                    f"GEOMETRY_ID {resolved['geometry_id']}\n"
+                ).encode(),
+                "beamformed.header": (
+                    f"DATA_STAGE BEAMFORMED\nCONFIG_ID {resolved['config_id']}\n"
+                    f"GEOMETRY_ID {resolved['geometry_id']}\n"
+                ).encode(),
+                "output.header": (
+                    f"DATA_STAGE BEAMFORMED\nCONFIG_ID {resolved['config_id']}\n"
                     f"GEOMETRY_ID {resolved['geometry_id']}\n"
                 ).encode(),
                 "validation_report.json": json.dumps(
@@ -499,13 +595,16 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(plan.group_count, 15141)
         self.assertEqual(plan.raw_key, "00d2")
         self.assertEqual(plan.compute_key, "00d4")
+        self.assertEqual(plan.output_key, "00d6")
         self.assertEqual(plan.raw_ring_blocks, 8)
         self.assertEqual(plan.compute_ring_blocks, 6)
+        self.assertEqual(plan.output_ring_blocks, 6)
+        self.assertEqual(plan.output_block_bytes, 33554432)
         self.assertEqual(plan.config_id, "a" * 64)
         self.assertEqual(plan.geometry_id, "b" * 64)
 
     def test_qths_bundle_uses_resolved_plan_and_no_legacy_geometry_json(self):
-        plan = make_plan(0.1, 10.0)
+        plan = make_plan(0.1, 10.0, compute_consumer="dbnull")
         bundle = MODULE.build_qths_bundle(
             plan, "/tmp/task8c-test"
         )
@@ -522,9 +621,14 @@ class Task8cRatePointTest(unittest.TestCase):
             'rdma2dada" --plan "$run_dir/resolved_observation.json"',
             bundle["start.sh"],
         )
+        self.assertIn(
+            'pipeline_worker" "$run_dir/resolved_observation.json"',
+            bundle["start.sh"],
+        )
+        self.assertNotIn('pipeline_worker" --plan', bundle["start.sh"])
 
     def test_ring_creation_uses_compiler_ring_plan_values(self):
-        plan = make_plan(0.1, 10.0)
+        plan = make_plan(0.1, 10.0, compute_consumer="dbnull")
         bundle = MODULE.build_qths_bundle(
             plan, "/tmp/task8c-test"
         )
@@ -537,6 +641,106 @@ class Task8cRatePointTest(unittest.TestCase):
             f"-k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 "
             f"-n {plan.compute_ring_blocks}", prepare
         )
+        self.assertIn(
+            f"-k {plan.output_key} -b {plan.output_block_bytes} -a 4096 "
+            f"-n {plan.output_ring_blocks}", prepare
+        )
+
+    def test_dbnull_consumes_one_complete_output_transfer_zero_copy(self):
+        plan = make_plan(1.0, 30.0, compute_consumer="dbnull")
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-full-pipeline")
+        self.assertIn(
+            f"dada_dbnull -k {plan.output_key} -s -z -q",
+            bundle["start.sh"],
+        )
+        self.assertNotIn(
+            f"dada_dbnull -k {plan.compute_key}", bundle["start.sh"]
+        )
+        self.assertIn("pipeline-worker.pid", bundle["start.sh"])
+        self.assertIn("output-ring.pid", bundle["prepare.sh"])
+        self.assertIn("output-ring.created", bundle["cleanup.sh"])
+        for process in ("reader", "pipeline-worker", "worker", "receiver"):
+            self.assertIn(
+                f'kill -0 "$(cat "$run_dir/{process}.pid")"',
+                bundle["start.sh"],
+            )
+            self.assertIn(f'"$run_dir/{process}.exit"', bundle["start.sh"])
+        self.assertIn('exited during readiness', bundle["start.sh"])
+        self.assertIn('tail -n 40 "$run_dir/$name.log"', bundle["start.sh"])
+        self.assertIn(
+            "Initialization complete, ready to start",
+            bundle["start.sh"],
+        )
+        self.assertIn("readiness timed out", bundle["start.sh"])
+        self.assertIn("report_readiness_state", bundle["start.sh"])
+
+    def test_unpack_stage_drains_compute_ring_without_gpu_pipeline(self):
+        plan = make_plan(
+            1.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-unpack-only")
+        self.assertIn(
+            f"dada_dbnull -k {plan.compute_key} -s -z -q",
+            bundle["start.sh"],
+        )
+        self.assertNotIn("pipeline_worker", bundle["start.sh"])
+        self.assertNotIn("output-ring", bundle["prepare.sh"])
+        self.assertNotIn("output-ring", bundle["cleanup.sh"])
+        self.assertNotIn(f"-k {plan.output_key}", bundle["prepare.sh"])
+        self.assertNotIn("output_key", plan.as_dict())
+        self.assertNotIn("output_block_bytes", plan.as_dict())
+        for process in ("reader", "worker", "receiver"):
+            self.assertIn(
+                f'kill -0 "$(cat "$run_dir/{process}.pid")"',
+                bundle["start.sh"],
+            )
+
+    def test_unpack_stage_dbnull_statistics_do_not_require_gpu_marker(self):
+        plan = make_plan(
+            0.1,
+            10.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        records = plan.group_count * plan.nant
+        receiver = (
+            f"Receive summary: accepted={records}, wrong_length=0, "
+            f"published={records}, blocks=1, partial_blocks=1, "
+            "cq_tail_records=0\n"
+        )
+        worker = (
+            "VDIF unpack statistics: "
+            f"records={records} accepted={records} bad_header=0 invalid_data=0 "
+            "unknown_station=0 duplicate=0 late=0 out_of_range=0 "
+            f"complete_groups={plan.group_count} incomplete_groups=0 "
+            f"fully_missing_groups=0 missing_station=0/{records} "
+            "large_gap_advances=0/0 max_station_ordinal_skew=0 "
+            "raw_blocks_single=0 raw_blocks_mixed=1 "
+            "max_station_records_per_raw_block=1 max_consecutive_station_records=1\n"
+            f"VDIF unpack station statistics: antenna=0 station=101 "
+            f"observed={plan.group_count} accepted={plan.group_count} late=0 "
+            f"highest_ordinal={plan.group_count - 1}\n"
+            f"VDIF unpack station statistics: antenna=1 station=102 "
+            f"observed={plan.group_count} accepted={plan.group_count} late=0 "
+            f"highest_ordinal={plan.group_count - 1}\n"
+            "VDIF unpack transfer completed\n"
+        )
+        statistics = MODULE.parse_qths_statistics(
+            receiver,
+            worker,
+            {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+            expect_pipeline_worker=False,
+        )
+        self.assertNotIn("gpu", statistics)
+        MODULE._validate_statistics(statistics, plan, "")
 
     def test_hf_controller_does_not_ssh_back_through_hf(self):
         argv = MODULE.build_ssh_argv(
@@ -551,7 +755,7 @@ class Task8cRatePointTest(unittest.TestCase):
         plan = make_plan(1.0, 10.0, batch_packets=16)
         self.assertEqual(plan.per_station_gbps, 0.5)
         self.assertEqual(plan.record_bytes, 4128)
-        self.assertEqual(plan.group_count, math.ceil(625_000_000 / 4096))
+        self.assertEqual(plan.group_count, math.ceil(625_000_000 / 4128))
         self.assertNotEqual(plan.group_count % 16, 0)
         self.assertNotEqual((plan.group_count * 2) % plan.records_per_block, 0)
         self.assertGreaterEqual(plan.group_count * plan.record_bytes * 8, 5_000_000_000)
@@ -667,12 +871,57 @@ class Task8cRatePointTest(unittest.TestCase):
         bundle = MODULE.build_qths_bundle(
             plan, "/tmp/task8c-dbnull"
         )
-        self.assertIn("dada_dbnull -k 00d4 -s -z -q", bundle["start.sh"])
+        self.assertIn("dada_dbnull -k 00d6 -s -z -q", bundle["start.sh"])
         self.assertIn(
-            ') >"$run_dir/reader.log" 2>&1 &', bundle["start.sh"]
+            '/usr/bin/python3 "$run_dir/supervise.py" '
+            '"$run_dir/reader.exit"',
+            bundle["start.sh"],
         )
         self.assertNotIn("dada_dbdisk", bundle["start.sh"])
         self.assertIn('"consumer": "dada_dbnull"', bundle["summarize.py"])
+
+    def test_qths_bundle_captures_run_scoped_nic_counters(self):
+        plan = make_plan(5.0, 30.0, compute_consumer="dbnull")
+        bundle = MODULE.build_qths_bundle(
+            plan,
+            "/tmp/task8c-nic-counters",
+            ethtool_path="/usr/sbin/ethtool",
+        )
+        self.assertIn("capture_nic_counters.py", bundle)
+        self.assertIn(
+            'capture_nic_counters.py" mlx5_0 /usr/sbin/ethtool '
+            '"$run_dir/nic-before.json"',
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            'capture_nic_counters.py" mlx5_0 /usr/sbin/ethtool '
+            '"$run_dir/nic-after.json"',
+            bundle["finish.sh"],
+        )
+
+    def test_nic_counter_delta_preserves_before_after_and_positive_delta(self):
+        before = {
+            "interface": "ens2np0",
+            "sysfs": {"rx_packets": 100, "rx_dropped": 3},
+            "ethtool": {"rx_out_of_buffer": 7, "rx_discards_phy": 11},
+        }
+        after = {
+            "interface": "ens2np0",
+            "sysfs": {"rx_packets": 140, "rx_dropped": 4},
+            "ethtool": {"rx_out_of_buffer": 9, "rx_discards_phy": 11},
+        }
+        result = MODULE.nic_counter_evidence(before, after)
+        self.assertEqual(result["interface"], "ens2np0")
+        self.assertEqual(result["delta"]["sysfs"]["rx_packets"], 40)
+        self.assertEqual(result["delta"]["sysfs"]["rx_dropped"], 1)
+        self.assertEqual(result["delta"]["ethtool"]["rx_out_of_buffer"], 2)
+        self.assertEqual(result["delta"]["ethtool"]["rx_discards_phy"], 0)
+
+    def test_nic_counter_delta_rejects_interface_change(self):
+        before = {"interface": "ens2np0", "sysfs": {}, "ethtool": {}}
+        after = {"interface": "ens3np0", "sysfs": {}, "ethtool": {}}
+        with self.assertRaises(ValueError):
+            MODULE.nic_counter_evidence(before, after)
 
     def test_dbnull_statistics_require_consumer_eod_and_exact_unpack_counts(self):
         plan = make_plan(
@@ -690,7 +939,17 @@ class Task8cRatePointTest(unittest.TestCase):
             "unknown_station=0 duplicate=0 late=0 out_of_range=0 "
             f"complete_groups={plan.group_count} incomplete_groups=0 "
             "fully_missing_groups=0 "
-            f"missing_station=0/{records} (0.000000%)\n"
+            f"missing_station=0/{records} (0.000000%) "
+            "large_gap_advances=0/0 max_station_ordinal_skew=0 "
+            "raw_blocks_single=0 raw_blocks_mixed=149 "
+            "max_station_records_per_raw_block=1024 "
+            "max_consecutive_station_records=16\n"
+            f"VDIF unpack station statistics: antenna=0 station=101 "
+            f"observed={plan.group_count} accepted={plan.group_count} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
+            f"VDIF unpack station statistics: antenna=1 station=102 "
+            f"observed={plan.group_count} accepted={plan.group_count} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
             "VDIF unpack transfer completed\n"
         )
         statistics = MODULE.parse_qths_statistics(
@@ -702,12 +961,50 @@ class Task8cRatePointTest(unittest.TestCase):
                 "zero_copy": True,
                 "single_transfer": True,
             },
+            "pipeline transfer completed\n",
         )
+        self.assertTrue(statistics["gpu"]["completed"])
         MODULE._validate_statistics(statistics, plan, "65667071")
         statistics["compute"]["exit_code"] = 1
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
+
+    def test_dbnull_count_deficit_is_a_performance_failure(self):
+        plan = make_plan(5.0, 30.0, compute_consumer="dbnull")
+        records = plan.group_count * plan.nant
+        statistics = {
+            "receiver": {
+                "accepted": records - 1,
+                "published": records - 1,
+                "wrong_length": 0,
+                "cq_errors": 0,
+            },
+            "unpack": {
+                "records": records - 1,
+                "accepted": records - 1,
+                "bad_header": 0,
+                "invalid_data": 0,
+                "unknown_station": 0,
+                "duplicate": 0,
+                "late": 0,
+                "out_of_range": 0,
+                "complete_groups": plan.group_count - 1,
+                "incomplete_groups": 1,
+                "fully_missing_groups": 0,
+                "missing_station": 1,
+            },
+            "compute": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+            "gpu": {"completed": True},
+        }
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "65667071")
+        self.assertEqual(raised.exception.classification, "PERFORMANCE_FAIL")
 
     def test_live_backend_builds_direct_host_commands_and_local_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -746,14 +1043,17 @@ class Task8cRatePointTest(unittest.TestCase):
             sorted(config_evidence["config_sha"]),
             [
                 "qths1:MANIFEST.sha256",
+                "qths1:capture_nic_counters.py",
                 "qths1:cleanup.sh",
                 "qths1:finish.sh",
+                "qths1:output.header",
                 "qths1:prepare.sh",
                 "qths1:raw.header",
                 "qths1:resolved_observation.json",
                 "qths1:ring_plan.json",
                 "qths1:start.sh",
                 "qths1:summarize.py",
+                "qths1:supervise.py",
                 "qths1:unpacked.header",
                 "qths1:validation_report.json",
                 "qtpulsar1:101.json",
@@ -767,6 +1067,7 @@ class Task8cRatePointTest(unittest.TestCase):
             [
                 "qths1:dada_db",
                 "qths1:dada_dbdisk",
+                "qths1:ethtool",
                 "qths1:rdma2dada",
                 "qths1:vdif_unpack_worker",
                 "qtpulsar1:fpga_sender_sim",
@@ -912,7 +1213,7 @@ class Task8cRatePointTest(unittest.TestCase):
             evidence = backend.prepare_configs(plan, run_dir, preparation)
             start_script = (run_dir / "bundle" / "qths" / "start.sh").read_text()
         self.assertIn(
-            "/home/user/psrdada/bin/dada_dbnull -k 00d4 -s -z -q",
+            "/home/user/psrdada/bin/dada_dbnull -k 00d6 -s -z -q",
             start_script,
         )
         self.assertEqual(evidence["binary_sha"]["qths1:dada_dbnull"], "abc123")
@@ -1215,6 +1516,10 @@ class Task8cRatePointTest(unittest.TestCase):
             finish = root / "finish.sh"
             finish.write_text(bundle["finish.sh"])
             finish.chmod(0o755)
+            capture = root / "capture_nic_counters.py"
+            capture.write_text(
+                "import pathlib, sys\npathlib.Path(sys.argv[3]).write_text('{}')\n"
+            )
             bash_env = root / "bash-env"
             bash_env.write_text("kill() { return 0; }\n")
             environment = os.environ.copy()
@@ -1235,6 +1540,53 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("did not exit", completed.stderr)
 
+    def test_process_supervisor_forwards_term_and_records_child_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            bundle = MODULE.build_qths_bundle(
+                make_plan(1.0, 10.0),
+                str(root),
+            )
+            supervisor = root / "supervise.py"
+            supervisor.write_text(bundle["supervise.py"])
+            child = root / "child.sh"
+            child.write_text(
+                "#!/usr/bin/env bash\n"
+                "trap 'printf terminated >\"$1\"; exit 0' TERM\n"
+                "printf ready >\"$2\"\n"
+                "while true; do sleep 0.05; done\n"
+            )
+            child.chmod(0o755)
+            marker = root / "child.terminated"
+            ready = root / "child.ready"
+            exit_path = root / "receiver.exit"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(supervisor),
+                    str(exit_path),
+                    str(child),
+                    str(marker),
+                    str(ready),
+                ]
+            )
+            try:
+                for _ in range(500):
+                    if ready.exists():
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                process.terminate()
+                process.wait(timeout=2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(marker.read_text(), "terminated")
+            self.assertEqual(exit_path.read_text().strip(), "0")
+
     def test_qths_logs_are_parsed_into_reconciled_statistics(self):
         plan = make_plan(1.0, 10.0)
         records = plan.group_count * 2
@@ -1249,7 +1601,17 @@ class Task8cRatePointTest(unittest.TestCase):
             "unknown_station=0 duplicate=0 late=0 out_of_range=0 "
             f"complete_groups={plan.group_count} incomplete_groups=0 "
             "fully_missing_groups=0 "
-            "missing_station=0/302816 (0.000000%)\n"
+            "missing_station=0/302816 (0.000000%) "
+            "large_gap_advances=0/0 max_station_ordinal_skew=3 "
+            "raw_blocks_single=1 raw_blocks_mixed=148 "
+            "max_station_records_per_raw_block=1024 "
+            "max_consecutive_station_records=32\n"
+            f"VDIF unpack station statistics: antenna=0 station=101 "
+            f"observed={plan.group_count} accepted={plan.group_count} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
+            f"VDIF unpack station statistics: antenna=1 station=102 "
+            f"observed={plan.group_count} accepted={plan.group_count} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
             "VDIF unpack transfer completed\n"
         )
         compute = {
@@ -1269,6 +1631,8 @@ class Task8cRatePointTest(unittest.TestCase):
         MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(statistics["receiver"]["accepted"], records)
         self.assertEqual(statistics["unpack"]["complete_groups"], plan.group_count)
+        self.assertEqual(statistics["unpack"]["max_station_ordinal_skew"], 3)
+        self.assertEqual(statistics["unpack"]["station"][0]["station"], 101)
         self.assertEqual(statistics["compute"]["sample_hex"], "65667071")
 
     def test_dbdisk_statistics_reject_mixed_configuration_identity(self):
@@ -1296,6 +1660,48 @@ class Task8cRatePointTest(unittest.TestCase):
             backend.calls,
             ["PREPARE", "CONFIG_READY", "CLEANUP"],
         )
+
+    def test_request_uses_backend_remote_observation_compiler(self):
+        class RemoteCompilerBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.remote_compiler = mock.Mock()
+                self.compiler_requests = []
+
+            def observation_compiler(self, compiler, run_dir):
+                self.compiler_requests.append((compiler, run_dir))
+                return self.remote_compiler
+
+        with tempfile.TemporaryDirectory() as directory:
+            backend = RemoteCompilerBackend()
+            controller = MODULE.RatePointController(
+                backend, pathlib.Path(directory), run_id="remote-compiler"
+            )
+            original_compile = MODULE.compile_rate_plan
+
+            def compile_with_remote_executor(request, *_args, **kwargs):
+                self.assertIs(
+                    kwargs.get("compiler_executor"), backend.remote_compiler
+                )
+                return make_plan(
+                    request.aggregate_gbps,
+                    request.duration_seconds,
+                    request.batch_packets,
+                    request.compute_consumer,
+                )
+
+            MODULE.compile_rate_plan = compile_with_remote_executor
+            try:
+                result = controller.preflight_request(
+                    MODULE.RateRequest(0.1, 10.0),
+                    pathlib.Path("observation.json"),
+                    pathlib.Path("/remote/observation_config_compile"),
+                )
+            finally:
+                MODULE.compile_rate_plan = original_compile
+
+        self.assertEqual(result["TEST_RESULT"], "PASS")
+        self.assertEqual(len(backend.compiler_requests), 1)
 
     def test_execute_cli_routes_through_real_controller_entry(self):
         with tempfile.TemporaryDirectory() as directory:

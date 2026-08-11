@@ -2,6 +2,7 @@
 
 #include "time_integrate_backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -385,24 +386,31 @@ pipeline::StageStatus TimeIntegrateModule::ProcessBlock(
         }
         const float* source = reinterpret_cast<const float*>(input.data);
         float* destination = reinterpret_cast<float*>(output->data);
+        const float mean_divisor =
+            static_cast<float>(impl_->integration_length);
         for (std::uint64_t output_time = 0;
              output_time < output_ntime; ++output_time) {
-            for (std::uint64_t element = 0;
-                 element < impl_->frame_elements; ++element) {
-                float sum = 0.0f;
-                for (std::uint64_t integration_index = 0;
-                     integration_index < impl_->integration_length;
-                     ++integration_index) {
-                    const std::uint64_t input_time =
-                        output_time * impl_->integration_length +
-                        integration_index;
-                    sum += source[
-                        input_time * impl_->frame_elements + element];
+            float* destination_frame =
+                destination + output_time * impl_->frame_elements;
+            std::fill(destination_frame,
+                      destination_frame + impl_->frame_elements, 0.0f);
+            const float* source_frame =
+                source + output_time * impl_->integration_length *
+                             impl_->frame_elements;
+            for (std::uint64_t integration_index = 0;
+                 integration_index < impl_->integration_length;
+                 ++integration_index) {
+                for (std::uint64_t element = 0;
+                     element < impl_->frame_elements; ++element) {
+                    destination_frame[element] += source_frame[element];
                 }
-                destination[output_time * impl_->frame_elements + element] =
-                    impl_->calculate_mean ?
-                        sum / static_cast<float>(impl_->integration_length) :
-                        sum;
+                source_frame += impl_->frame_elements;
+            }
+            if (impl_->calculate_mean) {
+                for (std::uint64_t element = 0;
+                     element < impl_->frame_elements; ++element) {
+                    destination_frame[element] /= mean_divisor;
+                }
             }
         }
     }

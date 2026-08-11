@@ -39,3 +39,50 @@ by `K`.
 
 The complete pipeline contract is documented in
 [`doc/ALGORITHM_MODULE_CONTRACTS.md`](../../doc/ALGORITHM_MODULE_CONTRACTS.md).
+
+## CPU performance benchmark
+
+Build the optional benchmark in Release mode and pass `T`, frame element count,
+integration length, iteration count and operation:
+
+```bash
+cmake -S . -B build-perf \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_RDMA_PIPELINE=OFF \
+  -DBUILD_ALGORITHM_BENCHMARKS=ON
+cmake --build build-perf --target time_integrate_benchmark --parallel
+./build-perf/time_integrate_benchmark 65536 180 128 40 MEAN
+```
+
+The tool runs through the public module API, checks deterministic output and
+reports effective input GB/s. Performance comparisons must use the same build,
+dimensions, operation and machine.
+
+The loop-order optimization was measured on 2026-08-05 with an AppleClang 21
+Release build. These numbers are a local A/B record, not a server acceptance
+threshold:
+
+| `frame_elements` | `K` | previous | contiguous-frame loop |
+| ---: | ---: | ---: | ---: |
+| 180 | 128 | 7.2 GB/s | 51.9 GB/s |
+| 8 | 128 | 11.4 GB/s | 33.2 GB/s |
+| 360 | 1024 | 6.6 GB/s | 67.5 GB/s |
+
+For every element, accumulation still visits time samples in the same order;
+the optimization changes traversal across independent frame elements so the
+CPU reads contiguous memory and can vectorize the inner loop.
+
+### CUDA kernel benchmark
+
+With `USE_CUDA=ON`, the same option also builds a CUDA-event benchmark. H2D and
+D2H are deliberately outside the timed region, and the downloaded result is
+checked against a CPU oracle:
+
+```bash
+cmake --build build-gpu --target time_integrate_cuda_benchmark --parallel
+./build-gpu/time_integrate_cuda_benchmark 65536 180 128 200 MEAN 0
+```
+
+Run the actual observation geometries and several `K` values before replacing
+the direct kernel with a cooperative tree reduction. Record `us_per_block` and
+`input_GBps` together with the GPU model, clocks and CUDA version.

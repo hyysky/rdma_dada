@@ -382,7 +382,11 @@ int CloseTransferBody(dada_client_t* client) {
              "duplicate=%llu late=%llu out_of_range=%llu "
              "complete_groups=%llu incomplete_groups=%llu "
              "fully_missing_groups=%llu missing_station=%llu/%llu "
-             "(%.6f%%) large_gap_advances=%llu payload_copies=%llu/%llu "
+             "(%.6f%%) large_gap_advances=%llu/%llu "
+             "max_station_ordinal_skew=%llu raw_blocks_single=%llu "
+             "raw_blocks_mixed=%llu max_station_records_per_raw_block=%llu "
+             "max_consecutive_station_records=%llu "
+             "payload_copies=%llu/%llu "
              "emitted_blocks=%llu emitted_bytes=%llu "
              "writer_acquire=%llu commit=%llu blocks=%llu bytes=%llu "
              "acquire_wait_ns=%llu\n",
@@ -404,6 +408,18 @@ int CloseTransferBody(dada_client_t* client) {
              static_cast<unsigned long long>(statistics.expected_station_packets),
              loss_percent,
              static_cast<unsigned long long>(statistics.large_gap_advances),
+             static_cast<unsigned long long>(
+                 statistics.large_gap_advanced_groups),
+             static_cast<unsigned long long>(
+                 statistics.max_station_ordinal_skew),
+             static_cast<unsigned long long>(
+                 statistics.single_station_raw_blocks),
+             static_cast<unsigned long long>(
+                 statistics.mixed_station_raw_blocks),
+             static_cast<unsigned long long>(
+                 statistics.max_station_records_per_raw_block),
+             static_cast<unsigned long long>(
+                 statistics.max_consecutive_station_records),
              static_cast<unsigned long long>(statistics.payload_copy_calls),
              static_cast<unsigned long long>(statistics.payload_copy_bytes),
              static_cast<unsigned long long>(statistics.emitted_blocks),
@@ -413,6 +429,25 @@ int CloseTransferBody(dada_client_t* client) {
              static_cast<unsigned long long>(writer_statistics.committed_blocks),
              static_cast<unsigned long long>(writer_statistics.committed_bytes),
              static_cast<unsigned long long>(writer_statistics.acquire_wait_ns));
+
+    for (std::size_t antenna = 0;
+         antenna < runtime->config.antenna_map.size(); ++antenna) {
+        multilog(runtime->log, LOG_INFO,
+                 "VDIF unpack station statistics: antenna=%llu station=%u "
+                 "observed=%llu accepted=%llu late=%llu "
+                 "highest_ordinal=%llu\n",
+                 static_cast<unsigned long long>(antenna),
+                 static_cast<unsigned int>(
+                     runtime->config.antenna_map[antenna]),
+                 static_cast<unsigned long long>(
+                     statistics.station_observed_packets[antenna]),
+                 static_cast<unsigned long long>(
+                     statistics.station_accepted_packets[antenna]),
+                 static_cast<unsigned long long>(
+                     statistics.station_late_packets[antenna]),
+                 static_cast<unsigned long long>(
+                     statistics.station_highest_ordinals[antenna]));
+    }
 
     if (!EndOutputTransfer(runtime)) return -1;
     if (!runtime->failed) {

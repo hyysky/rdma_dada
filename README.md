@@ -1,10 +1,13 @@
 # RDMA/PSRDADA Pipeline
 
-该项目正在重构为独立的 PSRDADA ring-connected pipeline。当前可用部分是 RoCE v2
-数据接收到 raw ring，以及可在 macOS 上开发和测试的配置、DADA header、pipeline
-core、Beamform、Power、Stokes 和 Time Integration reference backend。四个算法及
-H2D/D2H 的独立 CUDA correctness test 已在目标服务器通过；`pipeline_worker` 第一版
-已经实现双 ring、header 传播，以及 Power/Stokes 后可选的 block-local 时间积分。
+该项目正在重构为独立的 PSRDADA ring-connected 实时天线阵列处理 pipeline。当前已实现
+统一 Observation/Resolved Plan、RoCE v2 ingest、Project VDIF TFP→ATFP 解包、GPU 上的
+ATFP→TFPA 转换，以及 Beamform、Power/Stokes、Time Integration 组成的双 ring
+`pipeline_worker`。功能、数值和 PSRDADA/CUDA 集成已经通过对应服务器验收；新 ATFP
+整链的持续吞吐和运行余量仍在测试，不能仅凭 correctness 结果声明满足实时观测速率。
+
+各应用、算法、配置、测试和后续工作的统一状态见
+[docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
 
 ## 当前数据契约
 
@@ -35,6 +38,7 @@ include/rdma_dada/io/psrdada/   PSRDADA ring/header 适配器接口
 src/config|pipeline|io/         与公共接口镜像的底层实现
 modules/                        独立算法，不持有 ring 和进程生命周期
 apps/rdma2dada/                 已实现的 NIC→raw ring 组合入口
+apps/vdif_unpack_worker/        已实现的 raw ring→ATFP compute ring 解包进程
 apps/pipeline_worker/           已实现的双 ring 模块链工作进程
 apps/dada2rdma|pipelinectl/     计划中的输出与编排入口
 tools/                          配置检查和 SSD 诊断工具
@@ -139,20 +143,22 @@ bash scripts/run_demo.sh start
 
 ## 当前限制
 
-- Linux RDMA 构建、CQ 错误路径、NIC flow steering 和持续运行需要在目标服务器验证。
+- Linux RDMA 构建、CQ 错误路径、NIC flow steering 和有限 transfer 已有服务器验证；
+  新 ATFP 完整整链的目标速率、持续运行和安全余量仍在验证。
 - `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32
   backend；`power`、`stokes`、`time_integrate` 已有 host FP32 reference 和异步
-  CUDA kernel。独立 CUDA correctness test 已在目标服务器通过，组合链、真实 ring
-  生命周期和性能仍需继续验证。
+  CUDA kernel。独立 CUDA correctness、GPU 数值组合链和 Resolved Plan 驱动的
+  PSRDADA/CUDA ring integration 已在目标服务器通过；整链持续性能仍需继续验证。
 - `host_to_device`、`device_to_host` 已实现为无 buffer 所有权的异步 CUDA 传输
   模块，并已接入 worker；当前 PSRDADA ring block 仍按普通 host 内存处理。
 - 观测流程固定为解析重排后执行 Beamform，再选择 Power 或 Stokes，最后按需执行
   time integration。当前 worker 已实现 `beamform`、`beamform+power`、
-  `beamform+stokes`，以及后两条链的可选积分；整数复数转 CF32 已作为独立模块实现，
-  但尚未接入 worker。VDIF 解包和通用模块 registry 仍待实现。
+  `beamform+stokes`，以及后两条链的可选积分；整数复数转 CF32 已作为固定前缀接入
+  worker。VDIF 解包已改为 payload-only ATFP 输出并通过功能验收，通用模块 registry
+  仍待实现。
 - 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
-  binary decoder、packet-group 状态机、TFPA scatter 及低速双 Station 真实 RDMA→unpack
-  基线已通过；接近 40 Gbps 的全正确 UDP 测速和低错误率测试尚未执行。
+  binary decoder、packet-group 状态机、ATFP 聚合、partial/EOD 和缺失补零已通过功能
+  验收；1–40 Gbps payload 目标速率 campaign 正在进行，低错误率测试尚未完成。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

@@ -23,10 +23,13 @@ CUDA FP32/TF32 backend. `power`, `stokes` and `time_integrate` have portable
 FP32 reference implementations and asynchronous CUDA elementwise/reduction
 backends. `host_to_device` and `device_to_host` are byte-preserving asynchronous
 CUDA transfer modules and are used by `pipeline_worker`. Their standalone CUDA
-correctness tests have passed on the target server. The full
-H2D→Beamform→Power→TimeIntegrate→D2H in-process CUDA chain has also passed;
-PSRDADA ring lifecycle and performance validation remain. Future algorithms
-should use the worker-owned execution stream by default.
+correctness tests have passed on the target server. The GPU worker now runs
+H2D→ATFP transpose/conversion→Beamform→Power/Stokes→optional TimeIntegrate→D2H.
+Beamform-only, Power and Stokes numerical products plus the Resolved
+Plan/PSRDADA/CUDA ring integration have passed server acceptance. Sustained
+full-pipeline throughput and operating headroom remain under test; isolated
+correctness does not establish real-time capability. Future algorithms should
+use the worker-owned execution stream by default.
 
 The authoritative data layouts, module inputs/outputs, integration rules and
 worker invocation contract are documented in
@@ -35,3 +38,8 @@ worker invocation contract are documented in
 Module order is configuration-driven and compatibility-checked. Each module
 must declare/validate its accepted input header and publish its output datatype,
 dimensions, ordering, memory location and block geometry.
+
+The current worker still selects from fixed legal chains. A general module
+registry for constructing arbitrary compatible chains is planned but not yet
+implemented. Per-module and application status is tracked in
+[`docs/PROJECT_STATUS.md`](../docs/PROJECT_STATUS.md).

@@ -37,6 +37,13 @@ struct VdifAtfpUnpackEngine::Impl {
         bool active;
     };
 
+    struct ParsedRecord {
+        const std::uint8_t* record;
+        std::uint64_t ordinal;
+        std::uint32_t antenna;
+        bool invalid_data;
+    };
+
     VdifUnpackConfig config;
     PipelineConfig pipeline;
     VdifUnpackLayout layout;
@@ -47,13 +54,14 @@ struct VdifAtfpUnpackEngine::Impl {
     std::vector<std::uint8_t> station_seen;
     std::vector<GroupSlot> slots;
     std::vector<std::int32_t> station_to_antenna;
+    std::vector<std::uint8_t> station_has_ordinal;
+    std::vector<std::uint64_t> block_station_counts;
+    std::vector<ParsedRecord> parsed_records;
     std::uint64_t groups_per_compute_block;
     std::uint64_t reorder_horizon_groups;
     std::uint64_t next_emit_ordinal;
-    std::uint64_t highest_seen_ordinal;
     std::uint64_t raw_block_bytes;
     std::uint64_t last_raw_block_sequence;
-    bool has_highest_seen;
     bool has_raw_block_sequence;
     bool configured;
     bool finished;
@@ -61,8 +69,7 @@ struct VdifAtfpUnpackEngine::Impl {
     Impl()
         : statistics(), groups_per_compute_block(0),
           reorder_horizon_groups(0), next_emit_ordinal(0),
-          highest_seen_ordinal(0), raw_block_bytes(0),
-          last_raw_block_sequence(0), has_highest_seen(false),
+          raw_block_bytes(0), last_raw_block_sequence(0),
           has_raw_block_sequence(false), configured(false), finished(false) {}
 
     std::uint64_t SlotIndex(std::uint64_t ordinal) const {
@@ -88,16 +95,35 @@ struct VdifAtfpUnpackEngine::Impl {
         return slot.active && slot.owned_ordinal == ordinal ? &slot : NULL;
     }
 
-    bool IsFinal(std::uint64_t ordinal) const {
+    bool StationWatermark(std::uint64_t* watermark) const {
+        if (!watermark ||
+            std::find(station_has_ordinal.begin(), station_has_ordinal.end(),
+                      0U) != station_has_ordinal.end()) {
+            return false;
+        }
+        *watermark = *std::min_element(
+            statistics.station_highest_ordinals.begin(),
+            statistics.station_highest_ordinals.end());
+        return true;
+    }
+
+    bool IsFinal(std::uint64_t ordinal, bool has_station_watermark,
+                 std::uint64_t station_watermark) const {
         const GroupSlot* slot = ActiveSlot(ordinal);
         if (slot && slot->seen_count == pipeline.nant) return true;
-        return has_highest_seen && highest_seen_ordinal >= ordinal &&
-               highest_seen_ordinal - ordinal >= reorder_horizon_groups;
+        return has_station_watermark && station_watermark >= ordinal &&
+               station_watermark - ordinal >= reorder_horizon_groups;
     }
 
     bool RangeIsFinal(std::uint64_t first, std::uint64_t count) const {
+        std::uint64_t station_watermark = 0;
+        const bool has_station_watermark =
+            StationWatermark(&station_watermark);
         for (std::uint64_t offset = 0; offset < count; ++offset) {
-            if (!IsFinal(first + offset)) return false;
+            if (!IsFinal(first + offset, has_station_watermark,
+                         station_watermark)) {
+                return false;
+            }
         }
         return true;
     }
@@ -184,10 +210,6 @@ struct VdifAtfpUnpackEngine::Impl {
     bool EnsureFits(std::uint64_t ordinal,
                     const VdifAtfpBlockEmitter& emit,
                     std::string* error) {
-        if (!has_highest_seen || ordinal > highest_seen_ordinal) {
-            highest_seen_ordinal = ordinal;
-            has_highest_seen = true;
-        }
         while (ordinal >= next_emit_ordinal &&
                ordinal - next_emit_ordinal >=
                    layout.window_capacity_groups) {
@@ -203,6 +225,7 @@ struct VdifAtfpUnpackEngine::Impl {
             }
             if (!Publish(groups_per_compute_block, emit, error)) return false;
             ++statistics.large_gap_advances;
+            statistics.large_gap_advanced_groups += groups_per_compute_block;
         }
         return true;
     }
@@ -291,6 +314,14 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
         layout.window_capacity_groups * pipeline.nant));
     next->slots.resize(static_cast<std::size_t>(layout.window_capacity_groups));
     next->station_to_antenna.assign(65536U, -1);
+    next->station_has_ordinal.assign(pipeline.nant, 0U);
+    next->block_station_counts.assign(pipeline.nant, 0U);
+    next->parsed_records.reserve(
+        static_cast<std::size_t>(layout.records_per_raw_block));
+    next->statistics.station_observed_packets.assign(pipeline.nant, 0U);
+    next->statistics.station_accepted_packets.assign(pipeline.nant, 0U);
+    next->statistics.station_late_packets.assign(pipeline.nant, 0U);
+    next->statistics.station_highest_ordinals.assign(pipeline.nant, 0U);
     for (std::size_t antenna = 0; antenna < config.antenna_map.size();
          ++antenna) {
         const std::uint16_t station = config.antenna_map[antenna];
@@ -324,6 +355,14 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
     impl_->has_raw_block_sequence = true;
     impl_->last_raw_block_sequence = raw_block_sequence;
 
+    std::fill(impl_->block_station_counts.begin(),
+              impl_->block_station_counts.end(), 0U);
+    impl_->parsed_records.clear();
+    std::uint64_t distinct_stations = 0U;
+    std::int32_t last_antenna = -1;
+    std::uint64_t consecutive_station_records = 0U;
+    std::uint64_t max_consecutive_station_records = 0U;
+
     for (std::uint64_t offset = 0; offset < size;
          offset += impl_->layout.raw_record_bytes) {
         ++impl_->statistics.received_records;
@@ -350,42 +389,98 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
             ++impl_->statistics.out_of_range_packets;
             continue;
         }
-        if (ordinal < impl_->next_emit_ordinal) {
+        const std::uint32_t antenna_index =
+            static_cast<std::uint32_t>(antenna);
+        ++impl_->statistics.station_observed_packets[antenna_index];
+        if (impl_->block_station_counts[antenna_index]++ == 0U)
+            ++distinct_stations;
+        if (last_antenna == antenna) {
+            ++consecutive_station_records;
+        } else {
+            last_antenna = antenna;
+            consecutive_station_records = 1U;
+        }
+        max_consecutive_station_records = std::max(
+            max_consecutive_station_records, consecutive_station_records);
+        if (impl_->station_has_ordinal[antenna_index] == 0U ||
+            ordinal > impl_->statistics.station_highest_ordinals[antenna_index]) {
+            impl_->station_has_ordinal[antenna_index] = 1U;
+            impl_->statistics.station_highest_ordinals[antenna_index] = ordinal;
+        }
+        Impl::ParsedRecord parsed = {};
+        parsed.record = record;
+        parsed.ordinal = ordinal;
+        parsed.antenna = antenna_index;
+        parsed.invalid_data = header.invalid_data;
+        impl_->parsed_records.push_back(parsed);
+    }
+    if (distinct_stations == 1U) {
+        ++impl_->statistics.single_station_raw_blocks;
+    } else if (distinct_stations > 1U) {
+        ++impl_->statistics.mixed_station_raw_blocks;
+    }
+    for (std::size_t antenna = 0;
+         antenna < impl_->block_station_counts.size(); ++antenna) {
+        impl_->statistics.max_station_records_per_raw_block = std::max(
+            impl_->statistics.max_station_records_per_raw_block,
+            impl_->block_station_counts[antenna]);
+    }
+    impl_->statistics.max_consecutive_station_records = std::max(
+        impl_->statistics.max_consecutive_station_records,
+        max_consecutive_station_records);
+    if (std::find(impl_->station_has_ordinal.begin(),
+                  impl_->station_has_ordinal.end(), 0U) ==
+        impl_->station_has_ordinal.end()) {
+        const std::pair<std::vector<std::uint64_t>::const_iterator,
+                        std::vector<std::uint64_t>::const_iterator> bounds =
+            std::minmax_element(
+                impl_->statistics.station_highest_ordinals.begin(),
+                impl_->statistics.station_highest_ordinals.end());
+        impl_->statistics.max_station_ordinal_skew = std::max(
+            impl_->statistics.max_station_ordinal_skew,
+            *bounds.second - *bounds.first);
+    }
+
+    for (std::size_t index = 0; index < impl_->parsed_records.size(); ++index) {
+        const Impl::ParsedRecord& parsed = impl_->parsed_records[index];
+        if (parsed.ordinal < impl_->next_emit_ordinal) {
             ++impl_->statistics.late_packets;
+            ++impl_->statistics.station_late_packets[parsed.antenna];
             continue;
         }
-        if (!impl_->EnsureFits(ordinal, emit, error)) return false;
-        if (header.invalid_data) {
+        if (!impl_->EnsureFits(parsed.ordinal, emit, error)) return false;
+        if (parsed.invalid_data) {
             ++impl_->statistics.invalid_data_packets;
             continue;
         }
 
-        const std::uint64_t slot_index = impl_->SlotIndex(ordinal);
+        const std::uint64_t slot_index = impl_->SlotIndex(parsed.ordinal);
         Impl::GroupSlot& slot =
             impl_->slots[static_cast<std::size_t>(slot_index)];
-        if (slot.active && slot.owned_ordinal != ordinal) {
+        if (slot.active && slot.owned_ordinal != parsed.ordinal) {
             return Fail("circular slot alias would overwrite a live ordinal",
                         error);
         }
         if (!slot.active) {
             slot.active = true;
-            slot.owned_ordinal = ordinal;
+            slot.owned_ordinal = parsed.ordinal;
             slot.seen_count = 0;
             std::memset(&impl_->station_seen[static_cast<std::size_t>(
                             slot_index * impl_->pipeline.nant)],
                         0, static_cast<std::size_t>(impl_->pipeline.nant));
         }
-        if (*impl_->Seen(slot_index, static_cast<std::uint32_t>(antenna)) != 0U) {
+        if (*impl_->Seen(slot_index, parsed.antenna) != 0U) {
             ++impl_->statistics.duplicate_packets;
             continue;
         }
         std::memcpy(
-            impl_->Payload(slot_index, static_cast<std::uint32_t>(antenna)),
-            record + impl_->pipeline.packet_header_bytes,
+            impl_->Payload(slot_index, parsed.antenna),
+            parsed.record + impl_->pipeline.packet_header_bytes,
             static_cast<std::size_t>(impl_->pipeline.packet_payload_bytes));
-        *impl_->Seen(slot_index, static_cast<std::uint32_t>(antenna)) = 1U;
+        *impl_->Seen(slot_index, parsed.antenna) = 1U;
         ++slot.seen_count;
         ++impl_->statistics.accepted_packets;
+        ++impl_->statistics.station_accepted_packets[parsed.antenna];
         ++impl_->statistics.payload_copy_calls;
         impl_->statistics.payload_copy_bytes +=
             impl_->pipeline.packet_payload_bytes;

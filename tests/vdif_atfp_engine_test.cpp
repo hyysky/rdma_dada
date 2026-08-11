@@ -318,7 +318,7 @@ void TestWatermarkZeroFillAndSlotReuse() {
     }
 
     records.clear();
-    Append(&records, MakeRecord(6, 101, 0));
+    AppendCompleteGroup(&records, 6);
     Expect(engine.ConsumeRawBlock(records.data(), records.size(), 12, emit,
                                   &error),
            "far-future packet advances safe window: " + error);
@@ -348,7 +348,8 @@ void TestWatermarkZeroFillAndSlotReuse() {
         Expect(output[2].bytes == ExpectedBlock(4, 2, present45),
                "slot reuse does not leak stale group bytes");
         std::vector<std::pair<std::uint64_t, std::uint32_t> > present67;
-        present67.push_back(std::make_pair(6U, 0U));
+        for (std::uint32_t antenna = 0; antenna < 3; ++antenna)
+            present67.push_back(std::make_pair(6U, antenna));
         Expect(output[3].bytes == ExpectedBlock(6, 2, present67),
                "EOD preserves one far packet and zero-fills the trailing group");
     }
@@ -357,8 +358,95 @@ void TestWatermarkZeroFillAndSlotReuse() {
            "groups three and seven are fully missing");
     Expect(stats.large_gap_advances == 1U,
            "far-future capacity advance is counted");
+    Expect(stats.large_gap_advanced_groups == 2U,
+           "capacity advance reports the number of emitted groups");
     Expect(stats.expected_station_packets == 24U,
            "loss denominator covers all EXPECTED_GROUPS");
+}
+
+void TestOneLeadingStationCannotEvictLaggingStations() {
+    unpack::VdifAtfpUnpackEngine engine;
+    std::string error;
+    Expect(engine.Configure(MakeConfig(), MakePipeline(), MakeLayout(),
+                            MakeTimeline(6), &error),
+           "multi-Station watermark engine configures: " + error);
+    std::vector<CollectedBlock> output;
+    const unpack::VdifAtfpBlockEmitter emit = Collect(&output);
+
+    std::vector<std::uint8_t> records;
+    AppendCompleteGroup(&records, 0);
+    Append(&records, MakeRecord(3, 205, 1));
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 40, emit,
+                                  &error),
+           "leading Station block consumes: " + error);
+    Expect(output.empty(),
+           "one leading Station cannot finalize a lagging incomplete group");
+
+    records.clear();
+    AppendCompleteGroup(&records, 1);
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 41, emit,
+                                  &error),
+           "lagging Station records remain in-window: " + error);
+    Expect(output.size() == 1U,
+           "completed lagging group emits one compute block");
+    if (output.size() == 1U) {
+        std::vector<std::pair<std::uint64_t, std::uint32_t> > present;
+        for (std::uint64_t group = 0; group < 2; ++group)
+            for (std::uint32_t antenna = 0; antenna < 3; ++antenna)
+                present.push_back(std::make_pair(group, antenna));
+        Expect(output[0].bytes == ExpectedBlock(0, 2, present),
+               "lagging Station payloads are preserved instead of zero-filled");
+    }
+    const unpack::VdifAtfpStatistics& stats = engine.statistics();
+    Expect(stats.late_packets == 0U,
+           "multi-Station watermark does not create artificial late packets");
+}
+
+void TestStationSkewAndRawBlockCompositionStatistics() {
+    unpack::VdifAtfpUnpackEngine engine;
+    std::string error;
+    Expect(engine.Configure(MakeConfig(), MakePipeline(), MakeLayout(),
+                            MakeTimeline(8), &error),
+           "station statistics engine configures: " + error);
+    std::vector<CollectedBlock> output;
+    const unpack::VdifAtfpBlockEmitter emit = Collect(&output);
+    std::vector<std::uint8_t> records;
+    Append(&records, MakeRecord(0, 101, 0));
+    Append(&records, MakeRecord(1, 101, 0));
+    Append(&records, MakeRecord(2, 101, 0));
+    Append(&records, MakeRecord(0, 205, 1));
+    Append(&records, MakeRecord(0, 409, 2));
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 30, emit,
+                                  &error),
+           "station statistics block consumes: " + error);
+
+    const unpack::VdifAtfpStatistics& stats = engine.statistics();
+    Expect(stats.station_observed_packets.size() == 3U &&
+               stats.station_observed_packets[0] == 3U &&
+               stats.station_observed_packets[1] == 1U &&
+               stats.station_observed_packets[2] == 1U,
+           "observed records are counted by antenna index");
+    Expect(stats.station_accepted_packets == stats.station_observed_packets,
+           "in-window station records are accepted");
+    Expect(stats.station_late_packets.size() == 3U &&
+               stats.station_late_packets[0] == 0U &&
+               stats.station_late_packets[1] == 0U &&
+               stats.station_late_packets[2] == 0U,
+           "station late counters start at zero");
+    Expect(stats.station_highest_ordinals.size() == 3U &&
+               stats.station_highest_ordinals[0] == 2U &&
+               stats.station_highest_ordinals[1] == 0U &&
+               stats.station_highest_ordinals[2] == 0U,
+           "highest ordinal is retained per Station");
+    Expect(stats.max_station_ordinal_skew == 2U,
+           "maximum Station ordinal skew is measured at block boundaries");
+    Expect(stats.mixed_station_raw_blocks == 1U &&
+               stats.single_station_raw_blocks == 0U,
+           "raw block Station diversity is classified");
+    Expect(stats.max_station_records_per_raw_block == 3U,
+           "maximum records from one Station in a raw block is measured");
+    Expect(stats.max_consecutive_station_records == 3U,
+           "maximum consecutive Station run is measured");
 }
 
 void TestPacketClassificationAndPartialEod() {
@@ -381,6 +469,8 @@ void TestPacketClassificationAndPartialEod() {
            "recoverable packet classes consume: " + error);
     records.clear();
     Append(&records, MakeRecord(2, 101, 0));
+    Append(&records, MakeRecord(2, 205, 1));
+    Append(&records, MakeRecord(2, 409, 2));
     Append(&records, MakeRecord(1, 205, 1));
     Expect(engine.ConsumeRawBlock(records.data(), records.size(), 21, emit,
                                   &error),
@@ -439,6 +529,8 @@ void TestExpectedTransferOverflowIsRejected() {
 int main() {
     TestArbitraryArrivalProducesAtfpBlock();
     TestWatermarkZeroFillAndSlotReuse();
+    TestStationSkewAndRawBlockCompositionStatistics();
+    TestOneLeadingStationCannotEvictLaggingStations();
     TestPacketClassificationAndPartialEod();
     TestMalformedRawBlockDoesNotPublish();
     TestExpectedTransferOverflowIsRejected();
