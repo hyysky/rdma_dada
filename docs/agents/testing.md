@@ -148,6 +148,16 @@ The controller itself is reviewed and tested like project code. A controller
 created only in `/tmp` is diagnostic material and cannot authorize final
 acceptance.
 
+For Task 8C startup, the controller exposes one external `PIPELINE_READY`
+gate. It creates the rings, starts the compute consumer, starts
+`vdif_unpack_worker`, waits for and validates its atomic `worker.ready`, then
+starts `rdma2dada` and waits for receiver readiness. Only then does it write
+`pipeline.ready` and allow both Station senders to start. `worker.ready`
+records the process identity, CONFIG_ID/GEOMETRY_ID, prepared window geometry
+and preparation timing. An optional `--worker-cpu-list` wraps only the worker
+with `/usr/bin/taskset -c`; omission preserves normal scheduling. The rendered
+argv and observed affinity are retained with the run artifacts.
+
 ## Environment and synchronization lessons
 
 - Compare a shared Git commit and source/config manifest. Independently built
@@ -218,6 +228,13 @@ part of that result. Set `--missing-wait-ms` and
 `window_blocks = 1 + missing-wait blocks + Station-skew-reserve blocks` from
 the requested aggregate rate and block geometry before creating either ring;
 the worker receives the missing-wait horizon explicitly.
+
+For an `rdma2dada` receive-limit test, use `--pipeline-stage receive
+--compute-consumer dbnull`. This mode creates only the raw ring, attaches
+`dada_dbnull -s -z` directly to it, starts `rdma2dada`, and starts the Station
+senders after receiver readiness. It does not create compute/output rings or
+start unpack/GPU workers. Result directories use the
+`rdma2dada-<rate>Gbps-<duration>s-<UTC>` prefix.
 
 Do not compare a `dbdisk` throughput result with a `dbnull` result as if they
 measured the same pipeline boundary; always report the consumer mode.

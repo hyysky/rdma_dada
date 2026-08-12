@@ -54,6 +54,11 @@ public:
     VdifAtfpUnpackEngine();
     ~VdifAtfpUnpackEngine();
 
+    bool Prepare(const VdifUnpackConfig& config,
+                 const PipelineConfig& pipeline,
+                 const VdifUnpackLayout& layout,
+                 std::string* error);
+    bool BeginTransfer(const VdifTimeline& timeline, std::string* error);
     bool Configure(const VdifUnpackConfig& config,
                    const PipelineConfig& pipeline,
                    const VdifUnpackLayout& layout,
@@ -66,6 +71,8 @@ public:
                          std::string* error);
     bool Finish(const VdifAtfpBlockEmitter& emit, std::string* error);
     const VdifAtfpStatistics& statistics() const;
+    bool prepared() const;
+    std::uint64_t prepared_window_bytes() const;
 
 private:
     struct Impl;

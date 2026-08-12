@@ -461,6 +461,19 @@ class Task8cRatePointTest(unittest.TestCase):
             "unpack-5Gbps-30s-20260811T143000Z",
         )
 
+    def test_receive_result_directory_is_named_for_rdma2dada(self):
+        request = MODULE.RateRequest(
+            aggregate_gbps=15.0,
+            duration_seconds=30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+
+        self.assertEqual(
+            MODULE.result_directory_name(request, "20260812T143000Z"),
+            "rdma2dada-15Gbps-30s-20260812T143000Z",
+        )
+
     def test_remote_compiler_uses_qths_binary_and_scoped_artifacts(self):
         class RecordingTransport:
             def __init__(self):
@@ -735,6 +748,78 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertNotIn('pipeline_worker" --plan', bundle["start.sh"])
 
+    def test_pipeline_ready_waits_for_worker_then_receiver_before_senders(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="unpack",
+            ),
+            reorder_horizon_groups=51200,
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-ready-order")
+        start = bundle["start.sh"]
+        worker_start = start.index("vdif_unpack_worker")
+        worker_ready = start.index('--ready-file "$run_dir/worker.ready"')
+        receiver_start = start.index('rdma2dada')
+        receiver_ready = start.index("Initialization complete, ready to start")
+        pipeline_ready = start.index('touch "$run_dir/pipeline.ready"')
+        self.assertLess(worker_start, worker_ready)
+        self.assertLess(worker_ready, receiver_start)
+        self.assertLess(receiver_start, receiver_ready)
+        self.assertLess(receiver_ready, pipeline_ready)
+        self.assertIn('--ready-file "$run_dir/worker.ready"', start)
+
+    def test_worker_ready_failure_stops_before_receiver_and_pipeline_ready(self):
+        plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        start = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-ready-failure"
+        )["start.sh"]
+        worker_wait = start.index('worker.ready')
+        receiver_start = start.index('rdma2dada')
+        self.assertLess(worker_wait, receiver_start)
+        self.assertIn('worker readiness timed out', start)
+        self.assertIn('report_readiness_state worker', start)
+        self.assertIn('touch "$run_dir/pipeline.ready"', start)
+
+    def test_worker_cpu_list_wraps_worker_with_taskset(self):
+        plan = dataclasses.replace(
+            make_plan(1.0, 30.0, compute_consumer="dbnull"),
+            worker_cpu_list="16-23",
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-taskset")
+        self.assertIn(
+            '/usr/bin/taskset -c 16-23 "$project/vdif_unpack_worker"',
+            bundle["start.sh"],
+        )
+        self.assertIn('taskset -pc "$worker_child_pid"', bundle["start.sh"])
+
+    def test_worker_cpu_list_omitted_keeps_default_scheduler(self):
+        plan = make_plan(1.0, 30.0, compute_consumer="dbnull")
+        start = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-no-taskset"
+        )["start.sh"]
+        self.assertNotIn('/usr/bin/taskset -c', start)
+
+    def test_worker_cpu_list_cli_accepts_linux_cpu_list(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            return_code = MODULE.main([
+                "--aggregate-gbps", "15",
+                "--duration-seconds", "30",
+                "--compute-consumer", "dbnull",
+                "--pipeline-stage", "unpack",
+                "--worker-cpu-list", "16-23",
+                "--dry-run",
+            ])
+        self.assertEqual(return_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["worker_cpu_list"], "16-23")
+
     def test_ring_creation_uses_compiler_ring_plan_values(self):
         plan = make_plan(0.1, 10.0, compute_consumer="dbnull")
         bundle = MODULE.build_qths_bundle(
@@ -805,6 +890,78 @@ class Task8cRatePointTest(unittest.TestCase):
                 f'kill -0 "$(cat "$run_dir/{process}.pid")"',
                 bundle["start.sh"],
             )
+
+    def test_receive_stage_drains_raw_ring_without_unpack_or_compute_ring(self):
+        plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-receive-only")
+
+        self.assertIn(
+            f"dada_dbnull -k {plan.raw_key} -s -z -q",
+            bundle["start.sh"],
+        )
+        self.assertIn(f"-k {plan.raw_key}", bundle["prepare.sh"])
+        self.assertNotIn(f"-k {plan.compute_key}", bundle["prepare.sh"])
+        self.assertNotIn("compute-ring", bundle["prepare.sh"])
+        self.assertNotIn("vdif_unpack_worker", bundle["start.sh"])
+        self.assertNotIn("worker.ready", bundle["start.sh"])
+        self.assertNotIn("pipeline_worker", bundle["start.sh"])
+        self.assertIn("Initialization complete, ready to start", bundle["start.sh"])
+        self.assertIn('touch "$run_dir/pipeline.ready"', bundle["start.sh"])
+        self.assertNotIn("compute_key", plan.as_dict())
+        self.assertNotIn("compute_block_bytes", plan.as_dict())
+
+    def test_receive_stage_requires_dbnull(self):
+        MODULE.RateRequest(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "receive pipeline_stage requires dbnull"):
+            MODULE.RateRequest(
+                15.0,
+                30.0,
+                compute_consumer="dbdisk",
+                pipeline_stage="receive",
+            ).validate()
+
+    def test_receive_stage_statistics_require_exact_receiver_and_raw_consumer(self):
+        plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+        records = plan.group_count * plan.nant
+        receiver = (
+            f"Receive summary: accepted={records}, wrong_length=0, "
+            f"published={records}, blocks=1, partial_blocks=1, "
+            "cq_tail_records=0\n"
+        )
+        statistics = MODULE.parse_receive_statistics(
+            receiver,
+            {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        )
+
+        MODULE._validate_statistics(statistics, plan, "")
+        self.assertNotIn("unpack", statistics)
+        self.assertEqual(statistics["raw"]["consumer"], "dada_dbnull")
+
+        statistics["receiver"]["accepted"] -= 1
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertEqual(raised.exception.classification, "PERFORMANCE_FAIL")
 
     def test_unpack_stage_dbnull_statistics_do_not_require_gpu_marker(self):
         plan = make_plan(
@@ -1163,7 +1320,9 @@ class Task8cRatePointTest(unittest.TestCase):
                 "qths1:summarize.py",
                 "qths1:supervise.py",
                 "qths1:unpacked.header",
+                "qths1:validate_worker_ready.py",
                 "qths1:validation_report.json",
+                "qths1:worker-argv.json",
                 "qtpulsar1:101.json",
                 "qtpulsar1:probe_sender_endpoint.py",
                 "qtpulsar2:102.json",

@@ -63,6 +63,7 @@ struct VdifAtfpUnpackEngine::Impl {
     std::uint64_t raw_block_bytes;
     std::uint64_t last_raw_block_sequence;
     bool has_raw_block_sequence;
+    bool prepared;
     bool configured;
     bool finished;
 
@@ -70,7 +71,8 @@ struct VdifAtfpUnpackEngine::Impl {
         : statistics(), groups_per_compute_block(0),
           reorder_horizon_groups(0), next_emit_ordinal(0),
           raw_block_bytes(0), last_raw_block_sequence(0),
-          has_raw_block_sequence(false), configured(false), finished(false) {}
+          has_raw_block_sequence(false), prepared(false), configured(false),
+          finished(false) {}
 
     std::uint64_t SlotIndex(std::uint64_t ordinal) const {
         return ordinal % layout.window_capacity_groups;
@@ -234,11 +236,10 @@ struct VdifAtfpUnpackEngine::Impl {
 VdifAtfpUnpackEngine::VdifAtfpUnpackEngine() : impl_(new Impl) {}
 VdifAtfpUnpackEngine::~VdifAtfpUnpackEngine() {}
 
-bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
-                                     const PipelineConfig& pipeline,
-                                     const VdifUnpackLayout& layout,
-                                     const VdifTimeline& timeline,
-                                     std::string* error) {
+bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
+                                   const PipelineConfig& pipeline,
+                                   const VdifUnpackLayout& layout,
+                                   std::string* error) {
     PipelineLayout pipeline_layout = {};
     if (!ComputePipelineLayout(pipeline, &pipeline_layout, error)) return false;
     if (config.window_blocks < 2U)
@@ -288,23 +289,10 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
             std::numeric_limits<std::size_t>::max() / pipeline.nant) {
         return Fail("ATFP window exceeds configured host memory limits", error);
     }
-    if (timeline.group_period_ps == 0U || timeline.start_frame != 0U ||
-        timeline.expected_groups == 0U)
-        return Fail("ATFP timeline is invalid", error);
-    std::uint64_t expected_transfer_bytes = 0;
-    std::uint64_t expected_station_packets = 0;
-    if (!CheckedMultiply(timeline.expected_groups, layout.group_bytes,
-                         &expected_transfer_bytes) ||
-        !CheckedMultiply(timeline.expected_groups, pipeline.nant,
-                         &expected_station_packets)) {
-        return Fail("ATFP expected transfer geometry overflows uint64", error);
-    }
-
     std::unique_ptr<Impl> next(new Impl);
     next->config = config;
     next->pipeline = pipeline;
     next->layout = layout;
-    next->timeline = timeline;
     next->raw_block_bytes = pipeline_layout.raw_block_bytes;
     next->groups_per_compute_block = groups_per_block;
     next->reorder_horizon_groups = reorder_horizon_groups;
@@ -323,7 +311,7 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
     next->station_to_antenna.assign(65536U, -1);
     next->station_has_ordinal.assign(pipeline.nant, 0U);
     next->block_station_counts.assign(pipeline.nant, 0U);
-    next->parsed_records.reserve(
+    next->parsed_records.resize(
         static_cast<std::size_t>(layout.records_per_raw_block));
     next->statistics.station_observed_packets.assign(pipeline.nant, 0U);
     next->statistics.station_accepted_packets.assign(pipeline.nant, 0U);
@@ -337,9 +325,61 @@ bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
         next->station_to_antenna[station] =
             static_cast<std::int32_t>(antenna);
     }
-    next->configured = true;
+    // Force physical page allocation before the producer can start.
+    std::fill(next->payload_window.begin(), next->payload_window.end(), 0U);
+    std::fill(next->station_seen.begin(), next->station_seen.end(), 0U);
+    std::fill(next->slots.begin(), next->slots.end(), Impl::GroupSlot());
+    std::fill(next->parsed_records.begin(), next->parsed_records.end(),
+              Impl::ParsedRecord());
+    next->parsed_records.clear();
+    next->prepared = true;
     impl_.swap(next);
     return true;
+}
+
+bool VdifAtfpUnpackEngine::BeginTransfer(const VdifTimeline& timeline,
+                                         std::string* error) {
+    if (!impl_->prepared)
+        return Fail("ATFP engine static resources are not prepared", error);
+    if (impl_->configured && !impl_->finished)
+        return Fail("ATFP engine transfer is already active", error);
+    if (timeline.group_period_ps == 0U || timeline.start_frame != 0U ||
+        timeline.expected_groups == 0U)
+        return Fail("ATFP timeline is invalid", error);
+    std::uint64_t expected_transfer_bytes = 0;
+    std::uint64_t expected_station_packets = 0;
+    if (!CheckedMultiply(timeline.expected_groups, impl_->layout.group_bytes,
+                         &expected_transfer_bytes) ||
+        !CheckedMultiply(timeline.expected_groups, impl_->pipeline.nant,
+                         &expected_station_packets)) {
+        return Fail("ATFP expected transfer geometry overflows uint64", error);
+    }
+    impl_->timeline = timeline;
+    impl_->statistics = VdifAtfpStatistics();
+    impl_->statistics.station_observed_packets.assign(impl_->pipeline.nant, 0U);
+    impl_->statistics.station_accepted_packets.assign(impl_->pipeline.nant, 0U);
+    impl_->statistics.station_late_packets.assign(impl_->pipeline.nant, 0U);
+    impl_->statistics.station_highest_ordinals.assign(impl_->pipeline.nant, 0U);
+    std::fill(impl_->station_seen.begin(), impl_->station_seen.end(), 0U);
+    std::fill(impl_->slots.begin(), impl_->slots.end(), Impl::GroupSlot());
+    std::fill(impl_->station_has_ordinal.begin(),
+              impl_->station_has_ordinal.end(), 0U);
+    impl_->parsed_records.clear();
+    impl_->next_emit_ordinal = 0U;
+    impl_->last_raw_block_sequence = 0U;
+    impl_->has_raw_block_sequence = false;
+    impl_->configured = true;
+    impl_->finished = false;
+    return true;
+}
+
+bool VdifAtfpUnpackEngine::Configure(const VdifUnpackConfig& config,
+                                     const PipelineConfig& pipeline,
+                                     const VdifUnpackLayout& layout,
+                                     const VdifTimeline& timeline,
+                                     std::string* error) {
+    return Prepare(config, pipeline, layout, error) &&
+           BeginTransfer(timeline, error);
 }
 
 bool VdifAtfpUnpackEngine::ConsumeRawBlock(
@@ -514,6 +554,12 @@ bool VdifAtfpUnpackEngine::Finish(const VdifAtfpBlockEmitter& emit,
 
 const VdifAtfpStatistics& VdifAtfpUnpackEngine::statistics() const {
     return impl_->statistics;
+}
+
+bool VdifAtfpUnpackEngine::prepared() const { return impl_->prepared; }
+
+std::uint64_t VdifAtfpUnpackEngine::prepared_window_bytes() const {
+    return impl_->prepared ? impl_->layout.window_bytes : 0U;
 }
 
 }  // namespace vdif_unpack

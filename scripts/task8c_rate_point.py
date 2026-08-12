@@ -59,6 +59,7 @@ class RateRequest:
     pipeline_stage: str = "full"
     missing_wait_ms: float = 200.0
     station_skew_reserve_ms: float = 200.0
+    worker_cpu_list: str | None = None
 
     def validate(self) -> None:
         if (
@@ -79,10 +80,18 @@ class RateRequest:
             raise ValueError("batch_packets must be positive")
         if self.compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
-        if self.pipeline_stage not in ("unpack", "full"):
-            raise ValueError("pipeline_stage must be unpack or full")
-        if self.pipeline_stage == "unpack" and self.compute_consumer != "dbnull":
-            raise ValueError("unpack pipeline_stage requires dbnull")
+        if self.pipeline_stage not in ("receive", "unpack", "full"):
+            raise ValueError("pipeline_stage must be receive, unpack or full")
+        if self.pipeline_stage in ("receive", "unpack") and self.compute_consumer != "dbnull":
+            raise ValueError(f"{self.pipeline_stage} pipeline_stage requires dbnull")
+        if self.worker_cpu_list is not None:
+            if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*",
+                                self.worker_cpu_list):
+                raise ValueError("worker_cpu_list must use Linux CPU-list syntax")
+            for part in self.worker_cpu_list.split(","):
+                bounds = [int(value) for value in part.split("-")]
+                if len(bounds) == 2 and bounds[0] > bounds[1]:
+                    raise ValueError("worker_cpu_list range must be ascending")
 
 
 def result_directory_name(
@@ -93,8 +102,9 @@ def result_directory_name(
     def compact(value: float) -> str:
         return str(int(value)) if value.is_integer() else format(value, "g")
 
+    stage = "rdma2dada" if request.pipeline_stage == "receive" else request.pipeline_stage
     return (
-        f"{request.pipeline_stage}-{compact(request.aggregate_gbps)}Gbps-"
+        f"{stage}-{compact(request.aggregate_gbps)}Gbps-"
         f"{compact(request.duration_seconds)}s-{timestamp}"
     )
 
@@ -139,10 +149,15 @@ class RatePlan:
     artifact_files: dict[str, bytes]
     pipeline_stage: str = "full"
     reorder_horizon_groups: int = 0
+    worker_cpu_list: str | None = None
 
     @property
     def uses_pipeline_worker(self) -> bool:
         return self.pipeline_stage == "full" and self.compute_consumer == "dbnull"
+
+    @property
+    def uses_unpack_worker(self) -> bool:
+        return self.pipeline_stage != "receive"
 
     @property
     def raw_block_bytes(self) -> int:
@@ -151,6 +166,12 @@ class RatePlan:
     @property
     def compute_block_bytes(self) -> int:
         return int(self.resolved_plan["resolved"]["compute_block_bytes"])
+
+    @property
+    def window_bytes(self) -> int:
+        derived = self.resolved_plan["resolved"]
+        return int(derived.get("window_payload_bytes",
+                               self.compute_block_bytes * 2))
 
     @property
     def raw_ring_blocks(self) -> int:
@@ -212,6 +233,7 @@ class RatePlan:
         batch_packets: int = 16,
         compute_consumer: str = "dbdisk",
         pipeline_stage: str = "full",
+        worker_cpu_list: str | None = None,
     ) -> "RatePlan":
         root = pathlib.Path(artifact_directory)
         base_required = (
@@ -306,10 +328,10 @@ class RatePlan:
             raise ValueError("rate, duration and batch size must be positive")
         if compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
-        if pipeline_stage not in ("unpack", "full"):
-            raise ValueError("pipeline_stage must be unpack or full")
-        if pipeline_stage == "unpack" and compute_consumer != "dbnull":
-            raise ValueError("unpack pipeline_stage requires dbnull")
+        if pipeline_stage not in ("receive", "unpack", "full"):
+            raise ValueError("pipeline_stage must be receive, unpack or full")
+        if pipeline_stage in ("receive", "unpack") and compute_consumer != "dbnull":
+            raise ValueError(f"{pipeline_stage} pipeline_stage requires dbnull")
         source = json.loads(resolved["source_json"])
         station_count = len(source["observation"]["station_ids"])
         if station_count == 0:
@@ -332,6 +354,7 @@ class RatePlan:
             ring_plan=rings,
             artifact_files=files,
             pipeline_stage=pipeline_stage,
+            worker_cpu_list=worker_cpu_list,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -349,7 +372,11 @@ class RatePlan:
                 for name, contents in self.artifact_files.items()
             },
         })
-        if self.pipeline_stage != "unpack" and "output" in self.ring_plan.get("rings", {}):
+        if self.pipeline_stage == "receive":
+            result.pop("compute_key", None)
+            result.pop("compute_block_bytes", None)
+            result.pop("compute_ring_blocks", None)
+        elif self.pipeline_stage != "unpack" and "output" in self.ring_plan.get("rings", {}):
             result.update({
                 "output_block_bytes": self.output_block_bytes,
                 "output_ring_blocks": self.output_ring_blocks,
@@ -555,7 +582,8 @@ def compile_rate_plan(
             str(plan.group_count), str(group_count), "HARNESS_FAIL"
         )
     return dataclasses.replace(
-        plan, reorder_horizon_groups=reorder_horizon_groups
+        plan, reorder_horizon_groups=reorder_horizon_groups,
+        worker_cpu_list=request.worker_cpu_list,
     )
 
 
@@ -649,8 +677,13 @@ def build_qths_bundle(
 ) -> dict[str, str | bytes]:
     if not plan.artifact_files:
         raise ValueError("compiler artifact bundle is required")
+    receive_only = plan.pipeline_stage == "receive"
     full_gpu_pipeline = plan.uses_pipeline_worker
-    consumer_key = plan.output_key if full_gpu_pipeline else plan.compute_key
+    consumer_key = (
+        plan.raw_key if receive_only
+        else plan.output_key if full_gpu_pipeline
+        else plan.compute_key
+    )
     receiver_device = str(plan.source["receiver"]["device"])
     capture_nic_counters = '''#!/usr/bin/env python3
 import datetime
@@ -731,6 +764,8 @@ def forward(signum, _frame):
 signal.signal(signal.SIGTERM, forward)
 signal.signal(signal.SIGINT, forward)
 child = subprocess.Popen(sys.argv[2:])
+child_pid_path = exit_path.with_name(exit_path.stem + ".child.pid")
+child_pid_path.write_text(str(child.pid) + "\\n")
 if pending_signal is not None and child.poll() is None:
     child.send_signal(pending_signal)
 return_code = child.wait()
@@ -738,12 +773,38 @@ exit_code = return_code if return_code >= 0 else 128 - return_code
 exit_path.write_text(str(exit_code) + "\\n")
 raise SystemExit(exit_code)
 '''
+    validate_worker_ready = '''#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+if len(sys.argv) != 5:
+    raise SystemExit(
+        "usage: validate_worker_ready.py READY CONFIG_ID GEOMETRY_ID WINDOW_BYTES"
+    )
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+expected = {
+    "config_id": sys.argv[2],
+    "geometry_id": sys.argv[3],
+    "window_bytes": int(sys.argv[4]),
+}
+for name, wanted in expected.items():
+    if value.get(name) != wanted:
+        raise SystemExit(f"worker ready {name} mismatch")
+if value.get("schema_version") != 1 or int(value.get("pid", 0)) <= 0:
+    raise SystemExit("worker ready metadata is invalid")
+'''
     if plan.compute_consumer == "dbnull":
         reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {dbnull_path} -k {consumer_key} -s -z -q >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
     else:
         reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {dbdisk_path} -k {plan.compute_key} -D "$run_dir/compute" -s -W >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
+    compute_ring_prepare = "" if receive_only else f'''{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
+echo $! >"$run_dir/compute-ring.pid"
+touch "$run_dir/compute-ring.created"
+'''
     prepare = f"""#!/usr/bin/env bash
 set -euo pipefail
 run_dir={remote_run_dir}
@@ -751,17 +812,13 @@ mkdir -p "$run_dir/compute"
 {dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
 echo $! >"$run_dir/raw-ring.pid"
 touch "$run_dir/raw-ring.created"
-{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
-echo $! >"$run_dir/compute-ring.pid"
-touch "$run_dir/compute-ring.created"
-""" + (f'''{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
+{compute_ring_prepare}""" + (f'''{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
 echo $! >"$run_dir/output-ring.pid"
 touch "$run_dir/output-ring.created"
 ''' if full_gpu_pipeline else "") + f"""
 sleep 1
 kill -0 "$(cat "$run_dir/raw-ring.pid")"
-kill -0 "$(cat "$run_dir/compute-ring.pid")"
-""" + ('kill -0 "$(cat "$run_dir/output-ring.pid")"\n' if full_gpu_pipeline else "")
+""" + ('kill -0 "$(cat "$run_dir/compute-ring.pid")"\n' if not receive_only else "") + ('kill -0 "$(cat "$run_dir/output-ring.pid")"\n' if full_gpu_pipeline else "")
     pipeline_worker_start = ""
     if full_gpu_pipeline:
         pipeline_worker_start = '''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" "$project/pipeline_worker" "$run_dir/resolved_observation.json" >"$run_dir/pipeline-worker.log" 2>&1 &
@@ -769,6 +826,7 @@ echo $! >"$run_dir/pipeline-worker.pid"'''
     process_names = (
         ("reader", "pipeline-worker", "worker", "receiver")
         if full_gpu_pipeline
+        else ("reader", "receiver") if receive_only
         else ("reader", "worker", "receiver")
     )
     readiness_checks = '\n'.join(
@@ -800,6 +858,45 @@ report_readiness_failure() {
   report_readiness_state "$name"
 }
 '''
+    worker_program = '"$project/vdif_unpack_worker"'
+    if plan.worker_cpu_list is not None:
+        worker_program = (
+            f'/usr/bin/taskset -c {plan.worker_cpu_list} '
+            '"$project/vdif_unpack_worker"'
+        )
+    worker_start = ""
+    if not receive_only:
+        worker_start = f'''rm -f "$run_dir/worker.ready"
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready" >"$run_dir/worker.log" 2>&1 &
+echo $! >"$run_dir/worker.pid"
+for _ in $(seq 1 300); do
+  if ! kill -0 "$(cat "$run_dir/worker.pid")" 2>/dev/null; then
+    report_readiness_failure worker
+    exit 1
+  fi
+  if [[ -f "$run_dir/worker.ready" ]]; then
+    /usr/bin/python3 "$run_dir/validate_worker_ready.py" "$run_dir/worker.ready" {plan.config_id} {plan.geometry_id} {plan.window_bytes}
+    break
+  fi
+  sleep 0.1
+done
+if [[ ! -f "$run_dir/worker.ready" ]]; then
+  echo "worker readiness timed out" >&2
+  report_readiness_state worker
+  exit 1
+fi
+for _ in $(seq 1 100); do
+  [[ -f "$run_dir/worker.child.pid" ]] && break
+  sleep 0.01
+done
+if [[ ! -f "$run_dir/worker.child.pid" ]]; then
+  echo "worker child PID was not recorded" >&2
+  report_readiness_state worker
+  exit 1
+fi
+worker_child_pid=$(cat "$run_dir/worker.child.pid")
+/usr/bin/taskset -pc "$worker_child_pid" >"$run_dir/worker-affinity.txt"
+'''
     start = f"""#!/usr/bin/env bash
 set -euo pipefail
 run_dir={remote_run_dir}
@@ -808,13 +905,16 @@ project={qths_binary_dir}
  /usr/bin/python3 "$run_dir/capture_nic_counters.py" {receiver_device} {ethtool_path} "$run_dir/nic-before.json"
 {reader_start}
 {pipeline_worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" "$project/vdif_unpack_worker" --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} >"$run_dir/worker.log" 2>&1 &
-echo $! >"$run_dir/worker.pid"
+rm -f "$run_dir/pipeline.ready"
+{worker_start}
 /usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n 64 --nsge 4 >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
-  grep -q 'Initialization complete, ready to start' "$run_dir/receiver.log" && exit 0
+  if grep -q 'Initialization complete, ready to start' "$run_dir/receiver.log"; then
+    touch "$run_dir/pipeline.ready"
+    exit 0
+  fi
   sleep 0.1
 done
 echo "readiness timed out waiting for receiver initialization" >&2
@@ -830,7 +930,7 @@ attempts=${{TASK8C_WAIT_ATTEMPTS:-300}}
 wait_sleep=${{TASK8C_WAIT_SLEEP:-0.1}}
 /usr/bin/python3 "$run_dir/capture_nic_counters.py" {receiver_device} {ethtool_path} "$run_dir/nic-after.json"
 kill -TERM "$(cat "$run_dir/receiver.pid")"
-for name in receiver worker {"pipeline-worker " if full_gpu_pipeline else ""}reader; do
+for name in receiver {"worker " if not receive_only else ""}{"pipeline-worker " if full_gpu_pipeline else ""}reader; do
   pid=$(cat "$run_dir/$name.pid")
   for _ in $(seq 1 "$attempts"); do
     kill -0 "$pid" 2>/dev/null || break
@@ -848,7 +948,7 @@ run_dir={remote_run_dir}
 status=0
 attempts=${{TASK8C_WAIT_ATTEMPTS:-100}}
 wait_sleep=${{TASK8C_WAIT_SLEEP:-0.1}}
-for name in receiver worker {"pipeline-worker " if full_gpu_pipeline else ""}reader raw-ring compute-ring {"output-ring" if full_gpu_pipeline else ""}; do
+for name in receiver {"worker " if not receive_only else ""}{"pipeline-worker " if full_gpu_pipeline else ""}reader raw-ring {"compute-ring " if not receive_only else ""}{"output-ring" if full_gpu_pipeline else ""}; do
   file="$run_dir/$name.pid"
   if [[ -f "$file" ]]; then
     pid=$(cat "$file")
@@ -923,6 +1023,7 @@ summary = {{
 (run_dir / "compute-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
 '''
     if plan.compute_consumer == "dbnull":
+        summary_name = "raw-summary.json" if receive_only else "compute-summary.json"
         summarize = f'''#!/usr/bin/env python3
 import json
 from pathlib import Path
@@ -937,8 +1038,18 @@ summary = {{
     "zero_copy": True,
     "single_transfer": True,
 }}
-(run_dir / "compute-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
+(run_dir / {summary_name!r}).write_text(json.dumps(summary, indent=2) + "\\n")
 '''
+    worker_argv: list[str] = []
+    if not receive_only:
+        if plan.worker_cpu_list is not None:
+            worker_argv += ["/usr/bin/taskset", "-c", plan.worker_cpu_list]
+        worker_argv += [
+            f"{qths_binary_dir}/vdif_unpack_worker",
+            "--plan", f"{remote_run_dir}/resolved_observation.json",
+            "--reorder-horizon-groups", str(plan.reorder_horizon_groups),
+            "--ready-file", f"{remote_run_dir}/worker.ready",
+        ]
     bundle: dict[str, str | bytes] = dict(plan.artifact_files)
     bundle.update({
         "supervise.py": supervise,
@@ -949,6 +1060,9 @@ summary = {{
         "cleanup.sh": cleanup,
         "summarize.py": summarize,
     })
+    if not receive_only:
+        bundle["validate_worker_ready.py"] = validate_worker_ready
+        bundle["worker-argv.json"] = json.dumps(worker_argv, indent=2) + "\n"
     return bundle
 
 
@@ -1376,10 +1490,14 @@ class SshBackend:
         hashes.update(self._transfer_sender_configs(bundle_root))
         binaries = [
             ("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),
-            ("qths1", "vdif_unpack_worker", self.qths_binary_dir / "vdif_unpack_worker"),
             ("qtpulsar1", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
             ("qtpulsar2", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
         ]
+        if plan.uses_unpack_worker:
+            binaries.insert(
+                1,
+                ("qths1", "vdif_unpack_worker", self.qths_binary_dir / "vdif_unpack_worker"),
+            )
         if plan.uses_pipeline_worker:
             binaries.insert(
                 2,
@@ -1562,7 +1680,9 @@ class SshBackend:
                 error.stderr,
                 "ENV_BLOCKED",
             ) from error
-        self._rings_acquired = [plan.raw_key, plan.compute_key]
+        self._rings_acquired = [plan.raw_key]
+        if plan.pipeline_stage != "receive":
+            self._rings_acquired.append(plan.compute_key)
         if plan.uses_pipeline_worker:
             self._rings_acquired.append(plan.output_key)
         binary = str(self.qths_binary_dir / "rdma2dada")
@@ -1602,10 +1722,31 @@ class SshBackend:
                 error.stderr,
                 "PRODUCT_FAIL",
             ) from error
-        return {
+        readiness: dict[str, Any] = {
             "rings": list(self._rings_acquired),
             "capability_added": True,
         }
+        if plan.uses_unpack_worker:
+            worker_ready_completed = self._ssh(
+                "qths1", ["cat", f"{self.remote_run_dir}/worker.ready"],
+                "PIPELINE_READY",
+            )
+            affinity_completed = self._ssh(
+                "qths1", ["cat", f"{self.remote_run_dir}/worker-affinity.txt"],
+                "PIPELINE_READY",
+            )
+            try:
+                worker_ready = json.loads(worker_ready_completed.stdout)
+            except json.JSONDecodeError as error:
+                raise StageError(
+                    "PIPELINE_READY", ["parse", "worker.ready"], 1,
+                    worker_ready_completed.stdout, repr(error), "HARNESS_FAIL",
+                ) from error
+            readiness.update({
+                "worker_ready": worker_ready,
+                "worker_affinity": affinity_completed.stdout.strip(),
+            })
+        return readiness
 
     def _remaining_start_margin(self) -> float:
         now_text = self._ssh(
@@ -1745,20 +1886,21 @@ class SshBackend:
         )
         qths_copy = run_dir / "qths"
         qths_copy.mkdir(exist_ok=True)
+        summary_name = (
+            "raw-summary.json" if plan.pipeline_stage == "receive"
+            else "compute-summary.json"
+        )
         artifact_names = [
-            "receiver.log",
-            "worker.log",
-            "reader.log",
-            "nic-before.json",
-            "nic-after.json",
-            "compute-summary.json",
-            "MANIFEST.sha256",
-            "resolved_observation.json",
-            "ring_plan.json",
-            "raw.header",
-            "unpacked.header",
-            "validation_report.json",
+            "receiver.log", "pipeline.ready", "reader.log",
+            "nic-before.json", "nic-after.json", summary_name,
+            "MANIFEST.sha256", "resolved_observation.json", "ring_plan.json",
+            "raw.header", "validation_report.json",
         ]
+        if plan.uses_unpack_worker:
+            artifact_names.extend((
+                "worker.log", "worker.ready", "worker-affinity.txt",
+                "worker-argv.json", "unpacked.header",
+            ))
         if plan.compute_consumer == "dbnull":
             artifact_names.append("reader.exit")
         if plan.uses_pipeline_worker:
@@ -1771,16 +1913,21 @@ class SshBackend:
                 "COLLECTING",
                 True,
             )
-        pipeline_worker_log = ""
-        if plan.uses_pipeline_worker:
-            pipeline_worker_log = (qths_copy / "pipeline-worker.log").read_text()
-        statistics = parse_qths_statistics(
-            (qths_copy / "receiver.log").read_text(),
-            (qths_copy / "worker.log").read_text(),
-            json.loads((qths_copy / "compute-summary.json").read_text()),
-            pipeline_worker_log,
-            expect_pipeline_worker=plan.uses_pipeline_worker,
-        )
+        receiver_log = (qths_copy / "receiver.log").read_text()
+        summary = json.loads((qths_copy / summary_name).read_text())
+        if plan.pipeline_stage == "receive":
+            statistics = parse_receive_statistics(receiver_log, summary)
+        else:
+            pipeline_worker_log = ""
+            if plan.uses_pipeline_worker:
+                pipeline_worker_log = (qths_copy / "pipeline-worker.log").read_text()
+            statistics = parse_qths_statistics(
+                receiver_log,
+                (qths_copy / "worker.log").read_text(),
+                summary,
+                pipeline_worker_log,
+                expect_pipeline_worker=plan.uses_pipeline_worker,
+            )
         statistics["nic"] = nic_counter_evidence(
             json.loads((qths_copy / "nic-before.json").read_text()),
             json.loads((qths_copy / "nic-after.json").read_text()),
@@ -1830,15 +1977,16 @@ class SshBackend:
             diagnostic_root = run_dir / "qths-cleanup"
             diagnostic_root.mkdir(exist_ok=True)
             diagnostic_names = [
-                "receiver.log",
-                "worker.log",
-                "reader.log",
-                "nic-before.json",
-                "nic-after.json",
-                "raw-ring.log",
-                "compute-ring.log",
-                "compute-summary.json",
+                "receiver.log", "pipeline.ready", "reader.log",
+                "nic-before.json", "nic-after.json", "raw-ring.log",
+                "raw-summary.json" if self._pipeline_stage == "receive"
+                else "compute-summary.json",
             ]
+            if self._pipeline_stage != "receive":
+                diagnostic_names.extend((
+                    "worker.log", "worker.ready", "worker-affinity.txt",
+                    "worker-argv.json", "compute-ring.log",
+                ))
             if self._compute_consumer == "dbnull":
                 diagnostic_names.append("reader.exit")
             if self._pipeline_stage == "full" and self._compute_consumer == "dbnull":
@@ -1972,20 +2120,30 @@ def _validate_statistics(
         ("receiver", "published"): expected_records,
         ("receiver", "wrong_length"): 0,
         ("receiver", "cq_errors"): 0,
-        ("unpack", "records"): expected_records,
-        ("unpack", "accepted"): expected_records,
-        ("unpack", "bad_header"): 0,
-        ("unpack", "invalid_data"): 0,
-        ("unpack", "unknown_station"): 0,
-        ("unpack", "duplicate"): 0,
-        ("unpack", "late"): 0,
-        ("unpack", "out_of_range"): 0,
-        ("unpack", "complete_groups"): plan.group_count,
-        ("unpack", "incomplete_groups"): 0,
-        ("unpack", "fully_missing_groups"): 0,
-        ("unpack", "missing_station"): 0,
     }
-    if plan.compute_consumer == "dbnull":
+    if plan.pipeline_stage == "receive":
+        required.update({
+            ("raw", "consumer"): "dada_dbnull",
+            ("raw", "exit_code"): 0,
+            ("raw", "zero_copy"): True,
+            ("raw", "single_transfer"): True,
+        })
+    else:
+        required.update({
+            ("unpack", "records"): expected_records,
+            ("unpack", "accepted"): expected_records,
+            ("unpack", "bad_header"): 0,
+            ("unpack", "invalid_data"): 0,
+            ("unpack", "unknown_station"): 0,
+            ("unpack", "duplicate"): 0,
+            ("unpack", "late"): 0,
+            ("unpack", "out_of_range"): 0,
+            ("unpack", "complete_groups"): plan.group_count,
+            ("unpack", "incomplete_groups"): 0,
+            ("unpack", "fully_missing_groups"): 0,
+            ("unpack", "missing_station"): 0,
+        })
+    if plan.pipeline_stage != "receive" and plan.compute_consumer == "dbnull":
         required.update(
             {
                 ("compute", "consumer"): "dada_dbnull",
@@ -1996,7 +2154,7 @@ def _validate_statistics(
         )
         if plan.uses_pipeline_worker:
             required[("gpu", "completed")] = True
-    else:
+    elif plan.pipeline_stage != "receive":
         required.update(
             {
                 ("compute", "data_bytes"): expected_data_bytes,
@@ -2044,13 +2202,7 @@ def _validate_statistics(
         )
 
 
-def parse_qths_statistics(
-    receiver_log: str,
-    worker_log: str,
-    compute_summary: dict[str, Any],
-    pipeline_worker_log: str = "",
-    expect_pipeline_worker: bool = True,
-) -> dict[str, Any]:
+def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
     receiver_match = re.search(
         r"Receive summary:\s*accepted=(\d+),\s*wrong_length=(\d+),\s*"
         r"published=(\d+),\s*blocks=(\d+),\s*partial_blocks=(\d+),\s*"
@@ -2059,12 +2211,55 @@ def parse_qths_statistics(
     )
     if not receiver_match:
         raise StageError(
-            "COLLECTING",
-            ["parse", "receiver.log"],
-            1,
-            receiver_log,
-            "missing receiver summary",
+            "COLLECTING", ["parse", "receiver.log"], 1,
+            receiver_log, "missing receiver summary",
         )
+    cq_patterns = (
+        "CQ status error", "invalid WR ID", "unexpected opcode", "repost failed",
+    )
+    return {
+        "accepted": int(receiver_match.group(1)),
+        "wrong_length": int(receiver_match.group(2)),
+        "published": int(receiver_match.group(3)),
+        "blocks": int(receiver_match.group(4)),
+        "partial_blocks": int(receiver_match.group(5)),
+        "cq_tail_records": int(receiver_match.group(6)),
+        "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
+    }
+
+
+def _parse_dbnull_summary(summary: dict[str, Any], filename: str) -> dict[str, Any]:
+    try:
+        return {
+            "consumer": "dada_dbnull",
+            "exit_code": int(summary["exit_code"]),
+            "zero_copy": summary["zero_copy"] is True,
+            "single_transfer": summary["single_transfer"] is True,
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise StageError(
+            "COLLECTING", ["parse", filename], 1,
+            json.dumps(summary, sort_keys=True), repr(error),
+        ) from error
+
+
+def parse_receive_statistics(
+    receiver_log: str, raw_summary: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "receiver": _parse_receiver_statistics(receiver_log),
+        "raw": _parse_dbnull_summary(raw_summary, "raw-summary.json"),
+    }
+
+
+def parse_qths_statistics(
+    receiver_log: str,
+    worker_log: str,
+    compute_summary: dict[str, Any],
+    pipeline_worker_log: str = "",
+    expect_pipeline_worker: bool = True,
+) -> dict[str, Any]:
+    receiver = _parse_receiver_statistics(receiver_log)
     unpack_match = re.search(
         r"VDIF unpack statistics:\s*records=(\d+)\s+accepted=(\d+)\s+"
         r"bad_header=(\d+)\s+invalid_data=(\d+)\s+unknown_station=(\d+)\s+"
@@ -2119,21 +2314,7 @@ def parse_qths_statistics(
             "missing unpack skew or per-Station diagnostics",
         )
     if compute_summary.get("consumer") == "dada_dbnull":
-        try:
-            compute = {
-                "consumer": "dada_dbnull",
-                "exit_code": int(compute_summary["exit_code"]),
-                "zero_copy": compute_summary["zero_copy"] is True,
-                "single_transfer": compute_summary["single_transfer"] is True,
-            }
-        except (KeyError, TypeError, ValueError) as error:
-            raise StageError(
-                "COLLECTING",
-                ["parse", "compute-summary.json"],
-                1,
-                json.dumps(compute_summary, sort_keys=True),
-                repr(error),
-            ) from error
+        compute = _parse_dbnull_summary(compute_summary, "compute-summary.json")
     else:
         header = compute_summary.get("header", {})
         try:
@@ -2157,12 +2338,6 @@ def parse_qths_statistics(
                 json.dumps(compute_summary, sort_keys=True),
                 repr(error),
             ) from error
-    cq_patterns = (
-        "CQ status error",
-        "invalid WR ID",
-        "unexpected opcode",
-        "repost failed",
-    )
     unpack = {
         name: int(value)
         for name, value in zip(unpack_names, unpack_match.groups())
@@ -2198,15 +2373,7 @@ def parse_qths_statistics(
         in station_matches
     ]
     result = {
-        "receiver": {
-            "accepted": int(receiver_match.group(1)),
-            "wrong_length": int(receiver_match.group(2)),
-            "published": int(receiver_match.group(3)),
-            "blocks": int(receiver_match.group(4)),
-            "partial_blocks": int(receiver_match.group(5)),
-            "cq_tail_records": int(receiver_match.group(6)),
-            "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
-        },
+        "receiver": receiver,
         "unpack": unpack,
         "compute": compute,
     }
@@ -2320,7 +2487,14 @@ class RatePointController:
             acquired = self.backend.start_pipeline(plan, self.run_dir)
             resources.rings = list(acquired.get("rings", []))
             resources.capability_added = bool(acquired.get("capability_added", False))
-            self._state("PIPELINE_READY", **config)
+            manifest = json.loads((self.run_dir / "manifest.json").read_text())
+            manifest["pipeline_ready"] = {
+                name: value for name, value in acquired.items()
+                if name not in ("rings", "capability_added")
+            }
+            _atomic_json(self.run_dir / "manifest.json", manifest)
+            self._state("PIPELINE_READY", **config,
+                        readiness=manifest["pipeline_ready"])
             processes = self.backend.start_senders(plan, self.run_dir)
             resources.processes = list(processes)
             self._state("SENDERS_WAITING")
@@ -2720,9 +2894,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pipeline-stage",
-        choices=("unpack", "full"),
+        choices=("receive", "unpack", "full"),
         default="full",
-        help="unpack stops at compute ring; full also runs pipeline_worker",
+        help=(
+            "receive drains the raw ring; unpack stops at the compute ring; "
+            "full also runs pipeline_worker"
+        ),
+    )
+    parser.add_argument(
+        "--worker-cpu-list",
+        help="optional Linux CPU list passed to taskset for vdif_unpack_worker",
     )
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -2747,7 +2928,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=pathlib.Path,
         help=(
             "required with --execute: qths1 directory containing the exact "
-            "rdma2dada and vdif_unpack_worker build under test"
+            "rdma2dada and, when used, vdif_unpack_worker build under test"
         ),
     )
     parser.add_argument(
@@ -2780,6 +2961,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         pipeline_stage=args.pipeline_stage,
         missing_wait_ms=args.missing_wait_ms,
         station_skew_reserve_ms=args.station_skew_reserve_ms,
+        worker_cpu_list=args.worker_cpu_list,
     )
     if args.dry_run:
         request.validate()

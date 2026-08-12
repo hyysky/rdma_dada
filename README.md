@@ -160,5 +160,7 @@ bash scripts/run_demo.sh start
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
   binary decoder、packet-group 状态机、ATFP 聚合、partial/EOD 和缺失补零已通过功能
-  验收；1–40 Gbps payload 目标速率 campaign 正在进行，低错误率测试尚未完成。
+  验收；unpack-only 链已在 10 Gbps payload、30 秒单次测试中精确闭合，15 Gbps
+  仍存在 receiver 接收/发布缺口。10 Gbps 尚未完成 warm-up+3，完整 GPU pipeline
+  速率和低错误率测试也尚未完成。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

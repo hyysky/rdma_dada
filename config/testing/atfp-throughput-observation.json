@@ -21,7 +21,7 @@
   },
   "blocks": {
     "groups_per_block": 6400,
-    "raw_ring_blocks": 8,
+    "raw_ring_blocks": 16,
     "compute_ring_blocks": 8,
     "window_blocks": 4
   },

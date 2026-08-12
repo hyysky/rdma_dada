@@ -17,12 +17,16 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <time.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -47,6 +51,13 @@ bool ParsePositiveUint64(const char* text, std::uint64_t* value) {
         return false;
     *value = static_cast<std::uint64_t>(parsed);
     return true;
+}
+
+std::uint64_t ClockNanoseconds(clockid_t clock_id) {
+    struct timespec value = {};
+    if (clock_gettime(clock_id, &value) != 0) return 0U;
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
+           static_cast<std::uint64_t>(value.tv_nsec);
 }
 
 bool LockHduRead(dada_hdu_t* hdu) {
@@ -127,7 +138,7 @@ struct WorkerRuntime {
     WorkerRuntime()
         : log(NULL), output_hdu(NULL), output_locked(false), failed(false),
           input_block_capacity(0), output_block_capacity(0),
-          raw_block_sequence(0), output_eod_sent(false) {}
+          raw_block_sequence(0), output_eod_sent(false), transfers_started(0) {}
 
     unpack::VdifUnpackConfig config;
     rdma_dada::PipelineConfig pipeline_config;
@@ -146,6 +157,7 @@ struct WorkerRuntime {
     std::uint64_t output_block_capacity;
     std::uint64_t raw_block_sequence;
     bool output_eod_sent;
+    std::uint64_t transfers_started;
 };
 
 void SetFailure(WorkerRuntime* runtime, const std::string& message) {
@@ -184,6 +196,80 @@ bool EmitAtfpBlock(WorkerRuntime* runtime,
     return runtime->writer.Write(view, error);
 }
 
+bool ValidateRingCapacities(WorkerRuntime* runtime, ipcio_t* input_data,
+                            std::string* error) {
+    runtime->input_block_capacity = ipcbuf_get_bufsz(
+        reinterpret_cast<ipcbuf_t*>(input_data));
+    runtime->output_block_capacity = ipcbuf_get_bufsz(
+        reinterpret_cast<ipcbuf_t*>(runtime->output_hdu->data_block));
+    if (runtime->input_block_capacity != runtime->pipeline_layout.raw_block_bytes) {
+        std::ostringstream message;
+        message << "input ring block capacity must be "
+                << runtime->pipeline_layout.raw_block_bytes << " bytes; got "
+                << runtime->input_block_capacity;
+        if (error) *error = message.str();
+        return false;
+    }
+    if (runtime->output_block_capacity !=
+        runtime->unpack_layout.compute_block_bytes) {
+        std::ostringstream message;
+        message << "output ring block capacity must be "
+                << runtime->unpack_layout.compute_block_bytes << " bytes; got "
+                << runtime->output_block_capacity;
+        if (error) *error = message.str();
+        return false;
+    }
+    return true;
+}
+
+bool WriteReadyFile(const std::string& path,
+                    const rdma_dada::ResolvedObservationPlan& plan,
+                    const WorkerRuntime& runtime,
+                    std::uint64_t prepare_duration_ns,
+                    std::string* error) {
+    if (path.empty()) return true;
+    const std::string temporary = path + ".tmp." +
+        std::to_string(static_cast<unsigned long long>(getpid()));
+    std::ofstream output(temporary.c_str(), std::ios::out | std::ios::trunc);
+    if (!output) {
+        if (error) *error = "cannot open worker ready temporary file";
+        return false;
+    }
+    output << "{\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"pid\": " << static_cast<long long>(getpid()) << ",\n"
+           << "  \"config_id\": \"" << plan.config_id << "\",\n"
+           << "  \"geometry_id\": \"" << plan.geometry_id << "\",\n"
+           << "  \"prepared_unix_ns\": "
+           << ClockNanoseconds(CLOCK_REALTIME) << ",\n"
+           << "  \"prepare_duration_ns\": " << prepare_duration_ns << ",\n"
+           << "  \"window_bytes\": "
+           << runtime.engine.prepared_window_bytes() << ",\n"
+           << "  \"window_groups\": "
+           << runtime.unpack_layout.window_capacity_groups << ",\n"
+           << "  \"raw_record_bytes\": "
+           << runtime.unpack_layout.raw_record_bytes << ",\n"
+           << "  \"records_per_raw_block\": "
+           << runtime.unpack_layout.records_per_raw_block << ",\n"
+           << "  \"raw_block_bytes\": "
+           << runtime.pipeline_layout.raw_block_bytes << ",\n"
+           << "  \"compute_block_bytes\": "
+           << runtime.unpack_layout.compute_block_bytes << "\n"
+           << "}\n";
+    output.close();
+    if (!output) {
+        std::remove(temporary.c_str());
+        if (error) *error = "cannot write worker ready temporary file";
+        return false;
+    }
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+        std::remove(temporary.c_str());
+        if (error) *error = "cannot publish worker ready file";
+        return false;
+    }
+    return true;
+}
+
 int OpenTransfer(dada_client_t* client) {
     WorkerRuntime* runtime =
         static_cast<WorkerRuntime*>(client ? client->context : NULL);
@@ -202,26 +288,8 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
-        runtime->input_block_capacity = ipcbuf_get_bufsz(
-            reinterpret_cast<ipcbuf_t*>(client->data_block));
-        runtime->output_block_capacity = ipcbuf_get_bufsz(
-            reinterpret_cast<ipcbuf_t*>(runtime->output_hdu->data_block));
-        if (runtime->input_block_capacity !=
-            runtime->pipeline_layout.raw_block_bytes) {
-            std::ostringstream message;
-            message << "input ring block capacity must be "
-                    << runtime->pipeline_layout.raw_block_bytes
-                    << " bytes; got " << runtime->input_block_capacity;
-            SetFailure(runtime, message.str());
-            return -1;
-        }
-        if (runtime->output_block_capacity !=
-            runtime->unpack_layout.compute_block_bytes) {
-            std::ostringstream message;
-            message << "output ring block capacity must be "
-                    << runtime->unpack_layout.compute_block_bytes
-                    << " bytes; got " << runtime->output_block_capacity;
-            SetFailure(runtime, message.str());
+        if (!ValidateRingCapacities(runtime, client->data_block, &error)) {
+            SetFailure(runtime, error);
             return -1;
         }
 
@@ -261,19 +329,16 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
-        if (!runtime->engine.Configure(
-                runtime->config, runtime->pipeline_config,
-                runtime->unpack_layout, runtime->timeline, &error)) {
-            SetFailure(runtime, "cannot configure VDIF unpack engine: " + error);
+        if (!runtime->engine.BeginTransfer(runtime->timeline, &error)) {
+            SetFailure(runtime, "cannot begin VDIF unpack transfer: " + error);
             return -1;
         }
-        runtime->sink.Configure(runtime->output_hdu->data_block,
-                                runtime->output_block_capacity);
-        if (!runtime->writer.Configure(
+        if (runtime->transfers_started != 0U && !runtime->writer.Configure(
                 runtime->output_block_capacity, &runtime->sink, &error)) {
             SetFailure(runtime, "cannot configure compute block writer: " + error);
             return -1;
         }
+        ++runtime->transfers_started;
 
         if (!LockHduWrite(runtime->output_hdu)) {
             SetFailure(runtime, "cannot lock output DADA ring for writing");
@@ -488,15 +553,38 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
 void PrintUsage(const char* program) {
     std::cerr << "Usage: " << program
               << " --plan resolved_observation.json"
-              << " [--reorder-horizon-groups GROUPS]\n";
+              << " [--reorder-horizon-groups GROUPS]"
+              << " [--ready-file PATH]\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if ((argc != 3 && argc != 5) || std::string(argv[1]) != "--plan" ||
-        (argc == 5 &&
-         std::string(argv[3]) != "--reorder-horizon-groups")) {
+    std::string plan_path;
+    std::string ready_path;
+    std::uint64_t reorder_horizon_groups = 0U;
+    for (int index = 1; index < argc; index += 2) {
+        if (index + 1 >= argc) {
+            PrintUsage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        const std::string option(argv[index]);
+        const std::string value(argv[index + 1]);
+        if (option == "--plan" && plan_path.empty()) {
+            plan_path = value;
+        } else if (option == "--ready-file" && ready_path.empty() &&
+                   !value.empty()) {
+            ready_path = value;
+        } else if (option == "--reorder-horizon-groups" &&
+                   reorder_horizon_groups == 0U &&
+                   ParsePositiveUint64(value.c_str(),
+                                       &reorder_horizon_groups)) {
+        } else {
+            PrintUsage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (plan_path.empty()) {
         PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -505,19 +593,15 @@ int main(int argc, char** argv) {
     rdma_dada::ResolvedObservationPlan resolved_plan;
     std::string error;
     if (!rdma_dada::LoadResolvedObservationPlan(
-            argv[2], &resolved_plan, &error) ||
+            plan_path, &resolved_plan, &error) ||
         !unpack::BuildVdifUnpackRuntimeFromResolvedPlan(
             resolved_plan, &runtime.config, &runtime.pipeline_config,
             &runtime.pipeline_layout, &runtime.unpack_layout, &error)) {
         std::cerr << "vdif_unpack_worker: " << error << '\n';
         return EXIT_FAILURE;
     }
-    if (argc == 5 && !ParsePositiveUint64(
-            argv[4], &runtime.config.reorder_horizon_groups)) {
-        std::cerr << "vdif_unpack_worker: reorder horizon must be a positive "
-                     "integer group count\n";
-        return EXIT_FAILURE;
-    }
+    if (reorder_horizon_groups != 0U)
+        runtime.config.reorder_horizon_groups = reorder_horizon_groups;
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
@@ -553,11 +637,32 @@ int main(int argc, char** argv) {
         } else if (!runtime.failed) {
             output_connected = true;
         }
-        if (!runtime.failed && !LockHduRead(input_hdu)) {
-            SetFailure(&runtime, "cannot lock input DADA ring for reading");
-        } else if (!runtime.failed) {
-            input_locked = true;
+        if (!runtime.failed && !ValidateRingCapacities(
+                &runtime, input_hdu->data_block, &error))
+            SetFailure(&runtime, error);
+        const std::uint64_t prepare_start = ClockNanoseconds(CLOCK_MONOTONIC_RAW);
+        if (!runtime.failed && !runtime.engine.Prepare(
+                runtime.config, runtime.pipeline_config,
+                runtime.unpack_layout, &error))
+            SetFailure(&runtime, "cannot prepare VDIF unpack engine: " + error);
+        if (!runtime.failed) {
+            runtime.sink.Configure(runtime.output_hdu->data_block,
+                                   runtime.output_block_capacity);
+            if (!runtime.writer.Configure(runtime.output_block_capacity,
+                                          &runtime.sink, &error))
+                SetFailure(&runtime,
+                           "cannot configure compute block writer: " + error);
         }
+        const std::uint64_t prepare_end = ClockNanoseconds(CLOCK_MONOTONIC_RAW);
+        const std::uint64_t prepare_duration =
+            prepare_end >= prepare_start ? prepare_end - prepare_start : 0U;
+        if (!runtime.failed && !WriteReadyFile(
+                ready_path, resolved_plan, runtime, prepare_duration, &error))
+            SetFailure(&runtime, error);
+        if (!runtime.failed && !LockHduRead(input_hdu))
+            SetFailure(&runtime, "cannot lock input DADA ring for reading");
+        else if (!runtime.failed)
+            input_locked = true;
     }
 
     if (!runtime.failed) {

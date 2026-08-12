@@ -1,6 +1,6 @@
 # 项目模块状态
 
-更新日期：2026-08-10
+更新日期：2026-08-12
 当前已验收基线：`872e734`（Observation/Resolved Plan、ATFP 转换和统一 GPU worker）
 
 本文是项目当前实现状态的汇总入口。详细数据契约仍以 `doc/`、`config/` 和各模块
@@ -54,8 +54,8 @@ README 为准；历史设计和执行记录保存在 `docs/superpowers/`，不�
 | 应用 | 当前状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `fpga_sender_sim` | 已验收 | 多服务器分别模拟 Station；Project VDIF；source port；`sendmmsg`；定速发送和错误注入基础能力 | 配合 ATFP 整链完成目标 payload 速率阶梯和低错误率测试 |
-| `rdma2dada` | 已验收，整链性能待确认 | 只匹配接收端 MAC/IP/port；CQ 校验/repost；partial raw block；accepted=published/EOD；Resolved Plan 入口 | 在新版 ATFP 整链中重新测量 sustained receive、ring occupancy 和 headroom |
-| `vdif_unpack_worker` | 性能验收中 | 独立 raw→compute 进程；Station→A；时间对齐；缺失补零；payload-only block-scoped ATFP；partial/EOD；严格 plan/header/capacity 门禁 | 完成当前 1–40 Gbps 阶梯，定位首个饱和阶段；随后决定进一步优化 |
+| `rdma2dada` | 已验收，整链性能待确认 | 只匹配接收端 MAC/IP/port；CQ 校验/repost；partial raw block；accepted=published/EOD；Resolved Plan 入口；在 unpack-only 链中已单次精确闭合 10 Gbps | 单独测定 receiver 的最高稳定速率；补充发布等待和 CQ 服务率，定位 15 Gbps deficit |
+| `vdif_unpack_worker` | 性能验收中 | 独立 raw→compute 进程；Station→A；时间对齐；缺失补零；payload-only block-scoped ATFP；partial/EOD；严格 plan/header/capacity 门禁；单次 10 Gbps/30 s 精确闭合 | 对 10 Gbps 执行 warm-up+3 正式重复验收；继续区分 15 Gbps receiver deficit 与 unpack 间接背压 |
 | `pipeline_worker` | 已验收，整链性能待确认 | 单 compute ring→单 output ring；Resolved Plan；H2D→转换→Beamform→Power/Stokes→积分→D2H；header/EOD/capacity 门禁 | 完成与 ingest/unpack 同时运行的吞吐、占用和跨 block overlap 评估 |
 | `dada2rdma` | 待开发 | 已有目录和职责说明 | 定义 processed data packetization、header 更新、UDP/RDMA 输出和验收方式 |
 | `pipelinectl` | 待开发 | 已有职责边界：不包含算法 | 实现配置编译、拓扑/reader count 校验、ring 创建、进程启动顺序、健康监控、停止和定向清理 |
@@ -90,19 +90,24 @@ ATFP campaign 外，尚未为每个模块给出整链目标速率下的独立 se
 | Resolved Plan + PSRDADA + CUDA worker integration | 已通过 | 三次 clean repetition；动态 ring key；header/geometry/EOD/cleanup 门禁 |
 | ATFP unpack 功能与 ring integration | 已通过 | full/partial/双 transfer、零填充、ATFP 字节、header/EOD |
 | 旧 TFPA unpack 速率路径 | 不满足需求，已停止 | Release 版本 1 Gbps 通过、2 Gbps 首点失败；该结论促成 ATFP 重设计 |
-| 新 ATFP 完整 pipeline 速率阶梯 | 进行中 | “unpack优化”任务执行 1–40 Gbps payload 目标速率 campaign；完成前不声明实时能力 |
+| 新 ATFP unpack-only 速率测试 | 性能验收中 | 10 Gbps/30 s 单次精确闭合：sender、receiver、unpack 计数一致且错误为 0；不含 GPU worker，且尚未完成 warm-up+3 |
+| 新 ATFP 15 Gbps 诊断 | 未通过 | sender 完整发送，receiver/published 少 254,672 包（约 1.87%）；unpack 完整处理 receiver 交付的全部包，无 window pressure；当前不能归因 unpack 算力 |
+| 新 ATFP 完整 GPU pipeline 速率阶梯 | 待执行 | 需覆盖 output ring、H2D、GPU 算法和 D2H；完成前不声明整条 pipeline 的实时能力 |
 | 低错误率测试 | 待执行 | 目标错误率 0.001%–0.1%，在极限稳定速率附近验证统计与连续运行行为 |
 | 长时间连续观测 | 待执行 | 验证多 transfer、Station 参与、EOD/重启策略、ring 稳态和无资源泄漏 |
 
 ## 后续开发顺序
 
-1. 完成新 ATFP 整链速率 campaign，确定最高稳定 payload 速率、首个饱和阶段和安全余量。
-2. 若性能门禁通过，提交并推送当前 unpack/controller 改动；若未通过，先针对证据中的
+1. 对 10 Gbps unpack-only 点执行 warm-up+3 重复验收，并用 receiver/CQ/worker
+   service-time 证据定位 15 Gbps 的首个饱和阶段。
+2. 将速率测试扩展到包含 output ring 和 GPU worker 的完整 pipeline，确定最高稳定
+   payload 速率和安全余量。
+3. 若性能门禁通过，提交并推送当前 unpack/controller 改动；若未通过，先针对证据中的
    饱和阶段优化并重复验收。
-3. 开发通用 module registry，使算法组合从固定分支迁移为受契约约束的配置组合。
-4. 开发 `pipelinectl`，统一管理 artifact、ring、进程、监控、失败中止和清理。
-5. 运行完整持续观测数据流验收，包括正确包、低错误率、Station 启动失败和长时间运行。
-6. 开发 `dada2rdma` 及后续输出链路。
+4. 开发通用 module registry，使算法组合从固定分支迁移为受契约约束的配置组合。
+5. 开发 `pipelinectl`，统一管理 artifact、ring、进程、监控、失败中止和清理。
+6. 运行完整持续观测数据流验收，包括正确包、低错误率、Station 启动失败和长时间运行。
+7. 开发 `dada2rdma` 及后续输出链路。
 
 ## 当前明确限制
 

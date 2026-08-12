@@ -436,6 +436,20 @@ void TestExplicitMissingWaitLeavesStationSkewReserve() {
            "explicit missing wait emits while skew reserve remains occupied");
 }
 
+void TestStaticPrepareThenBeginTransfer() {
+    unpack::VdifAtfpUnpackEngine engine;
+    unpack::VdifUnpackConfig config = MakeConfig();
+    unpack::VdifUnpackLayout layout = MakeLayout();
+    std::string error;
+    Expect(engine.Prepare(config, MakePipeline(), layout, &error),
+           "ATFP static resources prepare before timeline: " + error);
+    Expect(engine.prepared(), "ATFP engine reports prepared state");
+    Expect(engine.prepared_window_bytes() == layout.window_bytes,
+           "prepared window byte count is exposed for readiness");
+    Expect(engine.BeginTransfer(MakeTimeline(8), &error),
+           "ATFP timeline begins without reallocating static resources: " + error);
+}
+
 void TestStationSkewAndRawBlockCompositionStatistics() {
     unpack::VdifAtfpUnpackEngine engine;
     std::string error;
@@ -566,6 +580,7 @@ int main() {
     TestStationSkewAndRawBlockCompositionStatistics();
     TestOneLeadingStationCannotEvictLaggingStations();
     TestExplicitMissingWaitLeavesStationSkewReserve();
+    TestStaticPrepareThenBeginTransfer();
     TestPacketClassificationAndPartialEod();
     TestMalformedRawBlockDoesNotPublish();
     TestExpectedTransferOverflowIsRejected();
