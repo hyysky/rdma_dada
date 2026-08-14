@@ -128,6 +128,8 @@ void print_helper() {
     printf("Options:\n");
     printf("    --plan, compiler-generated resolved_observation.json (required)\n");
     printf("    --send_n, batch size (default: 64)\n");
+    printf("    --recv-wr-num, receive WR depth (default: send_n * 4)\n");
+    printf("    --poll-batch, maximum CQ completions per poll (default: 8)\n");
     printf("    --nsge, scatter/gather entries per work request (default: 4)\n");
     printf("    --cpu, CPU ID for thread affinity (default: -1)\n");
     printf("    --debug, enable debug mode with verbose logging\n");
@@ -142,6 +144,8 @@ static int parse_args(RoCEv2Dada::RdmaParam &param,
     int c;
     struct option long_options[] = {
         {"send_n", required_argument, NULL, 265},
+        {"recv-wr-num", required_argument, NULL, 275},
+        {"poll-batch", required_argument, NULL, 276},
         {"debug", no_argument, NULL, 271},
         {"nsge", required_argument, NULL, 272},
         {"plan", required_argument, NULL, 273},
@@ -157,11 +161,15 @@ static int parse_args(RoCEv2Dada::RdmaParam &param,
     param.pkt_size = 0;  // Loaded from the validated pipeline config.
     param.RdmaDirectGpu = 0;
     param.send_n = 64;
+    param.recv_wr_num = 0;
+    param.poll_batch = 8;
     param.nsge = 4;
     while (1) {
         c = getopt_long(argc, argv, "c:h", long_options, NULL);
         switch (c) {
             case 265: param.send_n = atoi(optarg); break;
+            case 275: param.recv_wr_num = (unsigned int)strtoul(optarg, NULL, 10); break;
+            case 276: param.poll_batch = (unsigned int)strtoul(optarg, NULL, 10); break;
             case 271: g_debug_mode = true; break;
             case 272: param.nsge = (unsigned int)strtoul(optarg, NULL, 10); break;
             case 273: strncpy(plan_path, optarg, plan_path_len - 1); plan_path[plan_path_len - 1] = '\0'; break;
@@ -253,7 +261,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Raw record size exceeds RDMA uint32 limit\n");
         return -1;
     }
-    if (param.send_n == 0 || pipeline_config.records_per_block % param.send_n != 0) {
+    if (param.send_n == 0 || param.poll_batch == 0 ||
+        pipeline_config.records_per_block % param.send_n != 0) {
         fprintf(stderr,
                 "Error: RECORDS_PER_BLOCK (%lu) must be an exact multiple of "
                 "--send_n (%u)\n",
@@ -324,6 +333,8 @@ int main(int argc, char *argv[]) {
     printf("  GPU: %d\n", param.gpu_id);
     printf("  Packet Size: %d\n", param.pkt_size);
     printf("  Batch Size: %d\n", param.send_n);
+    printf("  Receive WR Depth: %u\n", param.recv_wr_num);
+    printf("  CQ Poll Batch: %u\n", param.poll_batch);
     printf("  NSGE: %u\n", param.nsge);
     printf("  Source filter: ANY MAC/IP/UDP port\n");
     printf("  Destination: %s:%s (%s)\n", param.DAddr, param.dst_port, param.DMacAddr);

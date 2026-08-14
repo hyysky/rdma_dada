@@ -60,6 +60,10 @@ class RateRequest:
     missing_wait_ms: float = 200.0
     station_skew_reserve_ms: float = 200.0
     worker_cpu_list: str | None = None
+    receiver_send_n: int = 64
+    receiver_nsge: int = 4
+    receiver_poll_batch: int = 8
+    receiver_wr_num: int = 0
 
     def validate(self) -> None:
         if (
@@ -78,6 +82,13 @@ class RateRequest:
             )
         if self.batch_packets <= 0:
             raise ValueError("batch_packets must be positive")
+        if (
+            self.receiver_send_n <= 0
+            or self.receiver_nsge <= 0
+            or self.receiver_poll_batch <= 0
+            or self.receiver_wr_num < 0
+        ):
+            raise ValueError("receiver queue parameters are invalid")
         if self.compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
         if self.pipeline_stage not in ("receive", "unpack", "full"):
@@ -150,6 +161,10 @@ class RatePlan:
     pipeline_stage: str = "full"
     reorder_horizon_groups: int = 0
     worker_cpu_list: str | None = None
+    receiver_send_n: int = 64
+    receiver_nsge: int = 4
+    receiver_poll_batch: int = 8
+    receiver_wr_num: int = 0
 
     @property
     def uses_pipeline_worker(self) -> bool:
@@ -584,6 +599,10 @@ def compile_rate_plan(
     return dataclasses.replace(
         plan, reorder_horizon_groups=reorder_horizon_groups,
         worker_cpu_list=request.worker_cpu_list,
+        receiver_send_n=request.receiver_send_n,
+        receiver_nsge=request.receiver_nsge,
+        receiver_poll_batch=request.receiver_poll_batch,
+        receiver_wr_num=request.receiver_wr_num,
     )
 
 
@@ -907,7 +926,7 @@ project={qths_binary_dir}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n 64 --nsge 4 >"$run_dir/receiver.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
@@ -2905,6 +2924,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--worker-cpu-list",
         help="optional Linux CPU list passed to taskset for vdif_unpack_worker",
     )
+    parser.add_argument("--receiver-send-n", type=int, default=64)
+    parser.add_argument("--receiver-nsge", type=int, default=4)
+    parser.add_argument("--receiver-poll-batch", type=int, default=8)
+    parser.add_argument("--receiver-wr-num", type=int, default=0)
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
@@ -2962,6 +2985,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         missing_wait_ms=args.missing_wait_ms,
         station_skew_reserve_ms=args.station_skew_reserve_ms,
         worker_cpu_list=args.worker_cpu_list,
+        receiver_send_n=args.receiver_send_n,
+        receiver_nsge=args.receiver_nsge,
+        receiver_poll_batch=args.receiver_poll_batch,
+        receiver_wr_num=args.receiver_wr_num,
     )
     if args.dry_run:
         request.validate()

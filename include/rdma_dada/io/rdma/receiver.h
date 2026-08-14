@@ -36,6 +36,8 @@ class RoCEv2Dada
             unsigned char device_id;
             unsigned int pkt_size;
             unsigned int send_n;
+            unsigned int recv_wr_num;
+            unsigned int poll_batch;
             int bind_cpu_id;
             int RdmaDirectGpu;
             bool SendOrRecv;

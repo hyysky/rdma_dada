@@ -916,6 +916,52 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertNotIn("compute_key", plan.as_dict())
         self.assertNotIn("compute_block_bytes", plan.as_dict())
 
+    def test_receive_stage_passes_explicit_rdma_queue_parameters(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="receive",
+            ),
+            receiver_send_n=64,
+            receiver_nsge=1,
+            receiver_poll_batch=32,
+            receiver_wr_num=1024,
+        )
+
+        bundle = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-rdma-queue-parameters"
+        )
+
+        self.assertIn(
+            '--send_n 64 --nsge 1 --poll-batch 32 --recv-wr-num 1024',
+            bundle["start.sh"],
+        )
+        self.assertEqual(plan.as_dict()["receiver_nsge"], 1)
+        self.assertEqual(plan.as_dict()["receiver_poll_batch"], 32)
+        self.assertEqual(plan.as_dict()["receiver_wr_num"], 1024)
+
+    def test_receive_queue_cli_parameters_are_recorded_in_dry_run(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            return_code = MODULE.main([
+                "--aggregate-gbps", "15",
+                "--duration-seconds", "30",
+                "--compute-consumer", "dbnull",
+                "--pipeline-stage", "receive",
+                "--receiver-send-n", "64",
+                "--receiver-nsge", "1",
+                "--receiver-poll-batch", "32",
+                "--receiver-wr-num", "1024",
+                "--dry-run",
+            ])
+        self.assertEqual(return_code, 0)
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["receiver_send_n"], 64)
+        self.assertEqual(rendered["receiver_nsge"], 1)
+        self.assertEqual(rendered["receiver_poll_batch"], 32)
+        self.assertEqual(rendered["receiver_wr_num"], 1024)
+
     def test_receive_stage_requires_dbnull(self):
         MODULE.RateRequest(
             15.0,

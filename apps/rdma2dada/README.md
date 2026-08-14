@@ -11,8 +11,11 @@ rdma2dada --plan artifacts/resolved_observation.json
 ```
 
 Receiver device, destination MAC/IP/port, raw ring key, record size and block
-geometry come only from the resolved plan. `--send_n`, `--nsge`, `--cpu` and
-`--debug` remain runtime tuning options; no geometry-changing override exists.
+geometry come only from the resolved plan. `--send_n`, `--recv-wr-num`,
+`--poll-batch`, `--nsge`, `--cpu` and `--debug` remain runtime tuning options;
+no geometry-changing override exists. A zero `--recv-wr-num` keeps the legacy
+`send_n * 4` receive depth; positive values decouple queue depth from copy
+batching.
 `--preflight-only` validates the plan and receiver device without accessing the
 ring.
 

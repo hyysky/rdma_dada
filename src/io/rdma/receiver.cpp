@@ -252,7 +252,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
         fprintf(stderr, "[ERROR] pkt_size (%u) must exceed PKT_HEAD_LEN (%u).\n", ibv_res_ptr->pkt_size, PKT_HEAD_LEN);
         return;
     }
-    ibv_res_ptr->poll_n = 8;
+    ibv_res_ptr->poll_n = this->param.poll_batch;
     ibv_res_ptr->recv_completed = 0;
     ibv_res_ptr->recv_sum_completed = 0;
     ibv_res_ptr->recv_sum = 0;
@@ -261,12 +261,14 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     // NIC queue limits. Data is copied from these buffers into the PSRDADA ring.
     int work_num;
     if (!this->param.SendOrRecv) {
-        work_num = (this->param.send_n < 2048) ? (this->param.send_n * 4) : 8192;
+        work_num = this->param.recv_wr_num != 0U
+            ? static_cast<int>(this->param.recv_wr_num)
+            : ((this->param.send_n < 2048) ? (this->param.send_n * 4) : 8192);
     } else {
         work_num = this->param.send_n * 4;
     }
-    printf("[RoCEv2Dada] Configured work_num=%d (send_n=%d)\n",
-           work_num, this->param.send_n);
+    printf("[RoCEv2Dada] Configured work_num=%d (send_n=%d, poll_batch=%u)\n",
+           work_num, this->param.send_n, this->param.poll_batch);
     fflush(stdout);
     
 #ifndef NO_CUDA
