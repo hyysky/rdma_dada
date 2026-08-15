@@ -147,13 +147,33 @@ struct VdifAtfpUnpackEngine::Impl {
         }
     }
 
-    void CountPublishedGroups(std::uint64_t first, std::uint64_t count) {
+    bool CountPublishedGroups(std::uint64_t first, std::uint64_t count,
+                              std::string* error) {
         for (std::uint64_t offset = 0; offset < count; ++offset) {
             const std::uint64_t ordinal = first + offset;
             const GroupSlot* active = ActiveSlot(ordinal);
             const std::uint64_t seen_count = active ? active->seen_count : 0U;
+            const std::uint64_t missing = pipeline.nant - seen_count;
             statistics.expected_station_packets += pipeline.nant;
-            statistics.missing_station_packets += pipeline.nant - seen_count;
+            statistics.missing_station_packets += missing;
+            if (missing != 0U &&
+                !statistics.missing_station_packets_per_second.empty()) {
+                std::uint32_t seconds = 0;
+                std::uint32_t frame = 0;
+                if (!VdifOrdinalToTime(timeline, ordinal, &seconds, &frame,
+                                       error)) {
+                    return false;
+                }
+                const std::uint64_t second_index =
+                    static_cast<std::uint64_t>(seconds - timeline.start_seconds);
+                if (second_index >=
+                    statistics.missing_station_packets_per_second.size()) {
+                    return Fail("missing-packet second exceeds diagnostic range",
+                                error);
+                }
+                statistics.missing_station_packets_per_second[
+                    static_cast<std::size_t>(second_index)] += missing;
+            }
             if (seen_count == pipeline.nant) {
                 ++statistics.completed_groups;
             } else {
@@ -161,6 +181,7 @@ struct VdifAtfpUnpackEngine::Impl {
                 if (seen_count == 0U) ++statistics.fully_missing_groups;
             }
         }
+        return true;
     }
 
     bool Publish(std::uint64_t count, const VdifAtfpBlockEmitter& emit,
@@ -180,7 +201,7 @@ struct VdifAtfpUnpackEngine::Impl {
         view.packet_payload_bytes = pipeline.packet_payload_bytes;
         if (!emit(view, error)) return false;
 
-        CountPublishedGroups(next_emit_ordinal, count);
+        if (!CountPublishedGroups(next_emit_ordinal, count, error)) return false;
         std::uint64_t emitted_bytes = 0;
         if (!CheckedMultiply(count, layout.group_bytes, &emitted_bytes))
             return Fail("emitted ATFP byte count overflows", error);
@@ -339,6 +360,12 @@ bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
 
 bool VdifAtfpUnpackEngine::BeginTransfer(const VdifTimeline& timeline,
                                          std::string* error) {
+    return BeginTransfer(timeline, false, error);
+}
+
+bool VdifAtfpUnpackEngine::BeginTransfer(
+    const VdifTimeline& timeline, bool collect_missing_per_second,
+    std::string* error) {
     if (!impl_->prepared)
         return Fail("ATFP engine static resources are not prepared", error);
     if (impl_->configured && !impl_->finished)
@@ -360,6 +387,23 @@ bool VdifAtfpUnpackEngine::BeginTransfer(const VdifTimeline& timeline,
     impl_->statistics.station_accepted_packets.assign(impl_->pipeline.nant, 0U);
     impl_->statistics.station_late_packets.assign(impl_->pipeline.nant, 0U);
     impl_->statistics.station_highest_ordinals.assign(impl_->pipeline.nant, 0U);
+    if (collect_missing_per_second) {
+        std::uint32_t last_seconds = 0;
+        std::uint32_t last_frame = 0;
+        if (!VdifOrdinalToTime(timeline, timeline.expected_groups - 1U,
+                               &last_seconds, &last_frame, error)) {
+            return false;
+        }
+        const std::uint64_t second_count =
+            static_cast<std::uint64_t>(last_seconds - timeline.start_seconds) +
+            1U;
+        if (second_count > std::numeric_limits<std::size_t>::max()) {
+            return Fail("missing-packet diagnostic range exceeds size_t",
+                        error);
+        }
+        impl_->statistics.missing_station_packets_per_second.assign(
+            static_cast<std::size_t>(second_count), 0U);
+    }
     std::fill(impl_->station_seen.begin(), impl_->station_seen.end(), 0U);
     std::fill(impl_->slots.begin(), impl_->slots.end(), Impl::GroupSlot());
     std::fill(impl_->station_has_ordinal.begin(),

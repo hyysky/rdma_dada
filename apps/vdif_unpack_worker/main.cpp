@@ -138,7 +138,8 @@ struct WorkerRuntime {
     WorkerRuntime()
         : log(NULL), output_hdu(NULL), output_locked(false), failed(false),
           input_block_capacity(0), output_block_capacity(0),
-          raw_block_sequence(0), output_eod_sent(false), transfers_started(0) {}
+          raw_block_sequence(0), output_eod_sent(false), transfers_started(0),
+          collect_missing_per_second(false) {}
 
     unpack::VdifUnpackConfig config;
     rdma_dada::PipelineConfig pipeline_config;
@@ -158,6 +159,7 @@ struct WorkerRuntime {
     std::uint64_t raw_block_sequence;
     bool output_eod_sent;
     std::uint64_t transfers_started;
+    bool collect_missing_per_second;
 };
 
 void SetFailure(WorkerRuntime* runtime, const std::string& message) {
@@ -329,7 +331,9 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
-        if (!runtime->engine.BeginTransfer(runtime->timeline, &error)) {
+        if (!runtime->engine.BeginTransfer(
+                runtime->timeline, runtime->collect_missing_per_second,
+                &error)) {
             SetFailure(runtime, "cannot begin VDIF unpack transfer: " + error);
             return -1;
         }
@@ -526,6 +530,23 @@ int CloseTransferBody(dada_client_t* client) {
                      statistics.station_highest_ordinals[antenna]));
     }
 
+    if (runtime->collect_missing_per_second) {
+        for (std::size_t second_index = 0;
+             second_index <
+                 statistics.missing_station_packets_per_second.size();
+             ++second_index) {
+            multilog(runtime->log, LOG_INFO,
+                     "VDIF missing per second: second_index=%llu "
+                     "vdif_seconds=%llu missing=%llu\n",
+                     static_cast<unsigned long long>(second_index),
+                     static_cast<unsigned long long>(
+                         runtime->timeline.start_seconds + second_index),
+                     static_cast<unsigned long long>(
+                         statistics.missing_station_packets_per_second[
+                             second_index]));
+        }
+    }
+
     if (!EndOutputTransfer(runtime)) return -1;
     if (!runtime->failed) {
         multilog(runtime->log, LOG_INFO, "VDIF unpack transfer completed\n");
@@ -554,7 +575,8 @@ void PrintUsage(const char* program) {
     std::cerr << "Usage: " << program
               << " --plan resolved_observation.json"
               << " [--reorder-horizon-groups GROUPS]"
-              << " [--ready-file PATH]\n";
+              << " [--ready-file PATH]"
+              << " [--diagnostics missing-per-second]\n";
 }
 
 }  // namespace
@@ -563,6 +585,7 @@ int main(int argc, char** argv) {
     std::string plan_path;
     std::string ready_path;
     std::uint64_t reorder_horizon_groups = 0U;
+    bool collect_missing_per_second = false;
     for (int index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) {
             PrintUsage(argv[0]);
@@ -579,6 +602,10 @@ int main(int argc, char** argv) {
                    reorder_horizon_groups == 0U &&
                    ParsePositiveUint64(value.c_str(),
                                        &reorder_horizon_groups)) {
+        } else if (option == "--diagnostics" &&
+                   value == "missing-per-second" &&
+                   !collect_missing_per_second) {
+            collect_missing_per_second = true;
         } else {
             PrintUsage(argv[0]);
             return EXIT_FAILURE;
@@ -602,6 +629,7 @@ int main(int argc, char** argv) {
     }
     if (reorder_horizon_groups != 0U)
         runtime.config.reorder_horizon_groups = reorder_horizon_groups;
+    runtime.collect_missing_per_second = collect_missing_per_second;
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);

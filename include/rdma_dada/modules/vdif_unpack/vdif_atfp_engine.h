@@ -44,6 +44,7 @@ struct VdifAtfpStatistics {
     std::vector<std::uint64_t> station_accepted_packets;
     std::vector<std::uint64_t> station_late_packets;
     std::vector<std::uint64_t> station_highest_ordinals;
+    std::vector<std::uint64_t> missing_station_packets_per_second;
 };
 
 typedef std::function<bool(const AtfpBlockView&, std::string*)>
@@ -59,6 +60,9 @@ public:
                  const VdifUnpackLayout& layout,
                  std::string* error);
     bool BeginTransfer(const VdifTimeline& timeline, std::string* error);
+    bool BeginTransfer(const VdifTimeline& timeline,
+                       bool collect_missing_per_second,
+                       std::string* error);
     bool Configure(const VdifUnpackConfig& config,
                    const PipelineConfig& pipeline,
                    const VdifUnpackLayout& layout,

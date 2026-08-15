@@ -15,6 +15,9 @@ struct VdifSenderStats {
     std::uint64_t failed_packets;
     std::uint64_t payload_bytes;
     std::uint64_t elapsed_ns;
+    std::uint64_t pacing_start_monotonic_ns;
+    std::uint64_t first_send_monotonic_ns;
+    std::uint64_t last_send_monotonic_ns;
     std::uint64_t batches;
     std::uint64_t short_batches;
     std::uint64_t overrun_batches;

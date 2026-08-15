@@ -942,6 +942,127 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(plan.as_dict()["receiver_poll_batch"], 32)
         self.assertEqual(plan.as_dict()["receiver_wr_num"], 1024)
 
+    def test_receiver_cumulative_diagnostics_are_opt_in(self):
+        default_plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        default_bundle = MODULE.build_qths_bundle(
+            default_plan, "/tmp/task8c-receiver-default-diagnostics"
+        )
+        self.assertNotIn(" --debug", default_bundle["start.sh"])
+
+        diagnostic_plan = dataclasses.replace(
+            default_plan, receiver_diagnostics=True
+        )
+        diagnostic_bundle = MODULE.build_qths_bundle(
+            diagnostic_plan, "/tmp/task8c-receiver-cumulative-diagnostics"
+        )
+        self.assertIn(" --debug", diagnostic_bundle["start.sh"])
+        self.assertTrue(diagnostic_plan.as_dict()["receiver_diagnostics"])
+
+    def test_receiver_cumulative_diagnostics_are_parsed(self):
+        receiver = (
+            "[RDMA_DIAG] sample=0 elapsed_ns=100000000 "
+            "poll_calls=100 empty_polls=20 completions=80 full_polls=2 "
+            "accepted=80 reposted=64 repost_failures=0 posted_wr=240 "
+            "min_posted_wr=192 copy_batches=1\n"
+            "[RDMA_DIAG] sample=1 elapsed_ns=200000000 "
+            "poll_calls=220 empty_polls=40 completions=180 full_polls=5 "
+            "accepted=180 reposted=128 repost_failures=0 posted_wr=204 "
+            "min_posted_wr=188 copy_batches=2\n"
+            "Receive summary: accepted=180, wrong_length=0, "
+            "published=180, blocks=1, partial_blocks=1, "
+            "cq_tail_records=52\n"
+        )
+        statistics = MODULE.parse_receive_statistics(
+            receiver,
+            {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+            expect_receiver_diagnostics=True,
+        )
+        self.assertEqual(
+            statistics["receiver"]["diagnostics"],
+            [
+                {
+                    "sample": 0,
+                    "elapsed_ns": 100000000,
+                    "poll_calls": 100,
+                    "empty_polls": 20,
+                    "completions": 80,
+                    "full_polls": 2,
+                    "accepted": 80,
+                    "reposted": 64,
+                    "repost_failures": 0,
+                    "posted_wr": 240,
+                    "min_posted_wr": 192,
+                    "copy_batches": 1,
+                },
+                {
+                    "sample": 1,
+                    "elapsed_ns": 200000000,
+                    "poll_calls": 220,
+                    "empty_polls": 40,
+                    "completions": 180,
+                    "full_polls": 5,
+                    "accepted": 180,
+                    "reposted": 128,
+                    "repost_failures": 0,
+                    "posted_wr": 204,
+                    "min_posted_wr": 188,
+                    "copy_batches": 2,
+                },
+            ],
+        )
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE.parse_receive_statistics(
+                receiver.split("Receive summary:", 1)[1].join(
+                    ("Receive summary:", "")
+                ),
+                {
+                    "consumer": "dada_dbnull",
+                    "exit_code": 0,
+                    "zero_copy": True,
+                    "single_transfer": True,
+                },
+                expect_receiver_diagnostics=True,
+            )
+        self.assertEqual(
+            raised.exception.stderr,
+            "missing cumulative receiver diagnostics",
+        )
+
+    def test_unpack_missing_per_second_diagnostics_are_opt_in(self):
+        default_plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        default_bundle = MODULE.build_qths_bundle(
+            default_plan, "/tmp/task8c-unpack-default-diagnostics"
+        )
+        self.assertNotIn("--diagnostics missing-per-second",
+                         default_bundle["start.sh"])
+
+        diagnostic_plan = dataclasses.replace(
+            default_plan, unpack_missing_per_second=True
+        )
+        diagnostic_bundle = MODULE.build_qths_bundle(
+            diagnostic_plan, "/tmp/task8c-unpack-second-diagnostics"
+        )
+        self.assertIn("--diagnostics missing-per-second",
+                      diagnostic_bundle["start.sh"])
+        self.assertTrue(
+            diagnostic_plan.as_dict()["unpack_missing_per_second"]
+        )
+
     def test_receive_queue_cli_parameters_are_recorded_in_dry_run(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             return_code = MODULE.main([
@@ -1052,6 +1173,77 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertNotIn("gpu", statistics)
         MODULE._validate_statistics(statistics, plan, "")
+
+    def test_unpack_missing_per_second_statistics_are_parsed_and_reconciled(self):
+        plan = make_plan(
+            0.1,
+            2.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        records = plan.group_count * plan.nant
+        receiver = (
+            f"Receive summary: accepted={records - 3}, wrong_length=0, "
+            f"published={records - 3}, blocks=1, partial_blocks=1, "
+            "cq_tail_records=0\n"
+        )
+        worker = (
+            "VDIF unpack statistics: "
+            f"records={records - 3} accepted={records - 3} "
+            "bad_header=0 invalid_data=0 unknown_station=0 duplicate=0 "
+            "late=0 out_of_range=0 "
+            f"complete_groups={plan.group_count - 2} incomplete_groups=2 "
+            f"fully_missing_groups=1 missing_station=3/{records} "
+            "large_gap_advances=0/0 max_station_ordinal_skew=0 "
+            "raw_blocks_single=0 raw_blocks_mixed=1 "
+            "max_station_records_per_raw_block=1 "
+            "max_consecutive_station_records=1\n"
+            f"VDIF unpack station statistics: antenna=0 station=101 "
+            f"observed={plan.group_count - 1} accepted={plan.group_count - 1} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
+            f"VDIF unpack station statistics: antenna=1 station=102 "
+            f"observed={plan.group_count - 2} accepted={plan.group_count - 2} "
+            f"late=0 highest_ordinal={plan.group_count - 1}\n"
+            "VDIF missing per second: second_index=0 "
+            "vdif_seconds=3283200 missing=1\n"
+            "VDIF missing per second: second_index=1 "
+            "vdif_seconds=3283201 missing=2\n"
+            "VDIF unpack transfer completed\n"
+        )
+        statistics = MODULE.parse_qths_statistics(
+            receiver,
+            worker,
+            {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+            expect_pipeline_worker=False,
+            expect_missing_per_second=True,
+        )
+        self.assertEqual(
+            statistics["unpack"]["missing_packets_per_second"],
+            [
+                {"second_index": 0, "vdif_seconds": 3283200, "missing": 1},
+                {"second_index": 1, "vdif_seconds": 3283201, "missing": 2},
+            ],
+        )
+
+        inconsistent = worker.replace("missing=2", "missing=1")
+        with self.assertRaises(MODULE.StageError):
+            MODULE.parse_qths_statistics(
+                receiver,
+                inconsistent,
+                {
+                    "consumer": "dada_dbnull",
+                    "exit_code": 0,
+                    "zero_copy": True,
+                    "single_transfer": True,
+                },
+                expect_pipeline_worker=False,
+                expect_missing_per_second=True,
+            )
 
     def test_hf_controller_does_not_ssh_back_through_hf(self):
         argv = MODULE.build_ssh_argv(

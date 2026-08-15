@@ -260,6 +260,7 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
     const SenderRatePlan rate_plan = {
         config.target_payload_bits_per_second, start_ns
     };
+    stats->pacing_start_monotonic_ns = start_ns;
     stats->scheduled_packets = config.group_count;
 #if defined(__linux__)
     stats->backend = "SENDMMSG";
@@ -282,6 +283,9 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
         if (!WaitUntilMonotonic(deadline, &overrun, error)) return false;
         if (overrun && first_group != 0) ++stats->overrun_batches;
         if (!batch.Prepare(first_group, count, error)) return false;
+        if (first_group == 0 &&
+            !MonotonicNowNs(&stats->first_send_monotonic_ns, error))
+            return false;
 #if defined(__linux__)
         if (!SendBatch(socket_fd.get(), batch, &vectors, &messages,
                        stats, error)) {
@@ -296,6 +300,9 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
             }
         }
 #endif
+        if (first_group + count == config.group_count &&
+            !MonotonicNowNs(&stats->last_send_monotonic_ns, error))
+            return false;
         ++stats->batches;
         stats->sent_packets += count;
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -345,6 +352,12 @@ std::string FormatVdifSenderStatsJson(const VdifSenderSimConfig& config,
            << "\"failed_packets\":" << stats.failed_packets << ','
            << "\"payload_bytes\":" << stats.payload_bytes << ','
            << "\"elapsed_ns\":" << stats.elapsed_ns << ','
+           << "\"pacing_start_monotonic_ns\":"
+           << stats.pacing_start_monotonic_ns << ','
+           << "\"first_send_monotonic_ns\":"
+           << stats.first_send_monotonic_ns << ','
+           << "\"last_send_monotonic_ns\":"
+           << stats.last_send_monotonic_ns << ','
            << "\"target_payload_gbps\":" << std::fixed
            << std::setprecision(9)
            << static_cast<double>(config.target_payload_bits_per_second) / 1e9

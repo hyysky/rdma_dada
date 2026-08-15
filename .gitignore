@@ -73,3 +73,7 @@ venv/
 *.bak
 *.orig
 *.rej
+
+# Local academic manuscript workspace and its planning artifacts
+/paper/
+/.superpowers/sdd/

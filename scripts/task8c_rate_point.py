@@ -64,6 +64,8 @@ class RateRequest:
     receiver_nsge: int = 4
     receiver_poll_batch: int = 8
     receiver_wr_num: int = 0
+    receiver_diagnostics: bool = False
+    unpack_missing_per_second: bool = False
 
     def validate(self) -> None:
         if (
@@ -95,6 +97,10 @@ class RateRequest:
             raise ValueError("pipeline_stage must be receive, unpack or full")
         if self.pipeline_stage in ("receive", "unpack") and self.compute_consumer != "dbnull":
             raise ValueError(f"{self.pipeline_stage} pipeline_stage requires dbnull")
+        if self.pipeline_stage == "receive" and self.unpack_missing_per_second:
+            raise ValueError(
+                "unpack_missing_per_second requires unpack or full stage"
+            )
         if self.worker_cpu_list is not None:
             if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*",
                                 self.worker_cpu_list):
@@ -165,6 +171,8 @@ class RatePlan:
     receiver_nsge: int = 4
     receiver_poll_batch: int = 8
     receiver_wr_num: int = 0
+    receiver_diagnostics: bool = False
+    unpack_missing_per_second: bool = False
 
     @property
     def uses_pipeline_worker(self) -> bool:
@@ -603,6 +611,8 @@ def compile_rate_plan(
         receiver_nsge=request.receiver_nsge,
         receiver_poll_batch=request.receiver_poll_batch,
         receiver_wr_num=request.receiver_wr_num,
+        receiver_diagnostics=request.receiver_diagnostics,
+        unpack_missing_per_second=request.unpack_missing_per_second,
     )
 
 
@@ -885,8 +895,12 @@ report_readiness_failure() {
         )
     worker_start = ""
     if not receive_only:
+        worker_diagnostics = (
+            " --diagnostics missing-per-second"
+            if plan.unpack_missing_per_second else ""
+        )
         worker_start = f'''rm -f "$run_dir/worker.ready"
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready" >"$run_dir/worker.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics} >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
 for _ in $(seq 1 300); do
   if ! kill -0 "$(cat "$run_dir/worker.pid")" 2>/dev/null; then
@@ -926,7 +940,7 @@ project={qths_binary_dir}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num} >"$run_dir/receiver.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{' --debug' if plan.receiver_diagnostics else ''} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
@@ -1935,7 +1949,10 @@ class SshBackend:
         receiver_log = (qths_copy / "receiver.log").read_text()
         summary = json.loads((qths_copy / summary_name).read_text())
         if plan.pipeline_stage == "receive":
-            statistics = parse_receive_statistics(receiver_log, summary)
+            statistics = parse_receive_statistics(
+                receiver_log, summary,
+                expect_receiver_diagnostics=plan.receiver_diagnostics,
+            )
         else:
             pipeline_worker_log = ""
             if plan.uses_pipeline_worker:
@@ -1946,6 +1963,8 @@ class SshBackend:
                 summary,
                 pipeline_worker_log,
                 expect_pipeline_worker=plan.uses_pipeline_worker,
+                expect_missing_per_second=plan.unpack_missing_per_second,
+                expect_receiver_diagnostics=plan.receiver_diagnostics,
             )
         statistics["nic"] = nic_counter_evidence(
             json.loads((qths_copy / "nic-before.json").read_text()),
@@ -2221,7 +2240,9 @@ def _validate_statistics(
         )
 
 
-def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
+def _parse_receiver_statistics(
+    receiver_log: str, expect_diagnostics: bool = False
+) -> dict[str, Any]:
     receiver_match = re.search(
         r"Receive summary:\s*accepted=(\d+),\s*wrong_length=(\d+),\s*"
         r"published=(\d+),\s*blocks=(\d+),\s*partial_blocks=(\d+),\s*"
@@ -2236,7 +2257,7 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
     cq_patterns = (
         "CQ status error", "invalid WR ID", "unexpected opcode", "repost failed",
     )
-    return {
+    result: dict[str, Any] = {
         "accepted": int(receiver_match.group(1)),
         "wrong_length": int(receiver_match.group(2)),
         "published": int(receiver_match.group(3)),
@@ -2245,6 +2266,38 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
         "cq_tail_records": int(receiver_match.group(6)),
         "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
     }
+    diagnostic_pattern = re.compile(
+        r"\[RDMA_DIAG\]\s+sample=(\d+)\s+elapsed_ns=(\d+)\s+"
+        r"poll_calls=(\d+)\s+empty_polls=(\d+)\s+completions=(\d+)\s+"
+        r"full_polls=(\d+)\s+accepted=(\d+)\s+reposted=(\d+)\s+"
+        r"repost_failures=(\d+)\s+posted_wr=(\d+)\s+"
+        r"min_posted_wr=(\d+)\s+copy_batches=(\d+)"
+    )
+    diagnostics = []
+    for match in diagnostic_pattern.finditer(receiver_log):
+        values = [int(value) for value in match.groups()]
+        diagnostics.append(dict(zip(
+            (
+                "sample", "elapsed_ns", "poll_calls", "empty_polls",
+                "completions", "full_polls", "accepted", "reposted",
+                "repost_failures", "posted_wr", "min_posted_wr",
+                "copy_batches",
+            ),
+            values,
+        )))
+    if diagnostics:
+        if [item["sample"] for item in diagnostics] != list(range(len(diagnostics))):
+            raise StageError(
+                "COLLECTING", ["parse", "receiver.log"], 1,
+                receiver_log, "receiver diagnostic samples are not contiguous",
+            )
+        result["diagnostics"] = diagnostics
+    elif expect_diagnostics:
+        raise StageError(
+            "COLLECTING", ["parse", "receiver.log"], 1,
+            receiver_log, "missing cumulative receiver diagnostics",
+        )
+    return result
 
 
 def _parse_dbnull_summary(summary: dict[str, Any], filename: str) -> dict[str, Any]:
@@ -2263,10 +2316,14 @@ def _parse_dbnull_summary(summary: dict[str, Any], filename: str) -> dict[str, A
 
 
 def parse_receive_statistics(
-    receiver_log: str, raw_summary: dict[str, Any]
+    receiver_log: str,
+    raw_summary: dict[str, Any],
+    expect_receiver_diagnostics: bool = False,
 ) -> dict[str, Any]:
     return {
-        "receiver": _parse_receiver_statistics(receiver_log),
+        "receiver": _parse_receiver_statistics(
+            receiver_log, expect_receiver_diagnostics
+        ),
         "raw": _parse_dbnull_summary(raw_summary, "raw-summary.json"),
     }
 
@@ -2277,8 +2334,12 @@ def parse_qths_statistics(
     compute_summary: dict[str, Any],
     pipeline_worker_log: str = "",
     expect_pipeline_worker: bool = True,
+    expect_missing_per_second: bool = False,
+    expect_receiver_diagnostics: bool = False,
 ) -> dict[str, Any]:
-    receiver = _parse_receiver_statistics(receiver_log)
+    receiver = _parse_receiver_statistics(
+        receiver_log, expect_receiver_diagnostics
+    )
     unpack_match = re.search(
         r"VDIF unpack statistics:\s*records=(\d+)\s+accepted=(\d+)\s+"
         r"bad_header=(\d+)\s+invalid_data=(\d+)\s+unknown_station=(\d+)\s+"
@@ -2391,6 +2452,52 @@ def parse_qths_statistics(
         for antenna, station, observed, accepted, late, highest
         in station_matches
     ]
+    missing_second_matches = re.findall(
+        r"VDIF missing per second:\s*second_index=(\d+)\s+"
+        r"vdif_seconds=(\d+)\s+missing=(\d+)",
+        worker_log,
+    )
+    if expect_missing_per_second and not missing_second_matches:
+        raise StageError(
+            "COLLECTING",
+            ["parse", "worker.log"],
+            1,
+            worker_log,
+            "missing per-second unpack diagnostics",
+        )
+    if missing_second_matches:
+        missing_per_second = [
+            {
+                "second_index": int(second_index),
+                "vdif_seconds": int(vdif_seconds),
+                "missing": int(missing),
+            }
+            for second_index, vdif_seconds, missing in missing_second_matches
+        ]
+        first_vdif_second = missing_per_second[0]["vdif_seconds"]
+        for expected_index, item in enumerate(missing_per_second):
+            if (
+                item["second_index"] != expected_index
+                or item["vdif_seconds"] != first_vdif_second + expected_index
+            ):
+                raise StageError(
+                    "COLLECTING",
+                    ["parse", "worker.log"],
+                    1,
+                    worker_log,
+                    "per-second unpack diagnostics are not contiguous",
+                )
+        if sum(item["missing"] for item in missing_per_second) != unpack[
+            "missing_station"
+        ]:
+            raise StageError(
+                "COLLECTING",
+                ["parse", "worker.log"],
+                1,
+                worker_log,
+                "per-second missing sum does not match missing_station",
+            )
+        unpack["missing_packets_per_second"] = missing_per_second
     result = {
         "receiver": receiver,
         "unpack": unpack,
@@ -2928,6 +3035,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--receiver-nsge", type=int, default=4)
     parser.add_argument("--receiver-poll-batch", type=int, default=8)
     parser.add_argument("--receiver-wr-num", type=int, default=0)
+    parser.add_argument(
+        "--receiver-diagnostics",
+        action="store_true",
+        help="enable low-rate cumulative CQ/WR receiver diagnostics",
+    )
+    parser.add_argument(
+        "--unpack-missing-per-second",
+        action="store_true",
+        help="enable opt-in VDIF missing-packet counts by expected second",
+    )
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
@@ -2989,6 +3106,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         receiver_nsge=args.receiver_nsge,
         receiver_poll_batch=args.receiver_poll_batch,
         receiver_wr_num=args.receiver_wr_num,
+        receiver_diagnostics=args.receiver_diagnostics,
+        unpack_missing_per_second=args.unpack_missing_per_second,
     )
     if args.dry_run:
         request.validate()

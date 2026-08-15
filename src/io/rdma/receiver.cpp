@@ -420,7 +420,20 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
     }
     struct timespec ts_start;
     struct timespec ts_now;
+    struct timespec diagnostic_start = {};
+    struct timespec diagnostic_last = {};
     uint64_t ns_elapsed;
+    uint64_t diagnostic_sample = 0;
+    uint64_t poll_calls = 0;
+    uint64_t empty_polls = 0;
+    uint64_t completions = 0;
+    uint64_t full_polls = 0;
+    uint64_t reposted = 0;
+    uint64_t repost_failures = 0;
+    uint64_t posted_wr = static_cast<uint64_t>(ibv_res_ptr->recv_wr_num);
+    uint64_t min_posted_wr = posted_wr;
+    uint64_t copy_batches = 0;
+    bool diagnostic_started = false;
     long int block_bufsz = 0;
     long int write_bufsz = 0;
     char * gpu_ibuf = NULL;
@@ -439,6 +452,31 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
     
     // 初始化时间戳，避免第一次计算时使用未初始化的值
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts_start);
+
+    const auto emit_diagnostic = [&](const struct timespec& now, bool force) {
+        if (!this_ptr->param.debug_mode || !diagnostic_started) return;
+        const int64_t since_last_ns =
+            (static_cast<int64_t>(now.tv_sec) - diagnostic_last.tv_sec) *
+                INT64_C(1000000000) +
+            (static_cast<int64_t>(now.tv_nsec) - diagnostic_last.tv_nsec);
+        if (!force && since_last_ns < INT64_C(100000000)) return;
+        const int64_t elapsed =
+            (static_cast<int64_t>(now.tv_sec) - diagnostic_start.tv_sec) *
+                INT64_C(1000000000) +
+            (static_cast<int64_t>(now.tv_nsec) - diagnostic_start.tv_nsec);
+        printf("[RDMA_DIAG] sample=%" PRIu64 " elapsed_ns=%" PRIi64
+               " poll_calls=%" PRIu64 " empty_polls=%" PRIu64
+               " completions=%" PRIu64 " full_polls=%" PRIu64
+               " accepted=%" PRIu64 " reposted=%" PRIu64
+               " repost_failures=%" PRIu64 " posted_wr=%" PRIu64
+               " min_posted_wr=%" PRIu64 " copy_batches=%" PRIu64 "\n",
+               diagnostic_sample++, elapsed, poll_calls, empty_polls,
+               completions, full_polls,
+               this_ptr->accepted_receive_packets.load(), reposted,
+               repost_failures, posted_wr, min_posted_wr, copy_batches);
+        fflush(stdout);
+        diagnostic_last = now;
+    };
     
     if (this_ptr->param.debug_mode) {
         printf("[DEBUG] Entering main receive loop...\n");
@@ -512,7 +550,34 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                 fprintf(stderr, "ERROR: SendRecvThread failed to poll receive CQ.\n");
                 return NULL;
             }
-            if (ibv_res_ptr->recv_completed == 0) continue;
+            if (this_ptr->param.debug_mode) {
+                ++poll_calls;
+                if (ibv_res_ptr->recv_completed == 0) {
+                    ++empty_polls;
+                } else {
+                    if (!diagnostic_started) {
+                        clock_gettime(CLOCK_MONOTONIC_RAW, &diagnostic_start);
+                        diagnostic_last = diagnostic_start;
+                        diagnostic_started = true;
+                    }
+                    completions += static_cast<uint64_t>(
+                        ibv_res_ptr->recv_completed);
+                    if (ibv_res_ptr->recv_completed == ibv_res_ptr->poll_n)
+                        ++full_polls;
+                    const uint64_t completed = static_cast<uint64_t>(
+                        ibv_res_ptr->recv_completed);
+                    posted_wr = completed > posted_wr ? 0 : posted_wr - completed;
+                    if (posted_wr < min_posted_wr) min_posted_wr = posted_wr;
+                }
+            }
+            if (ibv_res_ptr->recv_completed == 0) {
+                if (this_ptr->param.debug_mode && diagnostic_started &&
+                    (poll_calls & UINT64_C(1023)) == 0) {
+                    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
+                    emit_diagnostic(ts_now, false);
+                }
+                continue;
+            }
 
             int accepted_completed = 0;
             for (int i = 0; i < ibv_res_ptr->recv_completed; ++i) {
@@ -544,8 +609,14 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                                 completion.byte_len, ibv_res_ptr->pkt_size,
                                 completion.wr_id, dropped);
                     }
-                    if (repost_receive_wr(ibv_res_ptr, completion.wr_id) != 0)
+                    if (repost_receive_wr(ibv_res_ptr, completion.wr_id) != 0) {
+                        if (this_ptr->param.debug_mode) ++repost_failures;
                         return NULL;
+                    }
+                    if (this_ptr->param.debug_mode) {
+                        ++reposted;
+                        ++posted_wr;
+                    }
                     continue;
                 }
                 ibv_res_ptr->wc[accepted_completed++] = completion;
@@ -568,6 +639,7 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
             while (ibv_res_ptr->recv_sum_completed >=
                    (int)this_ptr->param.send_n) {
                 const int count = (int)this_ptr->param.send_n;
+                if (this_ptr->param.debug_mode) ++copy_batches;
                 const uint64_t bytes = (uint64_t)count * ring_pkt_len;
                 if (!gpu_ibuf) {
                     gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
@@ -596,8 +668,14 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                         memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
                                src + RX_STRIP_HEADER_BYTES, ring_pkt_len);
                     }
-                    if (repost_receive_wr(ibv_res_ptr, wr_id) != 0)
+                    if (repost_receive_wr(ibv_res_ptr, wr_id) != 0) {
+                        if (this_ptr->param.debug_mode) ++repost_failures;
                         return NULL;
+                    }
+                    if (this_ptr->param.debug_mode) {
+                        ++reposted;
+                        ++posted_wr;
+                    }
                 }
                 gpu_ibuf += bytes;
                 block_bufsz -= (long int)bytes;
@@ -621,7 +699,18 @@ void * RoCEv2Dada::SendRecvThread(void *arg)
                     write_bufsz = 0;
                 }
             }
+            if (this_ptr->param.debug_mode && diagnostic_started &&
+                (poll_calls & UINT64_C(1023)) == 0) {
+                clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
+                emit_diagnostic(ts_now, false);
+            }
         }
+    }
+
+    if (!this_ptr->param.SendOrRecv && this_ptr->param.debug_mode &&
+        diagnostic_started) {
+        clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
+        emit_diagnostic(ts_now, true);
     }
 
     if (!this_ptr->param.SendOrRecv) {

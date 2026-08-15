@@ -36,6 +36,9 @@ void TestMachineReadableStatistics() {
     stats.retried_packets = 2;
     stats.payload_bytes = 264192;
     stats.elapsed_ns = UINT64_C(211353600);
+    stats.pacing_start_monotonic_ns = UINT64_C(999999000);
+    stats.first_send_monotonic_ns = UINT64_C(1000000000);
+    stats.last_send_monotonic_ns = UINT64_C(1211353600);
     stats.batches = 4;
     stats.short_batches = 1;
     stats.overrun_batches = 3;
@@ -62,6 +65,13 @@ void TestMachineReadableStatistics() {
            "statistics identify the UDP batch backend");
     Expect(object.find("payload_prefix_hex")->second.text() == "65667071",
            "statistics expose the transmitted payload prefix");
+    Expect(object.find("pacing_start_monotonic_ns")->second.text() ==
+               "999999000" &&
+           object.find("first_send_monotonic_ns")->second.text() ==
+               "1000000000" &&
+           object.find("last_send_monotonic_ns")->second.text() ==
+               "1211353600",
+           "statistics expose the pacing, first and last send timestamps");
 }
 
 }  // namespace

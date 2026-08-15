@@ -110,6 +110,27 @@ std::vector<std::uint8_t> MakeRecord(std::uint64_t ordinal,
     return result;
 }
 
+std::vector<std::uint8_t> MakeTimelineRecord(
+    const unpack::VdifTimeline& timeline, std::uint64_t ordinal,
+    std::uint16_t station, std::uint32_t antenna) {
+    std::uint32_t seconds = 0;
+    std::uint32_t frame = 0;
+    std::string error;
+    Expect(unpack::VdifOrdinalToTime(timeline, ordinal, &seconds, &frame,
+                                     &error),
+           "test timeline record time resolves: " + error);
+    std::vector<std::uint8_t> result = MakeRecord(
+        ordinal, station, antenna);
+    unpack::ProjectVdifHeader header = {};
+    Expect(unpack::DecodeProjectVdifV1(result.data(), 32, &header, &error),
+           "test timeline record decodes: " + error);
+    header.seconds_from_reference_epoch = seconds;
+    header.frame_number_within_second = frame;
+    Expect(unpack::EncodeProjectVdifV1(header, result.data(), 32, &error),
+           "test timeline record re-encodes: " + error);
+    return result;
+}
+
 void Append(std::vector<std::uint8_t>* block,
             const std::vector<std::uint8_t>& record) {
     block->insert(block->end(), record.begin(), record.end());
@@ -450,6 +471,60 @@ void TestStaticPrepareThenBeginTransfer() {
            "ATFP timeline begins without reallocating static resources: " + error);
 }
 
+void TestOptionalMissingPacketsPerSecondStatistics() {
+    unpack::VdifTimeline timeline = MakeTimeline(4);
+    timeline.group_period_ps = UINT64_C(500000000000);
+
+    unpack::VdifAtfpUnpackEngine disabled;
+    std::string error;
+    Expect(disabled.Configure(MakeConfig(), MakePipeline(), MakeLayout(),
+                              timeline, &error),
+           "default diagnostics engine configures: " + error);
+    std::vector<CollectedBlock> disabled_output;
+    Expect(disabled.Finish(Collect(&disabled_output), &error),
+           "default diagnostics engine flushes: " + error);
+    Expect(disabled.statistics().missing_station_packets_per_second.empty(),
+           "per-second missing diagnostics are disabled by default");
+
+    unpack::VdifAtfpUnpackEngine enabled;
+    Expect(enabled.Prepare(MakeConfig(), MakePipeline(), MakeLayout(), &error),
+           "per-second diagnostics engine prepares: " + error);
+    Expect(enabled.BeginTransfer(timeline, true, &error),
+           "per-second diagnostics transfer begins: " + error);
+    std::vector<CollectedBlock> output;
+    const unpack::VdifAtfpBlockEmitter emit = Collect(&output);
+
+    std::vector<std::uint8_t> records;
+    for (std::uint32_t antenna = 0; antenna < 3; ++antenna) {
+        Append(&records, MakeTimelineRecord(
+            timeline, 0, MakeConfig().antenna_map[antenna], antenna));
+    }
+    Append(&records, MakeTimelineRecord(timeline, 1, 101, 0));
+    Append(&records, MakeTimelineRecord(timeline, 1, 205, 1));
+    Expect(enabled.ConsumeRawBlock(records.data(), records.size(), 60, emit,
+                                   &error),
+           "first diagnostic second consumes: " + error);
+
+    records.clear();
+    for (std::uint32_t antenna = 0; antenna < 3; ++antenna) {
+        Append(&records, MakeTimelineRecord(
+            timeline, 3, MakeConfig().antenna_map[antenna], antenna));
+    }
+    Expect(enabled.ConsumeRawBlock(records.data(), records.size(), 61, emit,
+                                   &error),
+           "second diagnostic second consumes: " + error);
+    Expect(enabled.Finish(emit, &error),
+           "per-second diagnostics transfer flushes: " + error);
+
+    const unpack::VdifAtfpStatistics& statistics = enabled.statistics();
+    Expect(statistics.missing_station_packets == 4U,
+           "one incomplete and one fully missing group count four packets");
+    Expect(statistics.missing_station_packets_per_second.size() == 2U &&
+               statistics.missing_station_packets_per_second[0] == 1U &&
+               statistics.missing_station_packets_per_second[1] == 3U,
+           "missing packets are counted in their expected VDIF second");
+}
+
 void TestStationSkewAndRawBlockCompositionStatistics() {
     unpack::VdifAtfpUnpackEngine engine;
     std::string error;
@@ -581,6 +656,7 @@ int main() {
     TestOneLeadingStationCannotEvictLaggingStations();
     TestExplicitMissingWaitLeavesStationSkewReserve();
     TestStaticPrepareThenBeginTransfer();
+    TestOptionalMissingPacketsPerSecondStatistics();
     TestPacketClassificationAndPartialEod();
     TestMalformedRawBlockDoesNotPublish();
     TestExpectedTransferOverflowIsRejected();
