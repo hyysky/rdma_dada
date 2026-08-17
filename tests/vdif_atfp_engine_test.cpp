@@ -131,6 +131,21 @@ std::vector<std::uint8_t> MakeTimelineRecord(
     return result;
 }
 
+std::vector<std::uint8_t> MakeTimestampRecord(
+    std::uint32_t seconds, std::uint32_t frame, std::uint16_t station,
+    std::uint32_t antenna) {
+    std::vector<std::uint8_t> result = MakeRecord(0, station, antenna);
+    unpack::ProjectVdifHeader header = {};
+    std::string error;
+    Expect(unpack::DecodeProjectVdifV1(result.data(), 32, &header, &error),
+           "timestamp record decodes: " + error);
+    header.seconds_from_reference_epoch = seconds;
+    header.frame_number_within_second = frame;
+    Expect(unpack::EncodeProjectVdifV1(header, result.data(), 32, &error),
+           "timestamp record re-encodes: " + error);
+    return result;
+}
+
 void Append(std::vector<std::uint8_t>* block,
             const std::vector<std::uint8_t>& record) {
     block->insert(block->end(), record.begin(), record.end());
@@ -525,6 +540,48 @@ void TestOptionalMissingPacketsPerSecondStatistics() {
            "missing packets are counted in their expected VDIF second");
 }
 
+void TestPreTimelinePacketsAreExcludedFromFormalStatistics() {
+    unpack::VdifAtfpUnpackEngine engine;
+    unpack::VdifTimeline timeline = MakeTimeline(2);
+    timeline.groups_per_second = 2U;
+    std::string error;
+    Expect(engine.Prepare(MakeConfig(), MakePipeline(), MakeLayout(), &error),
+           "pre-timeline discard engine prepares: " + error);
+    Expect(engine.BeginTransfer(timeline, false, true, &error),
+           "pre-timeline discard policy begins: " + error);
+
+    std::vector<CollectedBlock> output;
+    const unpack::VdifAtfpBlockEmitter emit = Collect(&output);
+    std::vector<std::uint8_t> records;
+    Append(&records, MakeTimestampRecord(999, 7, 205, 1));
+    Append(&records, MakeTimestampRecord(999, 8, 101, 0));
+    Append(&records, MakeTimelineRecord(timeline, 0, 409, 2));
+    Append(&records, MakeTimelineRecord(timeline, 0, 101, 0));
+    Append(&records, MakeTimelineRecord(timeline, 0, 205, 1));
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 62, emit,
+                                  &error),
+           "preparation and formal records consume together: " + error);
+    records.clear();
+    Append(&records, MakeTimelineRecord(timeline, 1, 205, 1));
+    Append(&records, MakeTimelineRecord(timeline, 1, 409, 2));
+    Append(&records, MakeTimelineRecord(timeline, 1, 101, 0));
+    Expect(engine.ConsumeRawBlock(records.data(), records.size(), 63, emit,
+                                  &error),
+           "formal Station order remains unrestricted: " + error);
+    Expect(engine.Finish(emit, &error),
+           "formal records flush after preparation discard: " + error);
+
+    const unpack::VdifAtfpStatistics& statistics = engine.statistics();
+    Expect(statistics.received_records == 6U,
+           "pre-timeline records are excluded from formal record count");
+    Expect(statistics.accepted_packets == 6U,
+           "all formal Station records are accepted");
+    Expect(statistics.completed_groups == 2U &&
+               statistics.missing_station_packets == 0U &&
+               statistics.out_of_range_packets == 0U,
+           "formal interval starts complete at group zero");
+}
+
 void TestStationSkewAndRawBlockCompositionStatistics() {
     unpack::VdifAtfpUnpackEngine engine;
     std::string error;
@@ -657,6 +714,7 @@ int main() {
     TestExplicitMissingWaitLeavesStationSkewReserve();
     TestStaticPrepareThenBeginTransfer();
     TestOptionalMissingPacketsPerSecondStatistics();
+    TestPreTimelinePacketsAreExcludedFromFormalStatistics();
     TestPacketClassificationAndPartialEod();
     TestMalformedRawBlockDoesNotPublish();
     TestExpectedTransferOverflowIsRejected();

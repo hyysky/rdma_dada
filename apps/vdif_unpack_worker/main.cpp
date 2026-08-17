@@ -139,7 +139,8 @@ struct WorkerRuntime {
         : log(NULL), output_hdu(NULL), output_locked(false), failed(false),
           input_block_capacity(0), output_block_capacity(0),
           raw_block_sequence(0), output_eod_sent(false), transfers_started(0),
-          collect_missing_per_second(false) {}
+          collect_missing_per_second(false),
+          discard_before_timeline_start(false), groups_per_second(0U) {}
 
     unpack::VdifUnpackConfig config;
     rdma_dada::PipelineConfig pipeline_config;
@@ -160,6 +161,8 @@ struct WorkerRuntime {
     bool output_eod_sent;
     std::uint64_t transfers_started;
     bool collect_missing_per_second;
+    bool discard_before_timeline_start;
+    std::uint64_t groups_per_second;
 };
 
 void SetFailure(WorkerRuntime* runtime, const std::string& message) {
@@ -302,6 +305,7 @@ int OpenTransfer(dada_client_t* client) {
                                     error);
             return -1;
         }
+        runtime->timeline.groups_per_second = runtime->groups_per_second;
 
         rdma_dada::pipeline::Metadata output_header;
         if (!unpack::BuildVdifUnpackOutputHeader(
@@ -333,6 +337,7 @@ int OpenTransfer(dada_client_t* client) {
 
         if (!runtime->engine.BeginTransfer(
                 runtime->timeline, runtime->collect_missing_per_second,
+                runtime->discard_before_timeline_start,
                 &error)) {
             SetFailure(runtime, "cannot begin VDIF unpack transfer: " + error);
             return -1;
@@ -576,7 +581,9 @@ void PrintUsage(const char* program) {
               << " --plan resolved_observation.json"
               << " [--reorder-horizon-groups GROUPS]"
               << " [--ready-file PATH]"
-              << " [--diagnostics missing-per-second]\n";
+              << " [--diagnostics missing-per-second]"
+              << " [--pre-timeline-policy discard]"
+              << " [--groups-per-second GROUPS]\n";
 }
 
 }  // namespace
@@ -586,6 +593,8 @@ int main(int argc, char** argv) {
     std::string ready_path;
     std::uint64_t reorder_horizon_groups = 0U;
     bool collect_missing_per_second = false;
+    bool discard_before_timeline_start = false;
+    std::uint64_t groups_per_second = 0U;
     for (int index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) {
             PrintUsage(argv[0]);
@@ -606,6 +615,13 @@ int main(int argc, char** argv) {
                    value == "missing-per-second" &&
                    !collect_missing_per_second) {
             collect_missing_per_second = true;
+        } else if (option == "--pre-timeline-policy" &&
+                   value == "discard" &&
+                   !discard_before_timeline_start) {
+            discard_before_timeline_start = true;
+        } else if (option == "--groups-per-second" &&
+                   groups_per_second == 0U &&
+                   ParsePositiveUint64(value.c_str(), &groups_per_second)) {
         } else {
             PrintUsage(argv[0]);
             return EXIT_FAILURE;
@@ -630,6 +646,8 @@ int main(int argc, char** argv) {
     if (reorder_horizon_groups != 0U)
         runtime.config.reorder_horizon_groups = reorder_horizon_groups;
     runtime.collect_missing_per_second = collect_missing_per_second;
+    runtime.discard_before_timeline_start = discard_before_timeline_start;
+    runtime.groups_per_second = groups_per_second;
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);

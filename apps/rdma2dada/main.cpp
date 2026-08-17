@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <string>
+#include <sstream>
+#include <vector>
 #include <limits>
 #include <climits>
 
@@ -104,20 +106,25 @@ int SendBuffPtr(std::uint64_t valid_bytes) {
         fprintf(stderr, "[ERROR] MarkWritten() failed!\n");
         return -1;
     }
-    static time_t last_print = 0;
     static uint64_t total_blocks = 0;
     total_blocks++;
-    time_t now = time(NULL);
-    if (now - last_print >= 2) {  // 每2秒打印一次
-        last_print = now;
-        uint64_t used = g_ringbuf->GetUsedSpace();
-        uint64_t free = g_ringbuf->GetFreeSpace();
-        uint64_t total = used + free;
-        double fill_percent = total > 0 ? (double)used * 100.0 / total : 0.0;
-        printf("[Progress] Blocks written: %" PRIu64
-               " | Ring buffer: %.1f%% full (%" PRIu64 "/%" PRIu64 " MB)\n",
-               total_blocks, fill_percent, used / 1024 / 1024, total / 1024 / 1024);
-        fflush(stdout);
+    if (rdma_dada::io::rdma::ShouldEmitPeriodicReceiveStatus(g_debug_mode)) {
+        static time_t last_print = 0;
+        const time_t now = time(NULL);
+        if (now - last_print >= 2) {
+            last_print = now;
+            const uint64_t used = g_ringbuf->GetUsedSpace();
+            const uint64_t free = g_ringbuf->GetFreeSpace();
+            const uint64_t total = used + free;
+            const double fill_percent = total > 0
+                ? static_cast<double>(used) * 100.0 / total
+                : 0.0;
+            printf("[Progress] Blocks written: %" PRIu64
+                   " | Ring buffer: %.1f%% full (%" PRIu64 "/%" PRIu64 " MB)\n",
+                   total_blocks, fill_percent, used / 1024 / 1024,
+                   total / 1024 / 1024);
+            fflush(stdout);
+        }
     }
     return 0;
 }
@@ -128,10 +135,15 @@ void print_helper() {
     printf("Options:\n");
     printf("    --plan, compiler-generated resolved_observation.json (required)\n");
     printf("    --send_n, batch size (default: 64)\n");
-    printf("    --recv-wr-num, receive WR depth (default: send_n * 4)\n");
-    printf("    --poll-batch, maximum CQ completions per poll (default: 8)\n");
-    printf("    --nsge, scatter/gather entries per work request (default: 4)\n");
-    printf("    --cpu, CPU ID for thread affinity (default: -1)\n");
+    printf("    --recv-wr-num, receive WR depth (default: 1024)\n");
+    printf("    --poll-batch, maximum CQ completions per poll (default: 32)\n");
+    printf("    --nsge, scatter/gather entries per work request (default: 1)\n");
+    printf("    --poll-cpu, CQ poll/repost thread CPU (default: -1)\n");
+    printf("    --poll-cpus, comma-separated CQ poll CPUs, one per shard\n");
+    printf("    --copy-cpu, packet copy/raw-ring thread CPU (default: -1)\n");
+    printf("    --receiver-shards, independent flow/QP/CQ count (default: 1)\n");
+    printf("    --receiver-flow, repeat IPv4:UDP_PORT once per shard\n");
+    printf("    --cpu, legacy alias for --poll-cpu\n");
     printf("    --debug, enable debug mode with verbose logging\n");
     printf("    --help, -h\n");
     printf("    --preflight-only, validate plan/device and exit before ring access\n");
@@ -146,6 +158,11 @@ static int parse_args(RoCEv2Dada::RdmaParam &param,
         {"send_n", required_argument, NULL, 265},
         {"recv-wr-num", required_argument, NULL, 275},
         {"poll-batch", required_argument, NULL, 276},
+        {"poll-cpu", required_argument, NULL, 277},
+        {"copy-cpu", required_argument, NULL, 278},
+        {"receiver-shards", required_argument, NULL, 279},
+        {"receiver-flow", required_argument, NULL, 280},
+        {"poll-cpus", required_argument, NULL, 281},
         {"debug", no_argument, NULL, 271},
         {"nsge", required_argument, NULL, 272},
         {"plan", required_argument, NULL, 273},
@@ -154,29 +171,94 @@ static int parse_args(RoCEv2Dada::RdmaParam &param,
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
-    param.bind_cpu_id = -1;
+    int legacy_cpu = -1;
+    int poll_cpu = -1;
+    int copy_cpu = -1;
+    std::vector<int> poll_cpus;
+    param.poll_cpu_id = -1;
+    param.copy_cpu_id = -1;
+    param.receive_shards = 1;
     param.gpu_id = 0;
     param.SendOrRecv = false;
     param.device_id = 0;
     param.pkt_size = 0;  // Loaded from the validated pipeline config.
     param.RdmaDirectGpu = 0;
-    param.send_n = 64;
-    param.recv_wr_num = 0;
-    param.poll_batch = 8;
-    param.nsge = 4;
+    param.send_n = rdma_dada::io::rdma::kDefaultReceiveCopyBatch;
+    param.recv_wr_num = rdma_dada::io::rdma::kDefaultReceiveWrDepth;
+    param.poll_batch = rdma_dada::io::rdma::kDefaultReceivePollBatch;
+    param.nsge = rdma_dada::io::rdma::kDefaultReceiveNsge;
     while (1) {
         c = getopt_long(argc, argv, "c:h", long_options, NULL);
         switch (c) {
             case 265: param.send_n = atoi(optarg); break;
             case 275: param.recv_wr_num = (unsigned int)strtoul(optarg, NULL, 10); break;
             case 276: param.poll_batch = (unsigned int)strtoul(optarg, NULL, 10); break;
+            case 277: poll_cpu = atoi(optarg); break;
+            case 278: copy_cpu = atoi(optarg); break;
+            case 279: param.receive_shards =
+                          (unsigned int)strtoul(optarg, NULL, 10); break;
+            case 280: {
+                rdma_dada::io::rdma::ReceiveFlowSpec flow;
+                std::string error;
+                if (!rdma_dada::io::rdma::ParseReceiveFlowSpec(
+                        optarg, &flow, &error)) {
+                    fprintf(stderr, "invalid --receiver-flow: %s\n",
+                            error.c_str());
+                    return -1;
+                }
+                param.receive_flows.push_back(flow);
+                break;
+            }
+            case 281: {
+                std::stringstream values(optarg);
+                std::string value;
+                while (std::getline(values, value, ',')) {
+                    char *end = NULL;
+                    const long cpu = strtol(value.c_str(), &end, 10);
+                    if (!end || *end != '\0' || cpu < 0 || cpu > INT_MAX) {
+                        fprintf(stderr, "invalid --poll-cpus value\n");
+                        return -1;
+                    }
+                    poll_cpus.push_back(static_cast<int>(cpu));
+                }
+                break;
+            }
             case 271: g_debug_mode = true; break;
             case 272: param.nsge = (unsigned int)strtoul(optarg, NULL, 10); break;
             case 273: strncpy(plan_path, optarg, plan_path_len - 1); plan_path[plan_path_len - 1] = '\0'; break;
             case 274: *preflight_only = true; break;
-            case 'c': param.bind_cpu_id = atoi(optarg); break;
+            case 'c': legacy_cpu = atoi(optarg); break;
             case 'h': print_helper(); return -1;
-            case -1: return optind == argc ? 0 : -1;
+            case -1: {
+                if (optind != argc) return -1;
+                if (poll_cpu >= 0) {
+                    if (!poll_cpus.empty()) {
+                        fprintf(stderr, "--poll-cpu conflicts with --poll-cpus\n");
+                        return -1;
+                    }
+                    poll_cpus.push_back(poll_cpu);
+                }
+                const rdma_dada::io::rdma::ReceiveShardCpuPlacement placement =
+                    rdma_dada::io::rdma::ResolveReceiveShardCpuPlacement(
+                        legacy_cpu, poll_cpus, copy_cpu,
+                        param.receive_shards);
+                if (!placement.valid) {
+                    fprintf(stderr, "invalid or conflicting receive CPU placement\n");
+                    return -1;
+                }
+                param.poll_cpu_ids = placement.poll_cpus;
+                param.poll_cpu_id = placement.poll_cpus.empty()
+                    ? -1 : placement.poll_cpus.front();
+                param.copy_cpu_id = placement.copy_cpu;
+                if ((param.receive_shards > 1 ||
+                     !param.receive_flows.empty()) &&
+                    param.receive_flows.size() != param.receive_shards) {
+                    fprintf(stderr,
+                            "receiver flow count must equal receiver shard count\n");
+                    return -1;
+                }
+                return 0;
+            }
             default: print_helper(); return -1;
         }
     }
@@ -272,18 +354,25 @@ int main(int argc, char *argv[]) {
     param.pkt_size = static_cast<uint32_t>(pipeline_layout.raw_record_bytes);
     param.debug_mode = g_debug_mode;  // Set debug mode in RDMA param
     if (param.nsge == 0) {
-        fprintf(stderr, "[WARN] Invalid --nsge value 0, falling back to 4\n");
-        param.nsge = 4;
+        fprintf(stderr, "[WARN] Invalid --nsge value 0, falling back to %u\n",
+                rdma_dada::io::rdma::kDefaultReceiveNsge);
+        param.nsge = rdma_dada::io::rdma::kDefaultReceiveNsge;
     }
     g_pkt_size = param.pkt_size;
 
     if (preflight_only) {
         printf("PLAN %s\nCONFIG_ID %s\nGEOMETRY_ID %s\n"
-               "RAW_KEY 0x%x\nRAW_BLOCK_BYTES %lu\nDEVICE %s\n",
+               "RAW_KEY 0x%x\nRAW_BLOCK_BYTES %lu\nDEVICE %s\n"
+               "RECEIVER_SHARDS %u\n",
                plan_path, resolved_plan.config_id.c_str(),
                resolved_plan.geometry_id.c_str(), resolved_plan.source.raw_key,
                (unsigned long)resolved_plan.raw_block_bytes,
-               resolved_plan.source.receiver_device.c_str());
+               resolved_plan.source.receiver_device.c_str(),
+               param.receive_shards);
+        for (std::size_t index = 0; index < param.receive_flows.size(); ++index)
+            printf("RECEIVER_FLOW %s:%u\n",
+                   param.receive_flows[index].source_ip.c_str(),
+                   param.receive_flows[index].source_port);
         return 0;
     }
     g_ringbuf = new PsrdadaRingBuf();
@@ -336,7 +425,15 @@ int main(int argc, char *argv[]) {
     printf("  Receive WR Depth: %u\n", param.recv_wr_num);
     printf("  CQ Poll Batch: %u\n", param.poll_batch);
     printf("  NSGE: %u\n", param.nsge);
-    printf("  Source filter: ANY MAC/IP/UDP port\n");
+    printf("  Receiver shards: %u\n", param.receive_shards);
+    if (param.receive_flows.empty()) {
+        printf("  Source filter: ANY MAC/IP/UDP port\n");
+    } else {
+        for (std::size_t index = 0; index < param.receive_flows.size(); ++index)
+            printf("  Source filter[%zu]: %s:%u\n", index,
+                   param.receive_flows[index].source_ip.c_str(),
+                   param.receive_flows[index].source_port);
+    }
     printf("  Destination: %s:%s (%s)\n", param.DAddr, param.dst_port, param.DMacAddr);
     printf("[Main] Calling: new RoCEv2Dada(param)...\n");
     fflush(stdout);
@@ -355,7 +452,8 @@ int main(int argc, char *argv[]) {
     printf("\n========================================\n");
     printf("RDMA receiver running\n");
     printf("Listening on: %s:%s (%s)\n", param.DAddr, param.dst_port, param.DMacAddr);
-    printf("Accepting packets from: ANY source MAC/IP/UDP port\n");
+    printf("Accepting packets through %u configured receiver shard(s)\n",
+           param.receive_shards);
     printf("\n");
     printf("⚠️  WAITING FOR DATA PACKETS\n");
     printf("   Make sure the sender is running and sending to:\n");

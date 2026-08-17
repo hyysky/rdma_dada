@@ -3,6 +3,9 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <vector>
+
+#include "rdma_dada/io/rdma/receive_policy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +27,17 @@ class RoCEv2Dada
             std::uint64_t published_blocks;
             std::uint64_t partial_blocks;
             std::uint64_t cq_tail_records;
+            std::uint64_t poll_calls;
+            std::uint64_t empty_polls;
+            std::uint64_t full_polls;
+            std::uint64_t reposted_wrs;
+            std::uint64_t repost_failures;
+            std::uint64_t copy_batches;
+            std::uint64_t min_posted_wrs;
+            std::uint64_t completion_queue_high_watermark;
+            std::uint64_t recycle_queue_high_watermark;
+            std::uint64_t completion_to_recycle_ns_total;
+            std::uint64_t completion_to_recycle_ns_max;
         };
 
         typedef std::function<int(std::uint64_t)> DataSend;
@@ -38,7 +52,11 @@ class RoCEv2Dada
             unsigned int send_n;
             unsigned int recv_wr_num;
             unsigned int poll_batch;
-            int bind_cpu_id;
+            int poll_cpu_id;
+            std::vector<int> poll_cpu_ids;
+            int copy_cpu_id;
+            unsigned int receive_shards;
+            std::vector<rdma_dada::io::rdma::ReceiveFlowSpec> receive_flows;
             int RdmaDirectGpu;
             bool SendOrRecv;
             bool debug_mode;  // Debug mode flag
@@ -60,11 +78,16 @@ class RoCEv2Dada
         int Stop();
         ReceiveStats GetReceiveStats() const;
     private:
+        struct ReceivePipelineState;
         RoCEv2Dada(const RoCEv2Dada &);
         const RoCEv2Dada &operator=(const RoCEv2Dada &);
         static void * SendRecvThread(void * arg);
+        static void * ReceivePollThread(void * arg);
+        static void * ReceiveCopyThread(void * arg);
         RdmaParam param;
         void * ibv_res;
+        std::vector<void *> receive_resources;
+        ReceivePipelineState * receive_pipeline;
         std::atomic<bool> stop_requested;
         std::atomic<std::uint64_t> accepted_receive_packets;
         std::atomic<std::uint64_t> wrong_length_receive_packets;

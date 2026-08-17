@@ -60,12 +60,21 @@ class RateRequest:
     missing_wait_ms: float = 200.0
     station_skew_reserve_ms: float = 200.0
     worker_cpu_list: str | None = None
+    sink_cpu_list: str | None = None
+    receiver_poll_cpu: int | None = None
+    receiver_poll_cpu_list: str | None = None
+    receiver_copy_cpu: int | None = None
+    receiver_shards: int = 1
+    numa_node: int | None = None
     receiver_send_n: int = 64
-    receiver_nsge: int = 4
-    receiver_poll_batch: int = 8
-    receiver_wr_num: int = 0
+    receiver_nsge: int = 1
+    receiver_poll_batch: int = 32
+    receiver_wr_num: int = 1024
     receiver_diagnostics: bool = False
     unpack_missing_per_second: bool = False
+    unpack_start_delay_seconds: int = 0
+    station_id: int | None = None
+    sender_source_port: int | None = None
 
     def validate(self) -> None:
         if (
@@ -101,6 +110,30 @@ class RateRequest:
             raise ValueError(
                 "unpack_missing_per_second requires unpack or full stage"
             )
+        if (self.station_id is None) != (self.sender_source_port is None):
+            raise ValueError(
+                "station_id and sender_source_port must be supplied together"
+            )
+        if self.station_id is not None:
+            if self.pipeline_stage != "receive":
+                raise ValueError("station_id requires receive pipeline_stage")
+            if self.station_id not in (101, 102):
+                raise ValueError("station_id must be 101 or 102")
+            if not 1 <= self.sender_source_port <= 65535:
+                raise ValueError("sender_source_port must be in 1..65535")
+        if (
+            type(self.unpack_start_delay_seconds) is not int
+            or self.unpack_start_delay_seconds < 0
+        ):
+            raise ValueError("unpack_start_delay_seconds must be a nonnegative integer")
+        if self.unpack_start_delay_seconds and (
+            self.pipeline_stage not in ("receive", "unpack")
+            or self.compute_consumer != "dbnull"
+        ):
+            raise ValueError(
+                "unpack_start_delay_seconds requires receive or unpack stage "
+                "with dbnull"
+            )
         if self.worker_cpu_list is not None:
             if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*",
                                 self.worker_cpu_list):
@@ -109,6 +142,54 @@ class RateRequest:
                 bounds = [int(value) for value in part.split("-")]
                 if len(bounds) == 2 and bounds[0] > bounds[1]:
                     raise ValueError("worker_cpu_list range must be ascending")
+        if self.receiver_shards <= 0:
+            raise ValueError("receiver_shards must be positive")
+        if self.receiver_poll_cpu is not None and self.receiver_poll_cpu_list:
+            raise ValueError(
+                "receiver_poll_cpu and receiver_poll_cpu_list conflict"
+            )
+        poll_cpus: list[int] = []
+        if self.receiver_poll_cpu_list:
+            if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*",
+                                self.receiver_poll_cpu_list):
+                raise ValueError("receiver poll CPU list is invalid")
+            poll_cpus = [int(value) for value in
+                         self.receiver_poll_cpu_list.split(",")]
+            if len(poll_cpus) != self.receiver_shards:
+                raise ValueError(
+                    "receiver_shards must match receiver poll CPU count"
+                )
+        elif self.receiver_poll_cpu is not None:
+            if self.receiver_shards != 1:
+                raise ValueError(
+                    "receiver_shards greater than one requires poll CPU list"
+                )
+            poll_cpus = [self.receiver_poll_cpu]
+        placement_active = bool(poll_cpus) or any(value is not None for value in (
+            self.receiver_copy_cpu, self.sink_cpu_list, self.numa_node,
+        ))
+        if placement_active:
+            if (not poll_cpus or self.receiver_copy_cpu is None or
+                    self.sink_cpu_list is None or self.numa_node is None or
+                    self.worker_cpu_list is None):
+                raise ValueError(
+                    "receiver poll/copy, worker, sink and NUMA placement "
+                    "must be supplied together"
+                )
+            if (
+                any(cpu < 0 for cpu in poll_cpus)
+                or self.receiver_copy_cpu < 0
+                or self.numa_node < 0
+                or not re.fullmatch(r"[0-9]+", self.worker_cpu_list)
+                or not re.fullmatch(r"[0-9]+", self.sink_cpu_list)
+            ):
+                raise ValueError("explicit CPU/NUMA placement is invalid")
+            roles = poll_cpus + [
+                self.receiver_copy_cpu, int(self.worker_cpu_list),
+                int(self.sink_cpu_list),
+            ]
+            if len(set(roles)) != len(roles):
+                raise ValueError("receive, worker and sink CPUs must be distinct")
 
 
 def result_directory_name(
@@ -167,12 +248,26 @@ class RatePlan:
     pipeline_stage: str = "full"
     reorder_horizon_groups: int = 0
     worker_cpu_list: str | None = None
+    sink_cpu_list: str | None = None
+    receiver_poll_cpu: int | None = None
+    receiver_poll_cpu_list: str | None = None
+    receiver_copy_cpu: int | None = None
+    receiver_shards: int = 1
+    numa_node: int | None = None
     receiver_send_n: int = 64
-    receiver_nsge: int = 4
-    receiver_poll_batch: int = 8
-    receiver_wr_num: int = 0
+    receiver_nsge: int = 1
+    receiver_poll_batch: int = 32
+    receiver_wr_num: int = 1024
     receiver_diagnostics: bool = False
     unpack_missing_per_second: bool = False
+    unpack_start_delay_seconds: int = 0
+    preparation_groups: int = 0
+    packets_per_second: int = 0
+    sender_source_port: int | None = None
+
+    @property
+    def sender_group_count(self) -> int:
+        return self.group_count + self.preparation_groups
 
     @property
     def uses_pipeline_worker(self) -> bool:
@@ -436,6 +531,30 @@ def _group_count_for_request(
     )
 
 
+def _fixed_packets_per_second(
+    aggregate_gbps: float, station_count: int, record_bytes: int
+) -> int:
+    if aggregate_gbps <= 0 or station_count <= 0 or record_bytes <= 0:
+        raise ValueError("packet-rate inputs must be positive")
+    packets = (
+        decimal.Decimal(str(aggregate_gbps))
+        * decimal.Decimal(1_000_000_000)
+        / decimal.Decimal(station_count * record_bytes * 8)
+    )
+    return int(packets.to_integral_value(rounding=decimal.ROUND_HALF_UP))
+
+
+def _aggregate_gbps_for_packet_rate(
+    packets_per_second: int, station_count: int, record_bytes: int
+) -> float:
+    if packets_per_second <= 0 or station_count <= 0 or record_bytes <= 0:
+        raise ValueError("packet-rate inputs must be positive")
+    return float(
+        decimal.Decimal(packets_per_second * station_count * record_bytes * 8)
+        / decimal.Decimal(1_000_000_000)
+    )
+
+
 def _window_blocks_for_horizon(
     aggregate_gbps: float,
     missing_wait_ms: float,
@@ -540,6 +659,19 @@ def compile_rate_plan(
                         (template_path.parent / weight).resolve()
                     )
         observation["observation"]["observation_id"] = root.name
+        if request.station_id is not None:
+            configured_stations = observation["observation"]["station_ids"]
+            if request.station_id not in configured_stations:
+                raise ValueError(
+                    f"station_id {request.station_id} is absent from observation"
+                )
+            observation["observation"]["station_ids"] = [request.station_id]
+        # Receive-only plans never consume processing modules.  Strip them
+        # before compiler validation so a single-Station receive plan does not
+        # spuriously fail on beamform weight geometry intended for the full
+        # multi-Station pipeline.
+        if request.pipeline_stage == "receive":
+            observation["processing"]["modules"] = []
         observation["processing"]["run_once"] = True
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise StageError(
@@ -564,6 +696,18 @@ def compile_rate_plan(
     group_count = _group_count_for_request(
         request, bootstrap.nant, bootstrap.record_bytes
     )
+    packets_per_second = 0
+    if request.unpack_start_delay_seconds:
+        if not request.duration_seconds.is_integer():
+            raise StageError(
+                "CONFIG_READY", ["validate", "duration_seconds"], 1, "",
+                "fixed packets/second requires a whole-second duration",
+                "HARNESS_FAIL",
+            )
+        packets_per_second = _fixed_packets_per_second(
+            request.aggregate_gbps, bootstrap.nant, bootstrap.record_bytes
+        )
+        group_count = packets_per_second * int(request.duration_seconds)
     if bootstrap.records_per_block % bootstrap.nant != 0:
         raise StageError(
             "CONFIG_READY", ["validate", "records_per_block"], 1, "",
@@ -604,15 +748,28 @@ def compile_rate_plan(
             "CONFIG_READY", ["validate", "expected_groups"], 1,
             str(plan.group_count), str(group_count), "HARNESS_FAIL"
         )
+    preparation_groups = (
+        request.unpack_start_delay_seconds * packets_per_second
+    )
     return dataclasses.replace(
         plan, reorder_horizon_groups=reorder_horizon_groups,
         worker_cpu_list=request.worker_cpu_list,
+        sink_cpu_list=request.sink_cpu_list,
+        receiver_poll_cpu=request.receiver_poll_cpu,
+        receiver_poll_cpu_list=request.receiver_poll_cpu_list,
+        receiver_copy_cpu=request.receiver_copy_cpu,
+        receiver_shards=request.receiver_shards,
+        numa_node=request.numa_node,
         receiver_send_n=request.receiver_send_n,
         receiver_nsge=request.receiver_nsge,
         receiver_poll_batch=request.receiver_poll_batch,
         receiver_wr_num=request.receiver_wr_num,
         receiver_diagnostics=request.receiver_diagnostics,
         unpack_missing_per_second=request.unpack_missing_per_second,
+        unpack_start_delay_seconds=request.unpack_start_delay_seconds,
+        preparation_groups=preparation_groups,
+        packets_per_second=packets_per_second,
+        sender_source_port=request.sender_source_port,
     )
 
 
@@ -622,6 +779,45 @@ def derive_sender_source_ports(run_identity: str) -> tuple[int, int]:
     digest = hashlib.sha256(run_identity.encode("utf-8")).digest()
     offset = int.from_bytes(digest[:2], byteorder="big") % 10000
     return 40000 + offset, 50000 + offset
+
+
+@dataclasses.dataclass(frozen=True)
+class SenderSpec:
+    station_id: int
+    host: str
+    source_ip: str
+    source_port: int
+    bundle_name: str
+    remote_name: str
+    log_name: str
+
+
+def sender_specs_for_plan(plan: RatePlan, run_identity: str) -> list[SenderSpec]:
+    first_port, second_port = derive_sender_source_ports(run_identity)
+    topology = {
+        101: ("qtpulsar1", "174.0.1.100", first_port,
+              "sender101.json", "101.json", "sender101.log"),
+        102: ("qtpulsar2", "174.0.1.101", second_port,
+              "sender102.json", "102.json", "sender102.log"),
+    }
+    stations = [int(value) for value in
+                plan.source.get("observation", {}).get("station_ids", [])]
+    if not stations or len(stations) > 2 or len(set(stations)) != len(stations):
+        raise ValueError("Task 8C requires one or two distinct Stations")
+    specs = []
+    for station_id in stations:
+        if station_id not in topology:
+            raise ValueError(f"unsupported Task 8C Station: {station_id}")
+        host, source_ip, source_port, bundle_name, remote_name, log_name = (
+            topology[station_id]
+        )
+        if len(stations) == 1 and plan.sender_source_port is not None:
+            source_port = plan.sender_source_port
+        specs.append(SenderSpec(
+            station_id, host, source_ip, source_port,
+            bundle_name, remote_name, log_name,
+        ))
+    return specs
 
 
 def build_sender_endpoint_probe() -> str:
@@ -658,7 +854,15 @@ def build_sender_config(
     wire = source["wire"]
     receiver = source["receiver"]
     resolved = plan.resolved_plan["resolved"]
-    return {
+    formal_start_seconds = int(resolved["group_start_seconds"])
+    if formal_start_seconds < plan.unpack_start_delay_seconds:
+        raise ValueError("unpack start delay crosses the VDIF reference epoch")
+    target_gbps = plan.per_station_gbps
+    if plan.packets_per_second:
+        target_gbps = (
+            plan.packets_per_second * plan.record_bytes * 8 / 1_000_000_000
+        )
+    result = {
         "schema_version": 2,
         "source": {"ip": source_ip, "port": source_port},
         "destination": {
@@ -677,13 +881,15 @@ def build_sender_config(
         },
         "time": {
             "reference_epoch": resolved["group_start_reference_epoch"],
-            "start_seconds": resolved["group_start_seconds"],
-            "group_count": plan.group_count,
+            "start_seconds": (
+                formal_start_seconds - plan.unpack_start_delay_seconds
+            ),
+            "group_count": plan.sender_group_count,
             "mode": "PACED",
             "start_utc": start_utc,
         },
         "transmit": {
-            "target_gbps": plan.per_station_gbps,
+            "target_gbps": target_gbps,
             "batch_packets": plan.batch_packets,
             "payload_mode": "REPEAT_TEMPLATE",
         },
@@ -693,6 +899,9 @@ def build_sender_config(
             "invalid_header_groups": [],
         },
     }
+    if plan.packets_per_second:
+        result["time"]["groups_per_second"] = plan.packets_per_second
+    return result
 
 
 def build_qths_bundle(
@@ -703,6 +912,7 @@ def build_qths_bundle(
     dbnull_path: str = "dada_dbnull",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
     ethtool_path: str = "ethtool",
+    receiver_flows: Sequence[str] = (),
 ) -> dict[str, str | bytes]:
     if not plan.artifact_files:
         raise ValueError("compiler artifact bundle is required")
@@ -714,6 +924,17 @@ def build_qths_bundle(
         else plan.compute_key
     )
     receiver_device = str(plan.source["receiver"]["device"])
+    if plan.receiver_shards != 1 and len(receiver_flows) != plan.receiver_shards:
+        raise ValueError("receiver flow count must equal receiver_shards")
+    shard_args = f" --receiver-shards {plan.receiver_shards}"
+    if plan.receiver_poll_cpu_list:
+        shard_args += f" --poll-cpus {plan.receiver_poll_cpu_list}"
+    elif plan.receiver_poll_cpu is not None:
+        shard_args += f" --poll-cpu {plan.receiver_poll_cpu}"
+    if plan.receiver_copy_cpu is not None:
+        shard_args += f" --copy-cpu {plan.receiver_copy_cpu}"
+    for flow in receiver_flows:
+        shard_args += f" --receiver-flow {flow}"
     capture_nic_counters = '''#!/usr/bin/env python3
 import datetime
 import json
@@ -824,13 +1045,20 @@ for name, wanted in expected.items():
 if value.get("schema_version") != 1 or int(value.get("pid", 0)) <= 0:
     raise SystemExit("worker ready metadata is invalid")
 '''
+    numa_prefix = (
+        f"/usr/bin/numactl --membind={plan.numa_node} "
+        if plan.numa_node is not None else ""
+    )
+    sink_prefix = numa_prefix
+    if plan.sink_cpu_list is not None:
+        sink_prefix += f"/usr/bin/taskset -c {plan.sink_cpu_list} "
     if plan.compute_consumer == "dbnull":
-        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {dbnull_path} -k {consumer_key} -s -z -q >"$run_dir/reader.log" 2>&1 &
+        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbnull_path} -k {consumer_key} -s -z -q >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
     else:
-        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {dbdisk_path} -k {plan.compute_key} -D "$run_dir/compute" -s -W >"$run_dir/reader.log" 2>&1 &
+        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbdisk_path} -k {plan.compute_key} -D "$run_dir/compute" -s -W >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
-    compute_ring_prepare = "" if receive_only else f'''{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
+    compute_ring_prepare = "" if receive_only else f'''{numa_prefix}{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
 echo $! >"$run_dir/compute-ring.pid"
 touch "$run_dir/compute-ring.created"
 '''
@@ -838,10 +1066,10 @@ touch "$run_dir/compute-ring.created"
 set -euo pipefail
 run_dir={remote_run_dir}
 mkdir -p "$run_dir/compute"
-{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
+{numa_prefix}{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
 echo $! >"$run_dir/raw-ring.pid"
 touch "$run_dir/raw-ring.created"
-{compute_ring_prepare}""" + (f'''{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
+{compute_ring_prepare}""" + (f'''{numa_prefix}{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
 echo $! >"$run_dir/output-ring.pid"
 touch "$run_dir/output-ring.created"
 ''' if full_gpu_pipeline else "") + f"""
@@ -887,10 +1115,10 @@ report_readiness_failure() {
   report_readiness_state "$name"
 }
 '''
-    worker_program = '"$project/vdif_unpack_worker"'
+    worker_program = numa_prefix + '"$project/vdif_unpack_worker"'
     if plan.worker_cpu_list is not None:
         worker_program = (
-            f'/usr/bin/taskset -c {plan.worker_cpu_list} '
+            numa_prefix + f'/usr/bin/taskset -c {plan.worker_cpu_list} '
             '"$project/vdif_unpack_worker"'
         )
     worker_start = ""
@@ -899,8 +1127,16 @@ report_readiness_failure() {
             " --diagnostics missing-per-second"
             if plan.unpack_missing_per_second else ""
         )
+        pre_timeline_policy = (
+            " --pre-timeline-policy discard"
+            if plan.unpack_start_delay_seconds else ""
+        )
+        fixed_packet_rate = (
+            f" --groups-per-second {plan.packets_per_second}"
+            if plan.packets_per_second else ""
+        )
         worker_start = f'''rm -f "$run_dir/worker.ready"
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics} >"$run_dir/worker.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics}{pre_timeline_policy}{fixed_packet_rate} >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
 for _ in $(seq 1 300); do
   if ! kill -0 "$(cat "$run_dir/worker.pid")" 2>/dev/null; then
@@ -935,16 +1171,16 @@ set -euo pipefail
 run_dir={remote_run_dir}
 project={qths_binary_dir}
 {readiness_diagnostics}
- /usr/bin/python3 "$run_dir/capture_nic_counters.py" {receiver_device} {ethtool_path} "$run_dir/nic-before.json"
+/usr/bin/python3 "$run_dir/capture_nic_counters.py" {receiver_device} {ethtool_path} "$run_dir/nic-before.json"
 {reader_start}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" "$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{' --debug' if plan.receiver_diagnostics else ''} >"$run_dir/receiver.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {numa_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{shard_args}{' --debug' if plan.receiver_diagnostics else ''} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
-  if grep -q 'Initialization complete, ready to start' "$run_dir/receiver.log"; then
+  if grep -q 'Receive threads ready' "$run_dir/receiver.log"; then
     touch "$run_dir/pipeline.ready"
     exit 0
   fi
@@ -1075,6 +1311,10 @@ summary = {{
 '''
     worker_argv: list[str] = []
     if not receive_only:
+        if plan.numa_node is not None:
+            worker_argv += [
+                "/usr/bin/numactl", f"--membind={plan.numa_node}"
+            ]
         if plan.worker_cpu_list is not None:
             worker_argv += ["/usr/bin/taskset", "-c", plan.worker_cpu_list]
         worker_argv += [
@@ -1083,6 +1323,14 @@ summary = {{
             "--reorder-horizon-groups", str(plan.reorder_horizon_groups),
             "--ready-file", f"{remote_run_dir}/worker.ready",
         ]
+        if plan.unpack_missing_per_second:
+            worker_argv += ["--diagnostics", "missing-per-second"]
+        if plan.unpack_start_delay_seconds:
+            worker_argv += ["--pre-timeline-policy", "discard"]
+        if plan.packets_per_second:
+            worker_argv += [
+                "--groups-per-second", str(plan.packets_per_second)
+            ]
     bundle: dict[str, str | bytes] = dict(plan.artifact_files)
     bundle.update({
         "supervise.py": supervise,
@@ -1289,6 +1537,7 @@ class SshBackend:
         self._capability_added = False
         self._sender_processes: list[Any] = []
         self._sender_endpoints: list[tuple[str, str, int]] = []
+        self._sender_specs: list[SenderSpec] = []
         self._compute_consumer = "dbdisk"
         self._pipeline_stage = "full"
         self._psrdada_paths = {
@@ -1297,6 +1546,7 @@ class SshBackend:
             "dada_dbnull": "dada_dbnull",
         }
         self._diagnostic_paths = {"ethtool": "ethtool"}
+        self._sender_ethtool_paths: dict[str, str] = {}
 
     def observation_compiler(
         self, compiler: pathlib.Path, run_directory: pathlib.Path
@@ -1368,7 +1618,8 @@ class SshBackend:
         self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
         if self.known_hosts.exists():
             self.known_hosts.unlink()
-        for host in ("qths1", "qtpulsar1", "qtpulsar2"):
+        self._sender_specs = sender_specs_for_plan(plan, identity)
+        for host in ("qths1", *(spec.host for spec in self._sender_specs)):
             self._bootstrap_host(host)
         start = self._future_start_utc("PREPARE")
         self.preparation = {
@@ -1381,6 +1632,19 @@ class SshBackend:
         bundle_root = self.local_run_dir / "bundle"
         qths_root = bundle_root / "qths"
         qths_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._sender_specs = sender_specs_for_plan(plan, self.remote_run_dir)
+        except ValueError as error:
+            raise StageError(
+                "CONFIG_READY", ["validate", "station_ids"], 1,
+                json.dumps(plan.source.get("observation", {}).get("station_ids", [])),
+                str(error),
+            ) from error
+        receiver_flows = (
+            [f"{spec.source_ip}:{spec.source_port}"
+             for spec in self._sender_specs]
+            if plan.receiver_shards > 1 else []
+        )
         for name, content in build_qths_bundle(
             plan,
             self.remote_run_dir,
@@ -1389,6 +1653,7 @@ class SshBackend:
             self._psrdada_paths["dada_dbnull"],
             str(self.qths_binary_dir),
             self._diagnostic_paths["ethtool"],
+            receiver_flows,
         ).items():
             path = qths_root / name
             if isinstance(content, bytes):
@@ -1397,27 +1662,16 @@ class SshBackend:
                 path.write_text(content)
             if path.suffix == ".sh":
                 path.chmod(0o755)
-        sender_a_port, sender_b_port = derive_sender_source_ports(
-            self.remote_run_dir
-        )
-        stations = plan.source.get("observation", {}).get("station_ids", [])
-        if len(stations) != 2:
-            raise StageError(
-                "CONFIG_READY", ["validate", "station_ids"], 1,
-                json.dumps(stations),
-                "Task 8C topology requires exactly two Stations",
-            )
-        sender_specs = (
-            (stations[0], "qtpulsar1", "174.0.1.100", sender_a_port, "sender101.json"),
-            (stations[1], "qtpulsar2", "174.0.1.101", sender_b_port, "sender102.json"),
-        )
         self._sender_endpoints = []
-        for station, host, source_ip, source_port, name in sender_specs:
-            self._sender_endpoints.append((host, source_ip, source_port))
-            (bundle_root / name).write_text(
+        for spec in self._sender_specs:
+            self._sender_endpoints.append(
+                (spec.host, spec.source_ip, spec.source_port)
+            )
+            (bundle_root / spec.bundle_name).write_text(
                 json.dumps(
                     build_sender_config(
-                        plan, station, source_ip, source_port, start_utc
+                        plan, spec.station_id, spec.source_ip,
+                        spec.source_port, start_utc
                     ),
                     indent=2,
                 )
@@ -1463,10 +1717,17 @@ class SshBackend:
         for tool in required_psrdada_tools:
             self._psrdada_paths[tool] = self._resolve_psrdada_tool(tool)
         self._diagnostic_paths["ethtool"] = self._resolve_executable(
-            "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool")
+            "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"), "qths1"
         )
+        self._sender_ethtool_paths = {
+            spec.host: self._resolve_executable(
+                "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"),
+                spec.host,
+            )
+            for spec in self._sender_specs
+        }
         bundle_root = self._write_bundle(plan, str(preparation["start_utc"]))
-        for host in ("qths1", "qtpulsar1", "qtpulsar2"):
+        for host in ("qths1", *(spec.host for spec in self._sender_specs)):
             self._ssh(host, ["mkdir", "-p", self.remote_run_dir], "CONFIG_READY")
         probe_hashes: dict[str, str] = {}
         probe_path = bundle_root / "probe_sender_endpoint.py"
@@ -1493,6 +1754,28 @@ class SshBackend:
                 )
             probe_hashes[f"{host}:probe_sender_endpoint.py"] = local_probe_sha
             self._preflight_sender_endpoint(host, source_ip, source_port)
+        capture_path = bundle_root / "qths" / "capture_nic_counters.py"
+        local_capture_sha = self.transport.run(
+            ["sha256sum", str(capture_path)], "CONFIG_READY", True
+        ).stdout.split()[0]
+        for spec in self._sender_specs:
+            remote_capture = f"{self.remote_run_dir}/capture_nic_counters.py"
+            self.transport.run(
+                self._scp_argv(str(capture_path), f"{spec.host}:{remote_capture}"),
+                "CONFIG_READY", True,
+            )
+            remote_capture_sha = self._ssh(
+                spec.host, ["sha256sum", remote_capture], "CONFIG_READY"
+            ).stdout.split()[0]
+            if local_capture_sha != remote_capture_sha:
+                raise StageError(
+                    "CONFIG_READY", ["sha256sum", spec.host, remote_capture],
+                    1, f"local={local_capture_sha} remote={remote_capture_sha}",
+                    "sender NIC capture SHA mismatch",
+                )
+            probe_hashes[f"{spec.host}:capture_nic_counters.py"] = (
+                local_capture_sha
+            )
         qths_files = sorted((bundle_root / "qths").iterdir())
         qths_hashes: dict[str, str] = {}
         for path in qths_files:
@@ -1523,8 +1806,11 @@ class SshBackend:
         hashes.update(self._transfer_sender_configs(bundle_root))
         binaries = [
             ("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),
-            ("qtpulsar1", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
-            ("qtpulsar2", "fpga_sender_sim", self.sender_binary_dir / "fpga_sender_sim"),
+            *(
+                (spec.host, "fpga_sender_sim",
+                 self.sender_binary_dir / "fpga_sender_sim")
+                for spec in self._sender_specs
+            ),
         ]
         if plan.uses_unpack_worker:
             binaries.insert(
@@ -1578,12 +1864,35 @@ class SshBackend:
             )
         binary_hashes["qths1:ethtool"] = output[0]
         binary_paths["qths1:ethtool"] = ethtool_path
+        for host, sender_ethtool_path in self._sender_ethtool_paths.items():
+            output = self._ssh(
+                host, ["sha256sum", sender_ethtool_path], "CONFIG_READY"
+            ).stdout.split()
+            if not output:
+                raise StageError(
+                    "CONFIG_READY", ["sha256sum", host, sender_ethtool_path],
+                    1, "", "missing sender ethtool SHA256",
+                )
+            binary_hashes[f"{host}:ethtool"] = output[0]
+            binary_paths[f"{host}:ethtool"] = sender_ethtool_path
         preflight_argv = [
             str(self.qths_binary_dir / "rdma2dada"),
             "--plan",
             f"{self.remote_run_dir}/resolved_observation.json",
             "--preflight-only",
         ]
+        preflight_argv += ["--receiver-shards", str(plan.receiver_shards)]
+        if plan.receiver_poll_cpu_list:
+            preflight_argv += ["--poll-cpus", plan.receiver_poll_cpu_list]
+        elif plan.receiver_poll_cpu is not None:
+            preflight_argv += ["--poll-cpu", str(plan.receiver_poll_cpu)]
+        if plan.receiver_copy_cpu is not None:
+            preflight_argv += ["--copy-cpu", str(plan.receiver_copy_cpu)]
+        if plan.receiver_shards > 1:
+            for spec in self._sender_specs:
+                preflight_argv += [
+                    "--receiver-flow", f"{spec.source_ip}:{spec.source_port}"
+                ]
         receiver_preflight = self._ssh(
             "qths1", preflight_argv, "CONFIG_READY"
         )
@@ -1627,23 +1936,41 @@ class SshBackend:
         )
 
     def _resolve_executable(
-        self, tool: str, candidates: Sequence[str]
+        self, tool: str, candidates: Sequence[str], host: str = "qths1"
     ) -> str:
         discovered = self._ssh(
-            "qths1", ["which", tool], "CONFIG_READY", check=False
+            host, ["which", tool], "CONFIG_READY", check=False
         )
         if discovered.returncode == 0 and discovered.stdout.strip():
             return discovered.stdout.strip().splitlines()[0]
         for candidate in candidates:
             executable = self._ssh(
-                "qths1", ["test", "-x", candidate], "CONFIG_READY", check=False
+                host, ["test", "-x", candidate], "CONFIG_READY", check=False
             )
             if executable.returncode == 0:
                 return candidate
         raise StageError(
-            "CONFIG_READY", ["which", tool], 1, "",
+            "CONFIG_READY", ["which", host, tool], 1, "",
             f"required executable is unavailable: {tool}", "ENV_BLOCKED",
         )
+
+    def _capture_sender_nic(self, phase: str) -> None:
+        if phase not in ("before", "after"):
+            raise ValueError("sender NIC capture phase must be before or after")
+        for spec in self._sender_specs:
+            self._ssh(
+                spec.host,
+                [
+                    "/usr/bin/python3",
+                    f"{self.remote_run_dir}/capture_nic_counters.py",
+                    "mlx5_0",
+                    self._sender_ethtool_paths.get(
+                        spec.host, "/usr/sbin/ethtool"
+                    ),
+                    f"{self.remote_run_dir}/sender-nic-{phase}.json",
+                ],
+                "SENDERS_WAITING" if phase == "before" else "COLLECTING",
+            )
 
     def _future_start_utc(self, stage: str) -> str:
         epoch_text = self._ssh(
@@ -1665,12 +1992,11 @@ class SshBackend:
         ).strftime("%Y-%m-%d-%H:%M:%S")
 
     def _transfer_sender_configs(self, bundle_root: pathlib.Path) -> dict[str, str]:
-        sender_targets = (
-            (bundle_root / "sender101.json", "qtpulsar1", "101.json"),
-            (bundle_root / "sender102.json", "qtpulsar2", "102.json"),
-        )
         hashes: dict[str, str] = {}
-        for path, host, remote_name in sender_targets:
+        for spec in self._sender_specs:
+            path = bundle_root / spec.bundle_name
+            host = spec.host
+            remote_name = spec.remote_name
             self.transport.run(
                 self._scp_argv(str(path), f"{host}:{self.remote_run_dir}/{remote_name}"),
                 "CONFIG_READY",
@@ -1808,21 +2134,13 @@ class SshBackend:
                     "refreshed start_utc margin is below 90 seconds",
                     "ENV_BLOCKED",
                 )
+        self._capture_sender_nic("before")
         binary = str(self.sender_binary_dir / "fpga_sender_sim")
-        commands = (
-            (
-                "qtpulsar1",
-                f"{self.remote_run_dir}/101.json",
-                run_dir / "sender101.log",
-            ),
-            (
-                "qtpulsar2",
-                f"{self.remote_run_dir}/102.json",
-                run_dir / "sender102.log",
-            ),
-        )
         started: list[Any] = []
-        for host, config, log in commands:
+        for spec in self._sender_specs:
+            host = spec.host
+            config = f"{self.remote_run_dir}/{spec.remote_name}"
+            log = run_dir / spec.log_name
             argv = build_ssh_argv(
                 host, [binary, config], str(self.known_hosts)
             )
@@ -1904,6 +2222,7 @@ class SshBackend:
                 )
             if not completed_any:
                 time.sleep(0.02)
+        self._capture_sender_nic("after")
         return outputs
 
     def collect(self, plan: RatePlan, run_dir: pathlib.Path) -> dict[str, Any]:
@@ -1970,6 +2289,26 @@ class SshBackend:
             json.loads((qths_copy / "nic-before.json").read_text()),
             json.loads((qths_copy / "nic-after.json").read_text()),
         )
+        sender_nic = {}
+        for spec in self._sender_specs:
+            sender_copy = run_dir / spec.host
+            sender_copy.mkdir(exist_ok=True)
+            snapshots = {}
+            for phase in ("before", "after"):
+                name = f"sender-nic-{phase}.json"
+                local_path = sender_copy / name
+                self.transport.run(
+                    self._scp_argv(
+                        f"{spec.host}:{self.remote_run_dir}/{name}",
+                        str(local_path),
+                    ),
+                    "COLLECTING", True,
+                )
+                snapshots[phase] = json.loads(local_path.read_text())
+            sender_nic[spec.host] = nic_counter_evidence(
+                snapshots["before"], snapshots["after"]
+            )
+        statistics["sender_nic"] = sender_nic
         return statistics
 
     def cleanup(self, resources: RunResources, run_dir: pathlib.Path) -> dict[str, Any]:
@@ -2066,7 +2405,7 @@ class SshBackend:
                 record_nonzero(completed)
             except Exception as error:
                 errors.append(repr(error))
-        for host in ("qtpulsar1", "qtpulsar2"):
+        for host in dict.fromkeys(spec.host for spec in self._sender_specs):
             if self.remote_run_dir:
                 try:
                     completed = self._ssh(
@@ -2151,14 +2490,18 @@ def _validate_sender(
 def _validate_statistics(
     statistics: dict[str, Any], plan: RatePlan, expected_sample_prefix: str
 ) -> None:
-    expected_records = plan.group_count * plan.nant
+    expected_receiver_records = plan.sender_group_count * plan.nant
+    expected_unpack_records = plan.group_count * plan.nant
     expected_data_bytes = plan.group_count * plan.payload_bytes * plan.nant
     required = {
-        ("receiver", "accepted"): expected_records,
-        ("receiver", "published"): expected_records,
         ("receiver", "wrong_length"): 0,
         ("receiver", "cq_errors"): 0,
     }
+    if not plan.unpack_start_delay_seconds:
+        required.update({
+            ("receiver", "accepted"): expected_receiver_records,
+            ("receiver", "published"): expected_receiver_records,
+        })
     if plan.pipeline_stage == "receive":
         required.update({
             ("raw", "consumer"): "dada_dbnull",
@@ -2168,8 +2511,8 @@ def _validate_statistics(
         })
     else:
         required.update({
-            ("unpack", "records"): expected_records,
-            ("unpack", "accepted"): expected_records,
+            ("unpack", "records"): expected_unpack_records,
+            ("unpack", "accepted"): expected_unpack_records,
             ("unpack", "bad_header"): 0,
             ("unpack", "invalid_data"): 0,
             ("unpack", "unknown_station"): 0,
@@ -2207,6 +2550,23 @@ def _validate_statistics(
             }
         )
     mismatches = []
+    if plan.unpack_start_delay_seconds:
+        receiver = statistics.get("receiver", {})
+        accepted = int(receiver.get("accepted", -1))
+        published = int(receiver.get("published", -2))
+        if (
+            accepted != published
+            or accepted < expected_unpack_records
+            or accepted > expected_receiver_records
+        ):
+            mismatches.append({
+                "field": "receiver.preparation_range",
+                "expected": (
+                    f"accepted=published in "
+                    f"[{expected_unpack_records},{expected_receiver_records}]"
+                ),
+                "actual": {"accepted": accepted, "published": published},
+            })
     for (section, key), expected in required.items():
         actual = statistics.get(section, {}).get(key)
         if actual != expected:
@@ -2217,6 +2577,7 @@ def _validate_statistics(
         performance_fields = {
             "receiver.accepted",
             "receiver.published",
+            "receiver.preparation_range",
             "unpack.records",
             "unpack.accepted",
             "unpack.complete_groups",
@@ -2266,6 +2627,52 @@ def _parse_receiver_statistics(
         "cq_tail_records": int(receiver_match.group(6)),
         "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
     }
+    pipeline_match = re.search(
+        r"Receive pipeline summary:\s*poll_calls=(\d+),\s*"
+        r"empty_polls=(\d+),\s*full_polls=(\d+),\s*"
+        r"reposted_wrs=(\d+),\s*repost_failures=(\d+),\s*"
+        r"copy_batches=(\d+),\s*min_posted_wrs=(\d+),\s*"
+        r"completion_queue_high_watermark=(\d+),\s*"
+        r"recycle_queue_high_watermark=(\d+),\s*"
+        r"completion_to_recycle_ns_total=(\d+),\s*"
+        r"completion_to_recycle_ns_max=(\d+)",
+        receiver_log,
+    )
+    if pipeline_match:
+        result["pipeline"] = dict(zip(
+            (
+                "poll_calls", "empty_polls", "full_polls",
+                "reposted_wrs", "repost_failures", "copy_batches",
+                "min_posted_wrs", "completion_queue_high_watermark",
+                "recycle_queue_high_watermark",
+                "completion_to_recycle_ns_total",
+                "completion_to_recycle_ns_max",
+            ),
+            (int(value) for value in pipeline_match.groups()),
+        ))
+    shard_pattern = re.compile(
+        r"\[RDMA\] Receive shard summary:\s*shard=(\d+),\s*"
+        r"poll_calls=(\d+),\s*empty_polls=(\d+),\s*"
+        r"full_polls=(\d+),\s*completions=(\d+),\s*"
+        r"reposted_wrs=(\d+),\s*repost_failures=(\d+),\s*"
+        r"min_posted_wrs=(\d+),\s*"
+        r"completion_queue_high_watermark=(\d+),\s*"
+        r"recycle_queue_high_watermark=(\d+)"
+    )
+    shards = [
+        dict(zip(
+            (
+                "shard", "poll_calls", "empty_polls", "full_polls",
+                "completions", "reposted_wrs", "repost_failures",
+                "min_posted_wrs", "completion_queue_high_watermark",
+                "recycle_queue_high_watermark",
+            ),
+            (int(value) for value in match.groups()),
+        ))
+        for match in shard_pattern.finditer(receiver_log)
+    ]
+    if shards:
+        result["shards"] = shards
     diagnostic_pattern = re.compile(
         r"\[RDMA_DIAG\]\s+sample=(\d+)\s+elapsed_ns=(\d+)\s+"
         r"poll_calls=(\d+)\s+empty_polls=(\d+)\s+completions=(\d+)\s+"
@@ -2537,10 +2944,13 @@ class RatePointController:
 
     def _manifest(self, plan: RatePlan) -> dict[str, Any]:
         controller_path = pathlib.Path(__file__).resolve()
+        sender_hosts = [
+            spec.host for spec in sender_specs_for_plan(plan, self.run_id)
+        ]
         return {
             "run_id": self.run_id,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "hosts": ["HF", "qths1", "qtpulsar1", "qtpulsar2"],
+            "hosts": ["HF", "qths1", *sender_hosts],
             "plan": plan.as_dict(),
             "controller": str(controller_path),
             "controller_sha256": hashlib.sha256(controller_path.read_bytes()).hexdigest(),
@@ -3031,10 +3441,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--worker-cpu-list",
         help="optional Linux CPU list passed to taskset for vdif_unpack_worker",
     )
+    parser.add_argument("--sink-cpu-list")
+    parser.add_argument("--receiver-poll-cpu", type=int)
+    parser.add_argument(
+        "--receiver-poll-cpu-list",
+        help="comma-separated poll CPU, one per receiver shard",
+    )
+    parser.add_argument("--receiver-copy-cpu", type=int)
+    parser.add_argument("--receiver-shards", type=int, default=1)
+    parser.add_argument("--numa-node", type=int)
     parser.add_argument("--receiver-send-n", type=int, default=64)
-    parser.add_argument("--receiver-nsge", type=int, default=4)
-    parser.add_argument("--receiver-poll-batch", type=int, default=8)
-    parser.add_argument("--receiver-wr-num", type=int, default=0)
+    parser.add_argument("--receiver-nsge", type=int, default=1)
+    parser.add_argument("--receiver-poll-batch", type=int, default=32)
+    parser.add_argument("--receiver-wr-num", type=int, default=1024)
+    parser.add_argument(
+        "--station-id",
+        type=int,
+        choices=(101, 102),
+        help="run receive-only with one selected Station",
+    )
+    parser.add_argument(
+        "--sender-source-port",
+        type=int,
+        help="source UDP port for an explicitly selected Station",
+    )
     parser.add_argument(
         "--receiver-diagnostics",
         action="store_true",
@@ -3044,6 +3474,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--unpack-missing-per-second",
         action="store_true",
         help="enable opt-in VDIF missing-packet counts by expected second",
+    )
+    parser.add_argument(
+        "--unpack-start-delay-seconds",
+        type=int,
+        default=0,
+        help=(
+            "start sender this many whole VDIF/actual seconds before the "
+            "formal acceptance timeline (receive/unpack with dbnull)"
+        ),
     )
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -3102,12 +3541,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         missing_wait_ms=args.missing_wait_ms,
         station_skew_reserve_ms=args.station_skew_reserve_ms,
         worker_cpu_list=args.worker_cpu_list,
+        sink_cpu_list=args.sink_cpu_list,
+        receiver_poll_cpu=args.receiver_poll_cpu,
+        receiver_poll_cpu_list=args.receiver_poll_cpu_list,
+        receiver_copy_cpu=args.receiver_copy_cpu,
+        receiver_shards=args.receiver_shards,
+        numa_node=args.numa_node,
         receiver_send_n=args.receiver_send_n,
         receiver_nsge=args.receiver_nsge,
         receiver_poll_batch=args.receiver_poll_batch,
         receiver_wr_num=args.receiver_wr_num,
         receiver_diagnostics=args.receiver_diagnostics,
         unpack_missing_per_second=args.unpack_missing_per_second,
+        unpack_start_delay_seconds=args.unpack_start_delay_seconds,
+        station_id=args.station_id,
+        sender_source_port=args.sender_source_port,
     )
     if args.dry_run:
         request.validate()

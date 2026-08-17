@@ -1,13 +1,18 @@
 //定义 RoCEv2Dada 类的成员函数，用于通过 RoCEv2 协议进行数据发送和接收
 #include <infiniband/verbs.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <sys/time.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <stdio.h>
+
+#include <vector>
+#include <algorithm>
 
 #include "rdma_dada/io/rdma/receiver.h"
 #include "rdma_dada/io/rdma/receive_policy.h"
@@ -88,24 +93,102 @@ static void log_fatal_receive_completion(
     }
 }
 
-static int repost_receive_wr(struct ibv_utils_res *ibv_res_ptr,
-                             uint64_t wr_id)
+static int post_receive_batch(
+    struct ibv_utils_res *ibv_res_ptr,
+    const rdma_dada::io::rdma::ReceiveWorkItem *items,
+    size_t count)
 {
-    ibv_res_ptr->recv_wr->wr_id = wr_id;
-    ibv_res_ptr->recv_wr->sg_list =
-        &ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge];
-    ibv_res_ptr->recv_wr->num_sge = ibv_res_ptr->recv_nsge;
-    ibv_res_ptr->recv_wr->next = NULL;
+    if (count == 0) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t wr_id = items[i].wr_id;
+        if (wr_id >= static_cast<uint64_t>(ibv_res_ptr->recv_wr_num)) {
+            fprintf(stderr, "[ERROR] Invalid receive WR id=%" PRIu64 ".\n",
+                    wr_id);
+            return -1;
+        }
+        struct ibv_recv_wr *wr = &ibv_res_ptr->recv_wr[wr_id];
+        memset(wr, 0, sizeof(*wr));
+        wr->wr_id = wr_id;
+        wr->sg_list = &ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge];
+        wr->num_sge = ibv_res_ptr->recv_nsge;
+        wr->next = i + 1 < count
+            ? &ibv_res_ptr->recv_wr[items[i + 1].wr_id]
+            : NULL;
+    }
+    struct ibv_recv_wr *first =
+        &ibv_res_ptr->recv_wr[items[0].wr_id];
     const int ret = ibv_post_recv(ibv_res_ptr->qp,
-                                  ibv_res_ptr->recv_wr,
+                                  first,
                                   &ibv_res_ptr->bad_recv_wr);
     if (ret != 0) {
         fprintf(stderr,
-                "[ERROR] Failed to repost receive WR wr_id=%" PRIu64
-                ": ret=%d, errno=%d (%s)\n",
-                wr_id, ret, errno, strerror(errno));
+                "[ERROR] Failed to post receive WR batch: count=%zu, "
+                "ret=%d, errno=%d (%s)\n",
+                count, ret, errno, strerror(errno));
     }
     return ret;
+}
+
+struct ReceiveShardState {
+    ReceiveShardState(RoCEv2Dada *owner_value,
+                      struct ibv_utils_res *resource_value,
+                      std::size_t wr_depth, std::size_t index_value)
+        : owner(owner_value), resource(resource_value), index(index_value),
+          completed(wr_depth), recycle(wr_depth), poll_done(false),
+          poll_thread_started(false), poll_calls(0), empty_polls(0),
+          completions(0), full_polls(0), reposted(0), repost_failures(0),
+          posted_wrs(wr_depth), min_posted_wrs(wr_depth) {}
+
+    RoCEv2Dada *owner;
+    struct ibv_utils_res *resource;
+    std::size_t index;
+    rdma_dada::io::rdma::ReceiveSpscQueue completed;
+    rdma_dada::io::rdma::ReceiveSpscQueue recycle;
+    pthread_t poll_tid;
+    std::atomic<bool> poll_done;
+    bool poll_thread_started;
+    std::atomic<std::uint64_t> poll_calls;
+    std::atomic<std::uint64_t> empty_polls;
+    std::atomic<std::uint64_t> completions;
+    std::atomic<std::uint64_t> full_polls;
+    std::atomic<std::uint64_t> reposted;
+    std::atomic<std::uint64_t> repost_failures;
+    std::atomic<std::uint64_t> posted_wrs;
+    std::atomic<std::uint64_t> min_posted_wrs;
+};
+
+struct RoCEv2Dada::ReceivePipelineState {
+    ReceivePipelineState()
+        : copy_done(false), failed(false), copy_thread_started(false),
+          copy_batches(0), completion_to_recycle_ns_total(0),
+          completion_to_recycle_ns_max(0) {}
+
+    std::vector<ReceiveShardState *> shards;
+    pthread_t copy_tid;
+    std::atomic<bool> copy_done;
+    std::atomic<bool> failed;
+    bool copy_thread_started;
+    std::atomic<std::uint64_t> copy_batches;
+    std::atomic<std::uint64_t> completion_to_recycle_ns_total;
+    std::atomic<std::uint64_t> completion_to_recycle_ns_max;
+};
+
+static void update_atomic_min(std::atomic<std::uint64_t> *target,
+                              std::uint64_t value) {
+    std::uint64_t observed = target->load(std::memory_order_relaxed);
+    while (value < observed &&
+           !target->compare_exchange_weak(observed, value,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {}
+}
+
+static void update_atomic_max(std::atomic<std::uint64_t> *target,
+                              std::uint64_t value) {
+    std::uint64_t observed = target->load(std::memory_order_relaxed);
+    while (value > observed &&
+           !target->compare_exchange_weak(observed, value,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {}
 }
 
 static int check_send_recv_info(struct ibv_utils_res * ibv_res_ptr, RoCEv2Dada::RdmaParam * Param_ptr)
@@ -150,12 +233,14 @@ static int check_send_recv_info(struct ibv_utils_res * ibv_res_ptr, RoCEv2Dada::
     printf("**********************************************\n");
     
     if (Param_ptr->pkt_size <= PKT_HEAD_LEN || Param_ptr->send_n == 0 ||
-        Param_ptr->bind_cpu_id < -1) {
+        Param_ptr->poll_cpu_id < -1 || Param_ptr->copy_cpu_id < -1 ||
+        (Param_ptr->poll_cpu_id >= 0 &&
+         Param_ptr->poll_cpu_id == Param_ptr->copy_cpu_id)) {
         fprintf(stderr,
                 "[ERROR] Invalid RDMA geometry: pkt_size=%u, send_n=%u, "
-                "bind_cpu_id=%d.\n",
+                "poll_cpu_id=%d, copy_cpu_id=%d.\n",
                 Param_ptr->pkt_size, Param_ptr->send_n,
-                Param_ptr->bind_cpu_id);
+                Param_ptr->poll_cpu_id, Param_ptr->copy_cpu_id);
         return -1;
     }
     return 0;
@@ -179,7 +264,8 @@ static int ib_send_pkg(struct ibv_utils_res * ibv_res, int send_idx, int send_nu
 }
 
 RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
-    : param(Param), ibv_res(NULL), stop_requested(false),
+    : param(Param), ibv_res(NULL), receive_pipeline(NULL),
+      stop_requested(false),
       accepted_receive_packets(0), wrong_length_receive_packets(0),
       published_receive_packets(0), published_receive_blocks(0),
       partial_receive_blocks(0), cq_tail_receive_records(0),
@@ -207,6 +293,25 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
                 this->param.pkt_size, this->param.send_n);
         return;
     }
+    if (!this->param.SendOrRecv) {
+        if (this->param.receive_shards == 0) this->param.receive_shards = 1;
+        if (this->param.poll_cpu_ids.empty() &&
+            this->param.poll_cpu_id >= 0) {
+            this->param.poll_cpu_ids.push_back(this->param.poll_cpu_id);
+        }
+        if (((this->param.receive_shards > 1 ||
+              !this->param.receive_flows.empty()) &&
+             this->param.receive_flows.size() !=
+                 this->param.receive_shards) ||
+            (!this->param.poll_cpu_ids.empty() &&
+             this->param.poll_cpu_ids.size() !=
+                 this->param.receive_shards)) {
+            fprintf(stderr,
+                    "[ERROR] Receive flow/CPU counts must match "
+                    "receive_shards=%u.\n", this->param.receive_shards);
+            return;
+        }
+    }
     
     if (this->param.SendOrRecv) {
         sscanf(this->param.SAddr, "%hhd.%hhd.%hhd.%hhd",
@@ -229,6 +334,17 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
                                &ibv_res_ptr->pkt_info.dst_mac[2], &ibv_res_ptr->pkt_info.dst_mac[3],
                                &ibv_res_ptr->pkt_info.dst_mac[4], &ibv_res_ptr->pkt_info.dst_mac[5]);
     sscanf(this->param.dst_port, "%hd", &ibv_res_ptr->pkt_info.dst_port);
+    if (!this->param.SendOrRecv && !this->param.receive_flows.empty()) {
+        const rdma_dada::io::rdma::ReceiveFlowSpec& flow =
+            this->param.receive_flows.front();
+        struct in_addr source_address = {};
+        if (inet_pton(AF_INET, flow.source_ip.c_str(), &source_address) != 1) {
+            fprintf(stderr, "[ERROR] Invalid receive flow source IP.\n");
+            return;
+        }
+        ibv_res_ptr->pkt_info.src_ip = source_address.s_addr;
+        ibv_res_ptr->pkt_info.src_port = flow.source_port;
+    }
 
     if (this->param.SendOrRecv) {
         printf("[RoCEv2Dada] Network params parsed: source -> "
@@ -288,7 +404,9 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
     
     printf("[RoCEv2Dada] Creating IB resources... (SendOrRecv=%d)\n", this->param.SendOrRecv);
     fflush(stdout);
-    unsigned int nsge = this->param.nsge ? this->param.nsge : 4;
+    unsigned int nsge = this->param.nsge
+        ? this->param.nsge
+        : rdma_dada::io::rdma::kDefaultReceiveNsge;
     ibv_res_ptr->recv_nsge = nsge;
     ibv_res_ptr->send_nsge = nsge;
     if(this->param.SendOrRecv) {
@@ -372,26 +490,93 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
         printf("Create flow successfully.\n");
         
         printf("[RoCEv2Dada] Posting receive work requests... (work_num=%d)\n", work_num);
-        int posted = 0;
-        for(int i = 0; i < work_num; i++) {
-            ibv_res_ptr->recv_wr->wr_id = i;
-            ibv_res_ptr->recv_wr->sg_list = &ibv_res_ptr->sge[i*ibv_res_ptr->recv_nsge];
-            ibv_res_ptr->recv_wr->num_sge = ibv_res_ptr->recv_nsge;
-            ibv_res_ptr->recv_wr->next = NULL;
-            ret = ibv_post_recv(ibv_res_ptr->qp, ibv_res_ptr->recv_wr, &ibv_res_ptr->bad_recv_wr);
-            if (ret != 0) {
-                fprintf(stderr, "[ERROR] ibv_post_recv failed at i=%d, ret=%d, errno=%d (%s)\n",
-                        i, ret, errno, strerror(errno));
+        std::vector<rdma_dada::io::rdma::ReceiveWorkItem> initial_work(
+            static_cast<std::size_t>(work_num));
+        for (int i = 0; i < work_num; ++i) {
+            initial_work[static_cast<std::size_t>(i)].wr_id =
+                static_cast<std::uint64_t>(i);
+            initial_work[static_cast<std::size_t>(i)].completion_ns = 0;
+        }
+        ret = post_receive_batch(ibv_res_ptr, initial_work.data(),
+                                 initial_work.size());
+        if (ret != 0) return;
+        printf("  Posted %d/%d receive WRs... Done!\n", work_num, work_num);
+        fflush(stdout);
+
+        receive_resources.push_back(ibv_res_ptr);
+        for (unsigned int shard_index = 1;
+             shard_index < this->param.receive_shards; ++shard_index) {
+            struct ibv_utils_res *shard =
+                static_cast<struct ibv_utils_res *>(
+                    calloc(1, sizeof(struct ibv_utils_res)));
+            if (!shard) {
+                fprintf(stderr, "[ERROR] Failed to allocate receive shard.\n");
                 return;
             }
-            posted++;
-            if (i % 1024 == 0 && i > 0) {
-                printf("  Posted %d/%d receive WRs...\r", i, work_num);
-                fflush(stdout);
+            shard->pkt_size = ibv_res_ptr->pkt_size;
+            shard->poll_n = ibv_res_ptr->poll_n;
+            shard->recv_nsge = ibv_res_ptr->recv_nsge;
+            shard->send_nsge = ibv_res_ptr->send_nsge;
+            shard->pkt_info = ibv_res_ptr->pkt_info;
+            if (!this->param.receive_flows.empty()) {
+                const rdma_dada::io::rdma::ReceiveFlowSpec& flow =
+                    this->param.receive_flows[shard_index];
+                struct in_addr source_address = {};
+                if (inet_pton(AF_INET, flow.source_ip.c_str(),
+                              &source_address) != 1) {
+                    fprintf(stderr, "[ERROR] Invalid receive shard IP.\n");
+                    free(shard);
+                    return;
+                }
+                shard->pkt_info.src_ip = source_address.s_addr;
+                shard->pkt_info.src_port = flow.source_port;
             }
+            if (open_ib_device(this->param.device_id, shard) < 0 ||
+                create_ib_res(shard, 0, work_num) < 0 ||
+                init_ib_res(shard) < 0) {
+                fprintf(stderr,
+                        "[ERROR] Failed to initialize receive shard %u.\n",
+                        shard_index);
+                receive_resources.push_back(shard);
+                return;
+            }
+            shard->mem_buf = static_cast<unsigned char *>(malloc(buf_size));
+            if (!shard->mem_buf ||
+                register_memory(shard, shard->mem_buf, buf_size,
+                                shard->pkt_size) < 0 ||
+                create_flow(shard, &shard->pkt_info) < 0) {
+                fprintf(stderr,
+                        "[ERROR] Failed to prepare receive shard %u.\n",
+                        shard_index);
+                receive_resources.push_back(shard);
+                return;
+            }
+            std::vector<rdma_dada::io::rdma::ReceiveWorkItem> shard_work(
+                static_cast<std::size_t>(work_num));
+            for (int wr = 0; wr < work_num; ++wr) {
+                shard_work[static_cast<std::size_t>(wr)] = {
+                    static_cast<std::uint64_t>(wr), 0};
+            }
+            if (post_receive_batch(shard, shard_work.data(),
+                                   shard_work.size()) != 0) {
+                receive_resources.push_back(shard);
+                return;
+            }
+            shard->init_flag = true;
+            receive_resources.push_back(shard);
+            printf("[RDMA] Receive shard %u initialized with %d WRs.\n",
+                   shard_index, work_num);
         }
-        printf("  Posted %d/%d receive WRs... Done!\n", posted, work_num);
-        fflush(stdout);
+        receive_pipeline = new ReceivePipelineState();
+        if (!receive_pipeline) return;
+        for (std::size_t shard_index = 0;
+             shard_index < receive_resources.size(); ++shard_index) {
+            receive_pipeline->shards.push_back(new ReceiveShardState(
+                this,
+                static_cast<struct ibv_utils_res *>(
+                    receive_resources[shard_index]),
+                static_cast<std::size_t>(work_num), shard_index));
+        }
     }
     
     printf("[RoCEv2Dada] Checking send/recv info...\n");
@@ -408,376 +593,297 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam & Param)
 
 void * RoCEv2Dada::SendRecvThread(void *arg)
 {
-    size_t total_recv = 0;
-    size_t total_recv_pre = 0;
-    int ret = 0;
-    RoCEv2Dada * this_ptr = (RoCEv2Dada *)arg;
-    struct ibv_utils_res * ibv_res_ptr = (struct ibv_utils_res *)this_ptr->ibv_res;
-    
-    if (this_ptr->param.debug_mode) {
-        printf("[DEBUG] SendRecvThread started (tid=%lu)\n", (unsigned long)pthread_self());
-        fflush(stdout);
-    }
-    struct timespec ts_start;
-    struct timespec ts_now;
-    struct timespec diagnostic_start = {};
-    struct timespec diagnostic_last = {};
-    uint64_t ns_elapsed;
-    uint64_t diagnostic_sample = 0;
-    uint64_t poll_calls = 0;
-    uint64_t empty_polls = 0;
-    uint64_t completions = 0;
-    uint64_t full_polls = 0;
-    uint64_t reposted = 0;
-    uint64_t repost_failures = 0;
-    uint64_t posted_wr = static_cast<uint64_t>(ibv_res_ptr->recv_wr_num);
-    uint64_t min_posted_wr = posted_wr;
-    uint64_t copy_batches = 0;
-    bool diagnostic_started = false;
-    long int block_bufsz = 0;
-    long int write_bufsz = 0;
-    char * gpu_ibuf = NULL;
-    // pkt_size already includes header (passed from run_demo.sh as PKT_HEADER+PKT_DATA)
-    int pkt_len = ibv_res_ptr->pkt_size;
-    int ring_pkt_len = this_ptr->param.pkt_size;
+    RoCEv2Dada *this_ptr = static_cast<RoCEv2Dada *>(arg);
+    struct ibv_utils_res *ibv_res_ptr =
+        static_cast<struct ibv_utils_res *>(this_ptr->ibv_res);
+    std::size_t completed = 0;
     int send_idx = 0;
-    time_t rawtime;
-    struct tm *timeinfo;
-    char time_buffer[80];
-
-    if (!this_ptr->param.SendOrRecv && this_ptr->param.pkt_size <= 0) {
-        fprintf(stderr, "ERROR: invalid payload pkt_size=%u.\n", this_ptr->param.pkt_size);
-        return NULL;
-    }
-    
-    // 初始化时间戳，避免第一次计算时使用未初始化的值
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_start);
-
-    const auto emit_diagnostic = [&](const struct timespec& now, bool force) {
-        if (!this_ptr->param.debug_mode || !diagnostic_started) return;
-        const int64_t since_last_ns =
-            (static_cast<int64_t>(now.tv_sec) - diagnostic_last.tv_sec) *
-                INT64_C(1000000000) +
-            (static_cast<int64_t>(now.tv_nsec) - diagnostic_last.tv_nsec);
-        if (!force && since_last_ns < INT64_C(100000000)) return;
-        const int64_t elapsed =
-            (static_cast<int64_t>(now.tv_sec) - diagnostic_start.tv_sec) *
-                INT64_C(1000000000) +
-            (static_cast<int64_t>(now.tv_nsec) - diagnostic_start.tv_nsec);
-        printf("[RDMA_DIAG] sample=%" PRIu64 " elapsed_ns=%" PRIi64
-               " poll_calls=%" PRIu64 " empty_polls=%" PRIu64
-               " completions=%" PRIu64 " full_polls=%" PRIu64
-               " accepted=%" PRIu64 " reposted=%" PRIu64
-               " repost_failures=%" PRIu64 " posted_wr=%" PRIu64
-               " min_posted_wr=%" PRIu64 " copy_batches=%" PRIu64 "\n",
-               diagnostic_sample++, elapsed, poll_calls, empty_polls,
-               completions, full_polls,
-               this_ptr->accepted_receive_packets.load(), reposted,
-               repost_failures, posted_wr, min_posted_wr, copy_batches);
-        fflush(stdout);
-        diagnostic_last = now;
-    };
-    
-    if (this_ptr->param.debug_mode) {
-        printf("[DEBUG] Entering main receive loop...\n");
-        fflush(stdout);
-    }
-    
     while (!this_ptr->stop_requested.load()) {
-        if(this_ptr->param.SendOrRecv) {
-            while(total_recv_pre < this_ptr->param.send_n &&
-                  !this_ptr->stop_requested.load()) {
-                int polled = ibv_poll_cq(ibv_res_ptr->cq, ibv_res_ptr->poll_n,
-                                         ibv_res_ptr->wc);
-                if (polled < 0) {
-                    fprintf(stderr, "ERROR: failed to poll send CQ.\n");
-                    return NULL;
-                }
-                for (int i = 0; i < polled; ++i) {
-                    if (!validate_send_completion(ibv_res_ptr->wc[i],
-                                                  ibv_res_ptr)) {
-                        return NULL;
-                    }
-                }
-                total_recv_pre += (size_t)polled;
+        while (completed < this_ptr->param.send_n &&
+               !this_ptr->stop_requested.load()) {
+            const int polled = ibv_poll_cq(
+                ibv_res_ptr->cq, ibv_res_ptr->poll_n, ibv_res_ptr->wc);
+            if (polled < 0) {
+                fprintf(stderr, "ERROR: failed to poll send CQ.\n");
+                return NULL;
             }
-            if (this_ptr->stop_requested.load()) {
+            for (int i = 0; i < polled; ++i) {
+                if (!validate_send_completion(ibv_res_ptr->wc[i],
+                                              ibv_res_ptr)) return NULL;
+            }
+            completed += static_cast<std::size_t>(polled);
+        }
+        if (this_ptr->stop_requested.load()) break;
+        for (unsigned int k = 0; k < this_ptr->param.send_n; ++k) {
+            struct udp_pkt *pkt = reinterpret_cast<struct udp_pkt *>(
+                ibv_res_ptr->mem_buf +
+                static_cast<std::size_t>(k + send_idx) *
+                    ibv_res_ptr->pkt_size);
+            if (this_ptr->param.WritSendBuff(
+                    pkt->payload, ibv_res_ptr->pkt_size) < 0) return NULL;
+        }
+        completed -= this_ptr->param.send_n;
+        send_idx = (send_idx + this_ptr->param.send_n) %
+            ibv_res_ptr->send_wr_num;
+        if (ib_send_pkg(ibv_res_ptr, send_idx,
+                        this_ptr->param.send_n) < 0) return NULL;
+    }
+    return NULL;
+}
+
+void * RoCEv2Dada::ReceivePollThread(void *arg)
+{
+    ReceiveShardState *shard = static_cast<ReceiveShardState *>(arg);
+    RoCEv2Dada *this_ptr = shard->owner;
+    struct ibv_utils_res *ibv_res_ptr = shard->resource;
+    ReceivePipelineState *pipeline = this_ptr->receive_pipeline;
+    const std::size_t maximum_batch = this_ptr->param.send_n;
+    std::vector<rdma_dada::io::rdma::ReceiveWorkItem> repost_batch(
+        maximum_batch);
+    std::uint64_t stop_empty_polls = 0;
+    const std::uint64_t kStopEmptyPolls = 4096;
+
+    while (!pipeline->failed.load()) {
+        std::size_t repost_count = 0;
+        while (repost_count < maximum_batch &&
+               shard->recycle.TryPop(&repost_batch[repost_count])) {
+            ++repost_count;
+        }
+        if (repost_count != 0) {
+            if (post_receive_batch(ibv_res_ptr, repost_batch.data(),
+                                   repost_count) != 0) {
+                shard->repost_failures.fetch_add(1);
+                pipeline->failed.store(true);
                 break;
             }
-            for(int k = 0; k < this_ptr->param.send_n; k++) {
-                struct udp_pkt *pkt = (struct udp_pkt *)((uint8_t *)ibv_res_ptr->mem_buf + (k + send_idx) * pkt_len);
-                ret = this_ptr->param.WritSendBuff(pkt->payload, ibv_res_ptr->pkt_size);
-                if (ret < 0) { printf("Failed to WritSendBuff.\n"); return NULL; }
-            }
-            total_recv_pre -= this_ptr->param.send_n;
-            send_idx = (send_idx + this_ptr->param.send_n) % ibv_res_ptr->send_wr_num;
-            ret = ib_send_pkg(ibv_res_ptr, send_idx, this_ptr->param.send_n);
-            if (ret < 0) { printf("Failed to send pkts.\n"); return NULL; }
-        } else {
-            static bool first_normal_path_log = true;
-            if (first_normal_path_log) {
-                printf("[RDMA] Using normal receive mode (with copy to ring buffer)\n");
-                fflush(stdout);
-                first_normal_path_log = false;
-            }
+            shard->reposted.fetch_add(repost_count);
+            shard->posted_wrs.fetch_add(repost_count);
+        }
 
-            clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
-            ns_elapsed = ELAPSED_US(ts_start, ts_now);
-            if (ns_elapsed > 1000 * 1000) {
-                ts_start = ts_now;
-                if (total_recv != total_recv_pre) {
-                    const double bandwidth = MEASURE_BANDWIDTH(
-                        ((total_recv - total_recv_pre) * ring_pkt_len),
-                        ns_elapsed);
-                    time(&rawtime);
-                    timeinfo = localtime(&rawtime);
-                    timeinfo->tm_hour += 8;
-                    strftime(time_buffer, sizeof(time_buffer),
-                             "year:%Y,month:%m,day:%d,hours:%H,minites:%M,second:%S",
-                             timeinfo);
-                    printf("NowTime:%s,gpu_id:%d,total_recv:%-8luKB,Process Bandwidth:%6.3f Gbps,cost time:%lums\n",
-                           time_buffer, this_ptr->param.gpu_id,
-                           (unsigned long)(total_recv * ring_pkt_len / 1024),
-                           bandwidth, (unsigned long)(ns_elapsed / 1000));
-                    fflush(stdout);
-                    total_recv_pre = total_recv;
-                }
+        const int polled = ibv_poll_cq(
+            ibv_res_ptr->cq, ibv_res_ptr->poll_n, ibv_res_ptr->wc);
+        shard->poll_calls.fetch_add(1);
+        if (polled < 0) {
+            fprintf(stderr, "ERROR: receive poll thread failed to poll CQ.\n");
+            pipeline->failed.store(true);
+            break;
+        }
+        if (polled == 0) {
+            shard->empty_polls.fetch_add(1);
+            if (this_ptr->stop_requested.load()) {
+                if (++stop_empty_polls >= kStopEmptyPolls) break;
             }
+            continue;
+        }
+        stop_empty_polls = 0;
+        shard->completions.fetch_add(static_cast<std::uint64_t>(polled));
+        if (polled == static_cast<int>(ibv_res_ptr->poll_n))
+            shard->full_polls.fetch_add(1);
+        const std::uint64_t before = shard->posted_wrs.fetch_sub(
+            static_cast<std::uint64_t>(polled));
+        const std::uint64_t after = before >= static_cast<std::uint64_t>(polled)
+            ? before - static_cast<std::uint64_t>(polled) : 0;
+        update_atomic_min(&shard->min_posted_wrs, after);
+        struct timespec completion_time = {};
+        clock_gettime(CLOCK_MONOTONIC_RAW, &completion_time);
+        const std::uint64_t completion_ns =
+            static_cast<std::uint64_t>(completion_time.tv_sec) *
+                UINT64_C(1000000000) +
+            static_cast<std::uint64_t>(completion_time.tv_nsec);
 
-            ibv_res_ptr->recv_completed = ibv_poll_cq(
-                ibv_res_ptr->cq, ibv_res_ptr->poll_n, ibv_res_ptr->wc);
-            if (ibv_res_ptr->recv_completed < 0) {
-                fprintf(stderr, "ERROR: SendRecvThread failed to poll receive CQ.\n");
-                return NULL;
+        for (int i = 0; i < polled; ++i) {
+            const struct ibv_wc completion = ibv_res_ptr->wc[i];
+            const rdma_dada::io::rdma::ReceiveCompletion policy_input = {
+                completion.status == IBV_WC_SUCCESS,
+                completion.opcode == IBV_WC_RECV,
+                completion.wr_id,
+                completion.byte_len
+            };
+            const rdma_dada::io::rdma::ReceiveDisposition disposition =
+                rdma_dada::io::rdma::ClassifyReceiveCompletion(
+                    policy_input,
+                    static_cast<std::uint64_t>(ibv_res_ptr->recv_wr_num),
+                    ibv_res_ptr->pkt_size);
+            if (disposition ==
+                rdma_dada::io::rdma::ReceiveDisposition::kFatal) {
+                log_fatal_receive_completion(completion, ibv_res_ptr);
+                pipeline->failed.store(true);
+                break;
             }
-            if (this_ptr->param.debug_mode) {
-                ++poll_calls;
-                if (ibv_res_ptr->recv_completed == 0) {
-                    ++empty_polls;
-                } else {
-                    if (!diagnostic_started) {
-                        clock_gettime(CLOCK_MONOTONIC_RAW, &diagnostic_start);
-                        diagnostic_last = diagnostic_start;
-                        diagnostic_started = true;
-                    }
-                    completions += static_cast<uint64_t>(
-                        ibv_res_ptr->recv_completed);
-                    if (ibv_res_ptr->recv_completed == ibv_res_ptr->poll_n)
-                        ++full_polls;
-                    const uint64_t completed = static_cast<uint64_t>(
-                        ibv_res_ptr->recv_completed);
-                    posted_wr = completed > posted_wr ? 0 : posted_wr - completed;
-                    if (posted_wr < min_posted_wr) min_posted_wr = posted_wr;
+            const rdma_dada::io::rdma::ReceiveWorkItem item = {
+                completion.wr_id, completion_ns
+            };
+            if (disposition ==
+                rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength) {
+                this_ptr->wrong_length_receive_packets.fetch_add(1);
+                if (post_receive_batch(ibv_res_ptr, &item, 1) != 0) {
+                    shard->repost_failures.fetch_add(1);
+                    pipeline->failed.store(true);
+                    break;
                 }
-            }
-            if (ibv_res_ptr->recv_completed == 0) {
-                if (this_ptr->param.debug_mode && diagnostic_started &&
-                    (poll_calls & UINT64_C(1023)) == 0) {
-                    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
-                    emit_diagnostic(ts_now, false);
-                }
+                shard->reposted.fetch_add(1);
+                shard->posted_wrs.fetch_add(1);
                 continue;
             }
+            while (!shard->completed.TryPush(item) &&
+                   !pipeline->failed.load()) sched_yield();
+            if (pipeline->failed.load()) break;
+            this_ptr->accepted_receive_packets.fetch_add(1);
+        }
+    }
+    shard->poll_done.store(true);
 
-            int accepted_completed = 0;
-            for (int i = 0; i < ibv_res_ptr->recv_completed; ++i) {
-                const struct ibv_wc completion = ibv_res_ptr->wc[i];
-                const rdma_dada::io::rdma::ReceiveCompletion policy_input = {
-                    completion.status == IBV_WC_SUCCESS,
-                    completion.opcode == IBV_WC_RECV,
-                    completion.wr_id,
-                    completion.byte_len
-                };
-                const rdma_dada::io::rdma::ReceiveDisposition disposition =
-                    rdma_dada::io::rdma::ClassifyReceiveCompletion(
-                        policy_input, (uint64_t)ibv_res_ptr->recv_wr_num,
-                        ibv_res_ptr->pkt_size);
-                if (disposition ==
-                    rdma_dada::io::rdma::ReceiveDisposition::kFatal) {
-                    log_fatal_receive_completion(completion, ibv_res_ptr);
-                    return NULL;
-                }
-                if (disposition ==
-                    rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength) {
-                    const uint64_t dropped =
-                        this_ptr->wrong_length_receive_packets.fetch_add(1) + 1;
-                    if (rdma_dada::io::rdma::ShouldLogWrongLengthDrop(dropped)) {
+    while (!pipeline->failed.load()) {
+        std::size_t repost_count = 0;
+        while (repost_count < maximum_batch &&
+               shard->recycle.TryPop(&repost_batch[repost_count])) {
+            ++repost_count;
+        }
+        if (repost_count == 0) {
+            if (pipeline->copy_done.load() && shard->recycle.empty()) break;
+            sched_yield();
+            continue;
+        }
+        if (post_receive_batch(ibv_res_ptr, repost_batch.data(),
+                               repost_count) != 0) {
+            shard->repost_failures.fetch_add(1);
+            pipeline->failed.store(true);
+            break;
+        }
+        shard->reposted.fetch_add(repost_count);
+        shard->posted_wrs.fetch_add(repost_count);
+    }
+    return NULL;
+}
+
+void * RoCEv2Dada::ReceiveCopyThread(void *arg)
+{
+    RoCEv2Dada *this_ptr = static_cast<RoCEv2Dada *>(arg);
+    ReceivePipelineState *pipeline = this_ptr->receive_pipeline;
+    const std::size_t maximum_batch = this_ptr->param.send_n;
+    const std::uint64_t ring_record_bytes = this_ptr->param.pkt_size;
+    std::vector<rdma_dada::io::rdma::ReceiveWorkItem> batch(maximum_batch);
+    long int remaining_bytes = 0;
+    long int block_bytes = 0;
+    char *write_ptr = NULL;
+    std::uint64_t recycle_delay_total = 0;
+    std::uint64_t recycle_delay_max = 0;
+
+    printf("[RDMA] Using sharded receive mode (%zu poll/repost + "
+           "one copy/ring thread)\n", pipeline->shards.size());
+    fflush(stdout);
+
+    while (!pipeline->failed.load()) {
+        bool copied_any = false;
+        bool all_pollers_done = true;
+        for (std::size_t shard_index = 0;
+             shard_index < pipeline->shards.size(); ++shard_index) {
+            ReceiveShardState *shard = pipeline->shards[shard_index];
+            if (!shard->poll_done.load() || !shard->completed.empty())
+                all_pollers_done = false;
+            std::size_t count = 0;
+            while (count < maximum_batch &&
+                   shard->completed.TryPop(&batch[count])) ++count;
+            if (count == 0) continue;
+            copied_any = true;
+            pipeline->copy_batches.fetch_add(1);
+            for (std::size_t i = 0; i < count; ++i) {
+                if (!write_ptr) {
+                    write_ptr = this_ptr->param.GetBuffPtr(remaining_bytes);
+                    block_bytes = remaining_bytes;
+                    if (!write_ptr || remaining_bytes <= 0 ||
+                        static_cast<std::uint64_t>(remaining_bytes) <
+                            ring_record_bytes) {
                         fprintf(stderr,
-                                "[WARN] Dropping wrong-length receive: "
-                                "byte_len=%u, expected=%u, wr_id=%" PRIu64
-                                ", total_wrong_length=%" PRIu64 ".\n",
-                                completion.byte_len, ibv_res_ptr->pkt_size,
-                                completion.wr_id, dropped);
-                    }
-                    if (repost_receive_wr(ibv_res_ptr, completion.wr_id) != 0) {
-                        if (this_ptr->param.debug_mode) ++repost_failures;
-                        return NULL;
-                    }
-                    if (this_ptr->param.debug_mode) {
-                        ++reposted;
-                        ++posted_wr;
-                    }
-                    continue;
-                }
-                ibv_res_ptr->wc[accepted_completed++] = completion;
-                this_ptr->accepted_receive_packets.fetch_add(1);
-            }
-            if (ibv_res_ptr->recv_sum_completed + accepted_completed >
-                ibv_res_ptr->recv_wr_num) {
-                fprintf(stderr,
-                        "[ERROR] CQ accumulation overflow: buffered=%d, "
-                        "new=%d, capacity=%d.\n",
-                        ibv_res_ptr->recv_sum_completed, accepted_completed,
-                        ibv_res_ptr->recv_wr_num);
-                return NULL;
-            }
-            memcpy(ibv_res_ptr->wc_tmp + ibv_res_ptr->recv_sum_completed,
-                   ibv_res_ptr->wc,
-                   sizeof(struct ibv_wc) * accepted_completed);
-            ibv_res_ptr->recv_sum_completed += accepted_completed;
-
-            while (ibv_res_ptr->recv_sum_completed >=
-                   (int)this_ptr->param.send_n) {
-                const int count = (int)this_ptr->param.send_n;
-                if (this_ptr->param.debug_mode) ++copy_batches;
-                const uint64_t bytes = (uint64_t)count * ring_pkt_len;
-                if (!gpu_ibuf) {
-                    gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
-                    write_bufsz = block_bufsz;
-                    if (!gpu_ibuf || block_bufsz <= 0) {
-                        fprintf(stderr, "ERROR: failed to acquire raw ring block.\n");
-                        return NULL;
+                                "ERROR: failed to acquire valid raw ring block.\n");
+                        pipeline->failed.store(true);
+                        break;
                     }
                 }
-                if ((uint64_t)block_bufsz < bytes) {
-                    fprintf(stderr,
-                            "ERROR: complete receive batch does not fit raw block.\n");
-                    return NULL;
+                const std::uint64_t wr_id = batch[i].wr_id;
+                struct ibv_utils_res *resource = shard->resource;
+                unsigned char *src = reinterpret_cast<unsigned char *>(
+                    resource->sge[wr_id * resource->recv_nsge].addr);
+                if (this_ptr->param.RdmaDirectGpu != 0) {
+                    CUDA_CALL(cudaMemcpy(write_ptr,
+                                         src + RX_STRIP_HEADER_BYTES,
+                                         ring_record_bytes,
+                                         cudaMemcpyDeviceToDevice));
+                } else {
+                    memcpy(write_ptr, src + RX_STRIP_HEADER_BYTES,
+                           ring_record_bytes);
                 }
-                for (int i = 0; i < count; ++i) {
-                    const uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
-                    unsigned char *src = (unsigned char *)
-                        ibv_res_ptr->sge[
-                            wr_id * ibv_res_ptr->recv_nsge].addr;
-                    if (this_ptr->param.RdmaDirectGpu != 0) {
-                        CUDA_CALL(cudaMemcpy(
-                            gpu_ibuf + ((size_t)i * ring_pkt_len),
-                            src + RX_STRIP_HEADER_BYTES, ring_pkt_len,
-                            cudaMemcpyDeviceToDevice));
-                    } else {
-                        memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
-                               src + RX_STRIP_HEADER_BYTES, ring_pkt_len);
-                    }
-                    if (repost_receive_wr(ibv_res_ptr, wr_id) != 0) {
-                        if (this_ptr->param.debug_mode) ++repost_failures;
-                        return NULL;
-                    }
-                    if (this_ptr->param.debug_mode) {
-                        ++reposted;
-                        ++posted_wr;
-                    }
-                }
-                gpu_ibuf += bytes;
-                block_bufsz -= (long int)bytes;
-                total_recv += count;
-                ibv_res_ptr->recv_sum_completed -= count;
-                memmove(ibv_res_ptr->wc_tmp,
-                        ibv_res_ptr->wc_tmp + count,
-                        sizeof(struct ibv_wc) *
-                            ibv_res_ptr->recv_sum_completed);
-                if (block_bufsz == 0) {
+                write_ptr += ring_record_bytes;
+                remaining_bytes -= static_cast<long int>(ring_record_bytes);
+                if (remaining_bytes == 0) {
                     if (this_ptr->param.DataSendBuff(
-                            (uint64_t)write_bufsz) < 0) {
-                        fprintf(stderr,
-                                "[ERROR] Failed to publish full raw block.\n");
-                        return NULL;
+                            static_cast<std::uint64_t>(block_bytes)) < 0) {
+                        fprintf(stderr, "[ERROR] Failed to publish raw block.\n");
+                        pipeline->failed.store(true);
+                        break;
                     }
                     this_ptr->published_receive_packets.fetch_add(
-                        (uint64_t)write_bufsz / ring_pkt_len);
+                        static_cast<std::uint64_t>(block_bytes) /
+                            ring_record_bytes);
                     this_ptr->published_receive_blocks.fetch_add(1);
-                    gpu_ibuf = NULL;
-                    write_bufsz = 0;
+                    write_ptr = NULL;
+                    block_bytes = 0;
                 }
             }
-            if (this_ptr->param.debug_mode && diagnostic_started &&
-                (poll_calls & UINT64_C(1023)) == 0) {
-                clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
-                emit_diagnostic(ts_now, false);
+            if (pipeline->failed.load()) break;
+            struct timespec recycled_at = {};
+            clock_gettime(CLOCK_MONOTONIC_RAW, &recycled_at);
+            const std::uint64_t recycled_ns =
+                static_cast<std::uint64_t>(recycled_at.tv_sec) *
+                    UINT64_C(1000000000) +
+                static_cast<std::uint64_t>(recycled_at.tv_nsec);
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::uint64_t recycle_delay =
+                    recycled_ns >= batch[i].completion_ns
+                    ? recycled_ns - batch[i].completion_ns : 0;
+                recycle_delay_total += recycle_delay;
+                if (recycle_delay > recycle_delay_max)
+                    recycle_delay_max = recycle_delay;
+                while (!shard->recycle.TryPush(batch[i]) &&
+                       !pipeline->failed.load()) sched_yield();
             }
+        }
+        if (pipeline->failed.load()) break;
+        if (!copied_any) {
+            if (all_pollers_done) break;
+            sched_yield();
         }
     }
 
-    if (!this_ptr->param.SendOrRecv && this_ptr->param.debug_mode &&
-        diagnostic_started) {
-        clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
-        emit_diagnostic(ts_now, true);
-    }
-
-    if (!this_ptr->param.SendOrRecv) {
-        const int tail_count = ibv_res_ptr->recv_sum_completed;
-        if (tail_count > 0) {
-            const uint64_t tail_bytes = (uint64_t)tail_count * ring_pkt_len;
-            if (!gpu_ibuf) {
-                gpu_ibuf = this_ptr->param.GetBuffPtr(block_bufsz);
-                write_bufsz = block_bufsz;
-                if (!gpu_ibuf || block_bufsz <= 0) {
-                    fprintf(stderr,
-                            "ERROR: failed to acquire raw ring block for CQ tail.\n");
-                    return NULL;
-                }
-            }
-            if ((uint64_t)block_bufsz < tail_bytes) {
-                fprintf(stderr, "ERROR: CQ tail does not fit raw ring block.\n");
-                return NULL;
-            }
-            for (int i = 0; i < tail_count; ++i) {
-                const uint64_t wr_id = ibv_res_ptr->wc_tmp[i].wr_id;
-                unsigned char *src = (unsigned char *)
-                    ibv_res_ptr->sge[wr_id * ibv_res_ptr->recv_nsge].addr;
-                if (this_ptr->param.RdmaDirectGpu != 0) {
-                    CUDA_CALL(cudaMemcpy(
-                        gpu_ibuf + ((size_t)i * ring_pkt_len),
-                        src + RX_STRIP_HEADER_BYTES, ring_pkt_len,
-                        cudaMemcpyDeviceToDevice));
-                } else {
-                    memcpy(gpu_ibuf + ((size_t)i * ring_pkt_len),
-                           src + RX_STRIP_HEADER_BYTES, ring_pkt_len);
-                }
-            }
-            gpu_ibuf += tail_bytes;
-            block_bufsz -= (long int)tail_bytes;
-            total_recv += tail_count;
-            this_ptr->cq_tail_receive_records.fetch_add(tail_count);
-            ibv_res_ptr->recv_sum_completed = 0;
-        }
-
-        if (gpu_ibuf && write_bufsz > block_bufsz) {
-            const uint64_t valid_bytes =
-                (uint64_t)(write_bufsz - block_bufsz);
-            if (this_ptr->param.DataSendBuff(valid_bytes) < 0) {
-                fprintf(stderr,
-                        "[ERROR] Failed to publish final raw block tail.\n");
-                return NULL;
-            }
+    if (!pipeline->failed.load() && write_ptr && block_bytes > remaining_bytes) {
+        const std::uint64_t valid_bytes =
+            static_cast<std::uint64_t>(block_bytes - remaining_bytes);
+        if (this_ptr->param.DataSendBuff(valid_bytes) < 0) {
+            fprintf(stderr, "[ERROR] Failed to publish final raw block.\n");
+            pipeline->failed.store(true);
+        } else {
             this_ptr->published_receive_packets.fetch_add(
-                valid_bytes / ring_pkt_len);
+                valid_bytes / ring_record_bytes);
             this_ptr->published_receive_blocks.fetch_add(1);
-            if (valid_bytes < (uint64_t)write_bufsz)
+            if (valid_bytes < static_cast<std::uint64_t>(block_bytes))
                 this_ptr->partial_receive_blocks.fetch_add(1);
             printf("[RDMA] Published final raw block: bytes=%" PRIu64
                    ", records=%" PRIu64 "\n",
-                   valid_bytes, valid_bytes / ring_pkt_len);
+                   valid_bytes, valid_bytes / ring_record_bytes);
             fflush(stdout);
         }
     }
+    pipeline->completion_to_recycle_ns_total.store(recycle_delay_total);
+    pipeline->completion_to_recycle_ns_max.store(recycle_delay_max);
+    pipeline->copy_done.store(true);
     return NULL;
 }
 
 RoCEv2Dada::~RoCEv2Dada()
 {
     Stop();
-    if(this->ibv_res) {
-        struct ibv_utils_res * ibv_res_ptr = (struct ibv_utils_res *)this->ibv_res;
+    const auto release_resource = [&](struct ibv_utils_res *ibv_res_ptr) {
+        if (!ibv_res_ptr) return;
         if (ibv_res_ptr->mem_buf) {
             if(this->param.RdmaDirectGpu > 0 && !this->param.SendOrRecv) {
                 CUDA_CALL(cudaFree(ibv_res_ptr->mem_buf));
@@ -791,8 +897,24 @@ RoCEv2Dada::~RoCEv2Dada()
         destroy_ib_res(ibv_res_ptr);
         close_ib_device(ibv_res_ptr);
         free(ibv_res_ptr);
-        this->ibv_res = NULL;
+    };
+    if (!receive_resources.empty()) {
+        for (std::size_t index = 0; index < receive_resources.size(); ++index)
+            release_resource(static_cast<struct ibv_utils_res *>(
+                receive_resources[index]));
+        receive_resources.clear();
+    } else if (this->ibv_res) {
+        release_resource(static_cast<struct ibv_utils_res *>(this->ibv_res));
     }
+    this->ibv_res = NULL;
+    if (receive_pipeline) {
+        for (std::size_t index = 0;
+             index < receive_pipeline->shards.size(); ++index)
+            delete receive_pipeline->shards[index];
+        receive_pipeline->shards.clear();
+    }
+    delete receive_pipeline;
+    receive_pipeline = NULL;
 }
 
 int RoCEv2Dada::Start()
@@ -829,34 +951,117 @@ int RoCEv2Dada::Start()
         return RDMA_ERROR;
     }
     
-    printf("[RoCEv2Dada::Start] Creating pthread...\n");
-    fflush(stdout);
-    
     stop_requested.store(false);
     cpu_set_t mask;
-    int ret = pthread_create(&ibv_res_ptr->tid, NULL, SendRecvThread, (void *)this);
-    
-    printf("[RoCEv2Dada::Start] pthread_create returned: %d (tid=%lu)\n", ret, (unsigned long)ibv_res_ptr->tid);
-    fflush(stdout);
-    
-    if (ret) { 
-        fprintf(stderr, "pthread_create failed: %d\n", ret); 
-        fflush(stderr);
-        return RDMA_ERROR; 
+    int ret = 0;
+    if (this->param.SendOrRecv) {
+        ret = pthread_create(&ibv_res_ptr->tid, NULL, SendRecvThread,
+                             static_cast<void *>(this));
+        if (ret != 0) {
+            fprintf(stderr, "pthread_create failed: %d\n", ret);
+            return RDMA_ERROR;
+        }
+    } else {
+        if (!receive_pipeline) {
+            fprintf(stderr, "RoCEv2Dada::Start error: receive pipeline missing.\n");
+            return RDMA_ERROR;
+        }
+        receive_pipeline->copy_done.store(false);
+        receive_pipeline->failed.store(false);
+        for (std::size_t index = 0;
+             index < receive_pipeline->shards.size(); ++index)
+            receive_pipeline->shards[index]->poll_done.store(false);
+        ret = pthread_create(&receive_pipeline->copy_tid, NULL,
+                             ReceiveCopyThread, static_cast<void *>(this));
+        if (ret != 0) {
+            fprintf(stderr, "copy pthread_create failed: %d\n", ret);
+            return RDMA_ERROR;
+        }
+        receive_pipeline->copy_thread_started = true;
+        for (std::size_t index = 0;
+             index < receive_pipeline->shards.size(); ++index) {
+            ReceiveShardState *shard = receive_pipeline->shards[index];
+            ret = pthread_create(&shard->poll_tid, NULL,
+                                 ReceivePollThread,
+                                 static_cast<void *>(shard));
+            if (ret != 0) {
+                fprintf(stderr, "poll pthread_create failed for shard %zu: %d\n",
+                        index, ret);
+                receive_pipeline->failed.store(true);
+                for (std::size_t pending = index;
+                     pending < receive_pipeline->shards.size(); ++pending)
+                    receive_pipeline->shards[pending]->poll_done.store(true);
+                for (std::size_t started = 0; started < index; ++started) {
+                    pthread_join(receive_pipeline->shards[started]->poll_tid,
+                                 NULL);
+                    receive_pipeline->shards[started]->poll_thread_started = false;
+                }
+                pthread_join(receive_pipeline->copy_tid, NULL);
+                receive_pipeline->copy_thread_started = false;
+                return RDMA_ERROR;
+            }
+            shard->poll_thread_started = true;
+        }
     }
     thread_started = true;
-    
-    if(this->param.bind_cpu_id >= 0) {
-        printf("[RoCEv2Dada::Start] Setting CPU affinity to core %d...\n", this->param.bind_cpu_id);
-        fflush(stdout);
+
+    const auto bind_thread = [&](pthread_t tid, int cpu,
+                                 const char *role) -> bool {
+        if (cpu < 0) return true;
         CPU_ZERO(&mask);
-        CPU_SET(this->param.bind_cpu_id, &mask);
-        ret = pthread_setaffinity_np(ibv_res_ptr->tid, sizeof(mask), &mask);
+        CPU_SET(cpu, &mask);
+        ret = pthread_setaffinity_np(tid, sizeof(mask), &mask);
         if (ret != 0) {
             fprintf(stderr,
-                    "[WARN] Failed to bind RDMA thread to CPU %d: %s\n",
-                    this->param.bind_cpu_id, strerror(ret));
+                    "[ERROR] Failed to bind RDMA %s thread to CPU %d: %s\n",
+                    role, cpu, strerror(ret));
+            return false;
         }
+        cpu_set_t actual;
+        CPU_ZERO(&actual);
+        ret = pthread_getaffinity_np(tid, sizeof(actual), &actual);
+        if (ret != 0 || !CPU_ISSET(cpu, &actual)) {
+            fprintf(stderr,
+                    "[ERROR] RDMA %s thread affinity verification failed "
+                    "for CPU %d.\n", role, cpu);
+            return false;
+        }
+        return true;
+    };
+    bool affinity_ok = true;
+    if (this->param.SendOrRecv) {
+        affinity_ok = bind_thread(ibv_res_ptr->tid,
+                                  this->param.poll_cpu_id, "send");
+    } else {
+        affinity_ok = bind_thread(receive_pipeline->copy_tid,
+                                  this->param.copy_cpu_id, "copy");
+        for (std::size_t index = 0;
+             affinity_ok && index < receive_pipeline->shards.size(); ++index) {
+            const int cpu = this->param.poll_cpu_ids.empty()
+                ? -1 : this->param.poll_cpu_ids[index];
+            char role[64];
+            snprintf(role, sizeof(role), "poll[%zu]", index);
+            affinity_ok = bind_thread(
+                receive_pipeline->shards[index]->poll_tid, cpu, role);
+        }
+    }
+    if (!affinity_ok) {
+        Stop();
+        return RDMA_ERROR;
+    }
+    if (!this->param.SendOrRecv) {
+        printf("[RDMA] Receive threads ready: shards=%zu, poll_cpus=",
+               receive_pipeline->shards.size());
+        if (this->param.poll_cpu_ids.empty()) {
+            printf("unbound");
+        } else {
+            for (std::size_t index = 0;
+                 index < this->param.poll_cpu_ids.size(); ++index)
+                printf("%s%d", index == 0 ? "" : ",",
+                       this->param.poll_cpu_ids[index]);
+        }
+        printf(", copy_cpu=%d\n", this->param.copy_cpu_id);
+        fflush(stdout);
     }
     
     printf("[RoCEv2Dada::Start] Success, returning RDMA_OK\n");
@@ -870,12 +1075,40 @@ int RoCEv2Dada::Stop()
         return RDMA_OK;
     }
 
-    struct ibv_utils_res * ibv_res_ptr = (struct ibv_utils_res *)this->ibv_res;
     stop_requested.store(true);
-    int ret = pthread_join(ibv_res_ptr->tid, NULL);
-    if (ret != 0) {
-        fprintf(stderr, "pthread_join failed: %d (%s)\n", ret, strerror(ret));
-        return RDMA_ERROR;
+    int ret = 0;
+    if (this->param.SendOrRecv) {
+        struct ibv_utils_res *ibv_res_ptr =
+            static_cast<struct ibv_utils_res *>(this->ibv_res);
+        ret = pthread_join(ibv_res_ptr->tid, NULL);
+        if (ret != 0) {
+            fprintf(stderr, "pthread_join failed: %d (%s)\n", ret,
+                    strerror(ret));
+            return RDMA_ERROR;
+        }
+    } else if (receive_pipeline) {
+        for (std::size_t index = 0;
+             index < receive_pipeline->shards.size(); ++index) {
+            ReceiveShardState *shard = receive_pipeline->shards[index];
+            if (!shard->poll_thread_started) continue;
+            ret = pthread_join(shard->poll_tid, NULL);
+            shard->poll_thread_started = false;
+            if (ret != 0) {
+                fprintf(stderr,
+                        "poll[%zu] pthread_join failed: %d (%s)\n",
+                        index, ret, strerror(ret));
+                return RDMA_ERROR;
+            }
+        }
+        if (receive_pipeline->copy_thread_started) {
+            ret = pthread_join(receive_pipeline->copy_tid, NULL);
+            receive_pipeline->copy_thread_started = false;
+            if (ret != 0) {
+                fprintf(stderr, "copy pthread_join failed: %d (%s)\n", ret,
+                        strerror(ret));
+                return RDMA_ERROR;
+            }
+        }
     }
     thread_started = false;
     if (!this->param.SendOrRecv) {
@@ -895,6 +1128,52 @@ int RoCEv2Dada::Stop()
                stats.partial_blocks, stats.cq_tail_records,
                wrong_length_ratio);
         fflush(stdout);
+        printf("[RDMA] Receive pipeline summary: poll_calls=%" PRIu64
+               ", empty_polls=%" PRIu64 ", full_polls=%" PRIu64
+               ", reposted_wrs=%" PRIu64
+               ", repost_failures=%" PRIu64
+               ", copy_batches=%" PRIu64
+               ", min_posted_wrs=%" PRIu64
+               ", completion_queue_high_watermark=%" PRIu64
+               ", recycle_queue_high_watermark=%" PRIu64
+               ", completion_to_recycle_ns_total=%" PRIu64
+               ", completion_to_recycle_ns_max=%" PRIu64 "\n",
+               stats.poll_calls, stats.empty_polls, stats.full_polls,
+               stats.reposted_wrs, stats.repost_failures,
+               stats.copy_batches, stats.min_posted_wrs,
+               stats.completion_queue_high_watermark,
+               stats.recycle_queue_high_watermark,
+               stats.completion_to_recycle_ns_total,
+               stats.completion_to_recycle_ns_max);
+        fflush(stdout);
+        if (receive_pipeline) {
+            for (std::size_t index = 0;
+                 index < receive_pipeline->shards.size(); ++index) {
+                const ReceiveShardState *shard =
+                    receive_pipeline->shards[index];
+                printf("[RDMA] Receive shard summary: shard=%zu"
+                       ", poll_calls=%" PRIu64
+                       ", empty_polls=%" PRIu64
+                       ", full_polls=%" PRIu64
+                       ", completions=%" PRIu64
+                       ", reposted_wrs=%" PRIu64
+                       ", repost_failures=%" PRIu64
+                       ", min_posted_wrs=%" PRIu64
+                       ", completion_queue_high_watermark=%zu"
+                       ", recycle_queue_high_watermark=%zu\n",
+                       index, shard->poll_calls.load(),
+                       shard->empty_polls.load(), shard->full_polls.load(),
+                       shard->completions.load(), shard->reposted.load(),
+                       shard->repost_failures.load(),
+                       shard->min_posted_wrs.load(),
+                       shard->completed.high_watermark(),
+                       shard->recycle.high_watermark());
+            }
+            fflush(stdout);
+        }
+        if (receive_pipeline && receive_pipeline->failed.load()) {
+            return RDMA_ERROR;
+        }
     }
     return RDMA_OK;
 }
@@ -908,5 +1187,41 @@ RoCEv2Dada::ReceiveStats RoCEv2Dada::GetReceiveStats() const
     stats.published_blocks = published_receive_blocks.load();
     stats.partial_blocks = partial_receive_blocks.load();
     stats.cq_tail_records = cq_tail_receive_records.load();
+    stats.poll_calls = 0;
+    stats.empty_polls = 0;
+    stats.full_polls = 0;
+    stats.reposted_wrs = 0;
+    stats.repost_failures = 0;
+    stats.copy_batches = receive_pipeline
+        ? receive_pipeline->copy_batches.load() : 0;
+    stats.min_posted_wrs = 0;
+    stats.completion_queue_high_watermark = 0;
+    stats.recycle_queue_high_watermark = 0;
+    if (receive_pipeline && !receive_pipeline->shards.empty()) {
+        stats.min_posted_wrs = UINT64_MAX;
+        for (std::size_t index = 0;
+             index < receive_pipeline->shards.size(); ++index) {
+            const ReceiveShardState *shard = receive_pipeline->shards[index];
+            stats.poll_calls += shard->poll_calls.load();
+            stats.empty_polls += shard->empty_polls.load();
+            stats.full_polls += shard->full_polls.load();
+            stats.reposted_wrs += shard->reposted.load();
+            stats.repost_failures += shard->repost_failures.load();
+            stats.min_posted_wrs = std::min(
+                stats.min_posted_wrs, shard->min_posted_wrs.load());
+            stats.completion_queue_high_watermark = std::max(
+                stats.completion_queue_high_watermark,
+                static_cast<std::uint64_t>(
+                    shard->completed.high_watermark()));
+            stats.recycle_queue_high_watermark = std::max(
+                stats.recycle_queue_high_watermark,
+                static_cast<std::uint64_t>(
+                    shard->recycle.high_watermark()));
+        }
+    }
+    stats.completion_to_recycle_ns_total = receive_pipeline
+        ? receive_pipeline->completion_to_recycle_ns_total.load() : 0;
+    stats.completion_to_recycle_ns_max = receive_pipeline
+        ? receive_pipeline->completion_to_recycle_ns_max.load() : 0;
     return stats;
 }

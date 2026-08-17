@@ -225,8 +225,12 @@ int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
         } 
     };
     const rdma_dada::io::rdma::DestinationUdpFilter filter =
-        rdma_dada::io::rdma::BuildDestinationUdpFilter(
-            pkt_info->dst_mac, pkt_info->dst_ip, pkt_info->dst_port);
+        (pkt_info->src_ip != 0 && pkt_info->src_port != 0)
+        ? rdma_dada::io::rdma::BuildSourceUdpFilter(
+              pkt_info->dst_mac, pkt_info->src_ip, pkt_info->src_port,
+              pkt_info->dst_ip, pkt_info->dst_port)
+        : rdma_dada::io::rdma::BuildDestinationUdpFilter(
+              pkt_info->dst_mac, pkt_info->dst_ip, pkt_info->dst_port);
 
     // Match IPv4 UDP traffic for this destination. All source values and masks
     // stay zero so every FPGA/Station source is accepted by the same QP.

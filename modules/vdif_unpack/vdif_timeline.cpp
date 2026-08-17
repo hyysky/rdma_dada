@@ -73,6 +73,8 @@ bool ValidateTimelineShape(const VdifTimeline& timeline,
                            std::string* error) {
     if (timeline.group_period_ps == 0U)
         return Fail("GROUP_PERIOD_PS must be positive", error);
+    if (timeline.groups_per_second > kMaximumVdifFrame + 1U)
+        return Fail("groups_per_second exceeds VDIF frame range", error);
     if (timeline.start_reference_epoch > 63U)
         return Fail("GROUP_START_REFERENCE_EPOCH exceeds six-bit range",
                     error);
@@ -115,6 +117,7 @@ bool ParseVdifTimeline(const pipeline::Metadata& header,
 
     VdifTimeline parsed = {};
     parsed.group_period_ps = group_period_ps;
+    parsed.groups_per_second = 0U;
     parsed.start_reference_epoch =
         static_cast<std::uint8_t>(reference_epoch);
     parsed.start_seconds = static_cast<std::uint32_t>(start_seconds);
@@ -151,6 +154,21 @@ bool VdifOrdinalToTime(const VdifTimeline& timeline,
     if (!ValidateTimelineShape(timeline, error)) return false;
     if (ordinal >= timeline.expected_groups)
         return Fail("group ordinal is outside EXPECTED_GROUPS", error);
+
+    if (timeline.groups_per_second != 0U) {
+        const std::uint64_t delta_seconds =
+            ordinal / timeline.groups_per_second;
+        std::uint64_t absolute_seconds = 0;
+        if (!CheckedAdd(timeline.start_seconds, delta_seconds,
+                        &absolute_seconds) ||
+            absolute_seconds > kMaximumVdifSeconds) {
+            return Fail("group time exceeds VDIF 30-bit seconds range", error);
+        }
+        *seconds = static_cast<std::uint32_t>(absolute_seconds);
+        *frame = static_cast<std::uint32_t>(
+            ordinal % timeline.groups_per_second);
+        return true;
+    }
 
     std::uint64_t elapsed_ps = 0;
     if (!CheckedMultiply(ordinal, timeline.group_period_ps, &elapsed_ps))
@@ -189,6 +207,21 @@ bool VdifTimeToOrdinal(const VdifTimeline& timeline,
         return Fail("packet time precedes timeline start", error);
     if (seconds > kMaximumVdifSeconds || frame > kMaximumVdifFrame)
         return Fail("packet time exceeds Project VDIF field range", error);
+
+    if (timeline.groups_per_second != 0U) {
+        if (frame >= timeline.groups_per_second)
+            return Fail("packet frame exceeds fixed groups per second", error);
+        std::uint64_t base = 0;
+        if (!CheckedMultiply(
+                static_cast<std::uint64_t>(seconds - timeline.start_seconds),
+                timeline.groups_per_second, &base) ||
+            !CheckedAdd(base, frame, ordinal)) {
+            return Fail("fixed-rate packet ordinal overflows", error);
+        }
+        if (*ordinal >= timeline.expected_groups)
+            return Fail("packet time is outside EXPECTED_GROUPS", error);
+        return true;
+    }
 
     const std::uint64_t delta_seconds =
         static_cast<std::uint64_t>(seconds - timeline.start_seconds);

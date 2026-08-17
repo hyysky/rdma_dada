@@ -21,6 +21,7 @@ struct VdifSenderSimConfig {
     std::uint8_t reference_epoch;
     std::uint32_t start_seconds;
     std::uint64_t sample_interval_ps;
+    std::uint64_t groups_per_second;
     std::uint64_t group_count;
     std::string mode;
     std::string start_utc;

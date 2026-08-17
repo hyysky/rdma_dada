@@ -189,6 +189,8 @@ bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
         return Fail("VDIF start time exceeds header field width", error);
     if (config.sample_interval_ps == 0 || config.group_count == 0)
         return Fail("sample interval and group count must be positive", error);
+    if (config.groups_per_second > 0x1000000U)
+        return Fail("groups_per_second exceeds VDIF frame range", error);
     if (config.schema_version != 2U &&
         config.mode != "BURST" && config.mode != "REALTIME")
         return Fail("schema v1 mode must be BURST or REALTIME", error);
@@ -298,6 +300,10 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     static const char* const time_keys[] = {
         "reference_epoch", "start_seconds", "group_count", "mode", "start_utc"
     };
+    static const char* const fixed_time_keys[] = {
+        "reference_epoch", "start_seconds", "group_count", "mode", "start_utc",
+        "groups_per_second"
+    };
     static const char* const fault_keys[] = {
         "drop_groups", "duplicate_groups", "invalid_header_groups"
     };
@@ -311,12 +317,15 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         !ExactKeys(*destination, destination_keys, 3, "destination", error) ||
         !ExactKeys(*station, station_keys, 1, "station", error) ||
         !ExactKeys(*packet, packet_keys, 6, "packet", error) ||
-        !ExactKeys(*time, time_keys, 5, "time", error) ||
+        !(time->count("groups_per_second")
+              ? ExactKeys(*time, fixed_time_keys, 6, "time", error)
+              : ExactKeys(*time, time_keys, 5, "time", error)) ||
         !ExactKeys(*faults, fault_keys, 3, "faults", error)) return false;
 
     VdifSenderSimConfig parsed = {};
     parsed.schema_version = static_cast<std::uint32_t>(schema);
     parsed.payload_mode = "DETERMINISTIC";
+    parsed.groups_per_second = 0U;
     std::uint64_t port, mtu, station_id, first_channel, nchan, npol;
     std::uint64_t nsamp, component_bits, epoch, start_seconds;
     std::uint64_t source_port = 0, batch_packets = 0;
@@ -344,6 +353,9 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         !UintField(*time, "group_count", &parsed.group_count, error) ||
         !StringField(*time, "mode", &parsed.mode, error) ||
         !StringField(*time, "start_utc", &parsed.start_utc, error)) return false;
+    if (time->count("groups_per_second") &&
+        !UintField(*time, "groups_per_second", &parsed.groups_per_second,
+                   error)) return false;
     if (port > 65535U || source_port > 65535U ||
         batch_packets > std::numeric_limits<std::uint32_t>::max() ||
         mtu > std::numeric_limits<std::uint32_t>::max() ||
@@ -392,16 +404,23 @@ bool BuildVdifSenderHeader(
     if (!ValidateConfig(config, error)) return false;
     if (group_index >= config.group_count)
         return Fail("group index is outside group_count", error);
-    std::uint64_t packet_duration = 0;
-    std::uint64_t elapsed = 0;
-    if (!CheckedMultiply(config.geometry.nsamp_per_packet,
-                         config.sample_interval_ps,
-                         "packet duration", &packet_duration, error) ||
-        !CheckedMultiply(group_index, packet_duration,
-                         "group time", &elapsed, error)) return false;
-    const std::uint64_t second_offset = elapsed / kPicosecondsPerSecond;
-    const std::uint64_t within_second = elapsed % kPicosecondsPerSecond;
-    const std::uint64_t frame = within_second / packet_duration;
+    std::uint64_t second_offset = 0;
+    std::uint64_t frame = 0;
+    if (config.groups_per_second) {
+        second_offset = group_index / config.groups_per_second;
+        frame = group_index % config.groups_per_second;
+    } else {
+        std::uint64_t packet_duration = 0;
+        std::uint64_t elapsed = 0;
+        if (!CheckedMultiply(config.geometry.nsamp_per_packet,
+                             config.sample_interval_ps,
+                             "packet duration", &packet_duration, error) ||
+            !CheckedMultiply(group_index, packet_duration,
+                             "group time", &elapsed, error)) return false;
+        second_offset = elapsed / kPicosecondsPerSecond;
+        const std::uint64_t within_second = elapsed % kPicosecondsPerSecond;
+        frame = within_second / packet_duration;
+    }
 
     modules::vdif_unpack::ProjectVdifHeader result = {};
     result.seconds_from_reference_epoch = static_cast<std::uint32_t>(

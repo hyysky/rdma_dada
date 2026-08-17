@@ -114,6 +114,31 @@ void TestTimeValidation() {
            "null ordinal output is rejected");
 }
 
+void TestFixedGroupsPerSecondRoundTrip() {
+    namespace unpack = rdma_dada::modules::vdif_unpack;
+    unpack::VdifTimeline timeline = {};
+    timeline.group_period_ps = UINT64_C(4403200);
+    timeline.groups_per_second = 227108U;
+    timeline.start_reference_epoch = 12U;
+    timeline.start_seconds = 100U;
+    timeline.start_frame = 0U;
+    timeline.expected_groups = 2U * timeline.groups_per_second;
+
+    std::uint32_t seconds = 0;
+    std::uint32_t frame = 0;
+    std::uint64_t ordinal = 0;
+    std::string error;
+    Expect(unpack::VdifOrdinalToTime(
+               timeline, 227108U, &seconds, &frame, &error),
+           "fixed packet rate crosses exactly one VDIF second: " + error);
+    Expect(seconds == 101U && frame == 0U,
+           "fixed packet rate starts each second at frame zero");
+    Expect(unpack::VdifTimeToOrdinal(
+               timeline, 12U, 101U, 0U, &ordinal, &error),
+           "fixed VDIF second maps back to ordinal: " + error);
+    Expect(ordinal == 227108U, "fixed VDIF second round trip is exact");
+}
+
 void TestHeaderValidation() {
     namespace unpack = rdma_dada::modules::vdif_unpack;
     const rdma_dada::PipelineConfig pipeline = MakePipeline(1.0, 512U);
@@ -189,6 +214,7 @@ void TestConversionOverflowIsRejected() {
 int main() {
     TestNonIntegralGroupsPerSecondRoundTrip();
     TestTimeValidation();
+    TestFixedGroupsPerSecondRoundTrip();
     TestHeaderValidation();
     TestConversionOverflowIsRejected();
     if (failures != 0) return 1;

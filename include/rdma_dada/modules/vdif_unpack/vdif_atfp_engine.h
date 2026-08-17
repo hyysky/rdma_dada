@@ -63,6 +63,10 @@ public:
     bool BeginTransfer(const VdifTimeline& timeline,
                        bool collect_missing_per_second,
                        std::string* error);
+    bool BeginTransfer(const VdifTimeline& timeline,
+                       bool collect_missing_per_second,
+                       bool discard_before_timeline_start,
+                       std::string* error);
     bool Configure(const VdifUnpackConfig& config,
                    const PipelineConfig& pipeline,
                    const VdifUnpackLayout& layout,

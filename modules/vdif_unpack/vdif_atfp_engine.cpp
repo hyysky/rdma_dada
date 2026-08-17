@@ -66,13 +66,14 @@ struct VdifAtfpUnpackEngine::Impl {
     bool prepared;
     bool configured;
     bool finished;
+    bool discard_before_timeline_start;
 
     Impl()
         : statistics(), groups_per_compute_block(0),
           reorder_horizon_groups(0), next_emit_ordinal(0),
           raw_block_bytes(0), last_raw_block_sequence(0),
           has_raw_block_sequence(false), prepared(false), configured(false),
-          finished(false) {}
+          finished(false), discard_before_timeline_start(false) {}
 
     std::uint64_t SlotIndex(std::uint64_t ordinal) const {
         return ordinal % layout.window_capacity_groups;
@@ -360,12 +361,18 @@ bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
 
 bool VdifAtfpUnpackEngine::BeginTransfer(const VdifTimeline& timeline,
                                          std::string* error) {
-    return BeginTransfer(timeline, false, error);
+    return BeginTransfer(timeline, false, false, error);
 }
 
 bool VdifAtfpUnpackEngine::BeginTransfer(
     const VdifTimeline& timeline, bool collect_missing_per_second,
     std::string* error) {
+    return BeginTransfer(timeline, collect_missing_per_second, false, error);
+}
+
+bool VdifAtfpUnpackEngine::BeginTransfer(
+    const VdifTimeline& timeline, bool collect_missing_per_second,
+    bool discard_before_timeline_start, std::string* error) {
     if (!impl_->prepared)
         return Fail("ATFP engine static resources are not prepared", error);
     if (impl_->configured && !impl_->finished)
@@ -412,6 +419,7 @@ bool VdifAtfpUnpackEngine::BeginTransfer(
     impl_->next_emit_ordinal = 0U;
     impl_->last_raw_block_sequence = 0U;
     impl_->has_raw_block_sequence = false;
+    impl_->discard_before_timeline_start = discard_before_timeline_start;
     impl_->configured = true;
     impl_->finished = false;
     return true;
@@ -456,13 +464,22 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
 
     for (std::uint64_t offset = 0; offset < size;
          offset += impl_->layout.raw_record_bytes) {
-        ++impl_->statistics.received_records;
         const std::uint8_t* record = data + offset;
         ProjectVdifHeader header = {};
         std::string ignored;
-        if (!DecodeProjectVdifV1(record, 32U, &header, &ignored) ||
-            !ValidateProjectVdifV1(header, impl_->geometry,
-                                   impl_->layout.raw_record_bytes, &ignored)) {
+        const bool decoded =
+            DecodeProjectVdifV1(record, 32U, &header, &ignored);
+        if (decoded && impl_->discard_before_timeline_start &&
+            header.reference_epoch == impl_->timeline.start_reference_epoch &&
+            (header.seconds_from_reference_epoch < impl_->timeline.start_seconds ||
+             (header.seconds_from_reference_epoch == impl_->timeline.start_seconds &&
+              header.frame_number_within_second < impl_->timeline.start_frame))) {
+            continue;
+        }
+        ++impl_->statistics.received_records;
+        if (!decoded || !ValidateProjectVdifV1(
+                header, impl_->geometry, impl_->layout.raw_record_bytes,
+                &ignored)) {
             ++impl_->statistics.invalid_header_packets;
             continue;
         }

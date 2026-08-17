@@ -193,6 +193,20 @@ void TestDeterministicCi8AndTimeRollover() {
            "non-integral groups per second use ordinal within current second");
 }
 
+void TestFixedPacketsPerSecondTimestamp() {
+    sim::VdifSenderSimConfig config = MakeConfig(101, 8);
+    config.groups_per_second = 227108U;
+    config.group_count = 227109U;
+    std::vector<std::uint8_t> record;
+    std::string error;
+    Expect(sim::BuildVdifSenderRecord(config, 227108U, &record, &error),
+           "fixed-rate second boundary record builds: " + error);
+    const unpack::ProjectVdifHeader header = Decode(record);
+    Expect(header.seconds_from_reference_epoch == 101U &&
+               header.frame_number_within_second == 0U,
+           "fixed packet count rolls over at exactly 227108 packets");
+}
+
 void TestCi16LittleEndianPayload() {
     sim::VdifSenderSimConfig config = MakeConfig(1000, 16);
     std::vector<std::uint8_t> record;
@@ -243,6 +257,7 @@ int main(int argc, char** argv) {
     TestStrictExampleConfig(argv[1]);
     TestStrictPacedConfig(argv[2]);
     TestDeterministicCi8AndTimeRollover();
+    TestFixedPacketsPerSecondTimestamp();
     TestCi16LittleEndianPayload();
     TestMtuRangeAndFaultInjection();
     if (failures) return 1;

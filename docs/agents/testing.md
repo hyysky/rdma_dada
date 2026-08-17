@@ -319,11 +319,20 @@ signal handler from publishing raw-ring EOD, and leave every downstream worker
 waiting indefinitely. This signal-forwarding path requires an executable
 regression test before a formal finite-transfer run.
 
-Receiver readiness must use the flushed initialization marker
-`Initialization complete, ready to start`, not the later buffered
-`RDMA receiver running` message. A readiness timeout must print every managed
+Receiver readiness must use the flushed `Receive threads ready` marker, which
+is emitted only after the CQ poll/repost and copy/raw-ring threads are running
+and any requested affinity has been verified. The earlier resource marker
+`Initialization complete, ready to start` is not sufficient. A readiness
+timeout must print every managed
 process PID, running state, recorded exit code and log tail; a silent timeout is
 a harness failure and provides no product evidence.
+
+The tuned receive defaults are `--send_n 64 --nsge 1 --poll-batch 32
+--recv-wr-num 1024`. In the dual-thread path, `send_n` is a maximum copy/repost
+batch, never a requirement to wait for 64 completions. Explicit qths1 Node-1
+placement uses `--poll-cpu 13 --copy-cpu 14`, worker CPU 15, sink CPU 16 and
+NUMA node 1; these values belong to the versioned runner invocation and are not
+hard-coded product defaults.
 
 Failure-time diagnostic collection and resource cleanup are reported
 separately. A missing artifact that was never expected to exist after an early

@@ -12,6 +12,7 @@ namespace vdif_unpack {
 
 struct VdifTimeline {
     std::uint64_t group_period_ps;
+    std::uint64_t groups_per_second;
     std::uint8_t start_reference_epoch;
     std::uint32_t start_seconds;
     std::uint32_t start_frame;

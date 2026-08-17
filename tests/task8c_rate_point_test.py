@@ -157,6 +157,19 @@ def make_plan(
     return plan
 
 
+def select_single_station(plan, station_id, source_port=41001):
+    source = plan.source
+    source["observation"]["station_ids"] = [station_id]
+    resolved_plan = dict(plan.resolved_plan)
+    resolved_plan["source_json"] = json.dumps(source)
+    return dataclasses.replace(
+        plan,
+        per_station_gbps=plan.aggregate_gbps,
+        resolved_plan=resolved_plan,
+        sender_source_port=source_port,
+    )
+
+
 class FakeProcess:
     def __init__(self, returncode=0, output=""):
         self.returncode = returncode
@@ -527,6 +540,42 @@ class Task8cRatePointTest(unittest.TestCase):
             15141,
         )
 
+    def test_start_delay_accepts_receive_or_unpack_dbnull(self):
+        MODULE.RateRequest(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+            unpack_start_delay_seconds=1,
+        ).validate()
+        MODULE.RateRequest(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+            station_id=101,
+            sender_source_port=41001,
+            unpack_start_delay_seconds=1,
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "unpack_start_delay_seconds"):
+            MODULE.RateRequest(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="full",
+                unpack_start_delay_seconds=1,
+            ).validate()
+
+    def test_15gbps_uses_fixed_integer_packets_per_second(self):
+        self.assertEqual(
+            MODULE._fixed_packets_per_second(15.0, 2, 4128),
+            227_108,
+        )
+        self.assertAlmostEqual(
+            MODULE._aggregate_gbps_for_packet_rate(227_108, 2, 4128),
+            15.000029184,
+        )
+
     def test_window_blocks_include_wait_and_skew_reserve_at_30gbps(self):
         self.assertEqual(
             MODULE._window_blocks_for_horizon(
@@ -763,7 +812,7 @@ class Task8cRatePointTest(unittest.TestCase):
         worker_start = start.index("vdif_unpack_worker")
         worker_ready = start.index('--ready-file "$run_dir/worker.ready"')
         receiver_start = start.index('rdma2dada')
-        receiver_ready = start.index("Initialization complete, ready to start")
+        receiver_ready = start.index("Receive threads ready")
         pipeline_ready = start.index('touch "$run_dir/pipeline.ready"')
         self.assertLess(worker_start, worker_ready)
         self.assertLess(worker_ready, receiver_start)
@@ -820,6 +869,84 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(return_code, 0)
         self.assertEqual(json.loads(stdout.getvalue())["worker_cpu_list"], "16-23")
 
+    def test_explicit_receive_pipeline_cpu_and_numa_placement(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0, 30.0, compute_consumer="dbnull",
+                pipeline_stage="unpack",
+            ),
+            receiver_poll_cpu=13,
+            receiver_copy_cpu=14,
+            worker_cpu_list="15",
+            sink_cpu_list="16",
+            numa_node=1,
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-placement")
+        self.assertIn(
+            "--poll-cpu 13 --copy-cpu 14", bundle["start.sh"]
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 15",
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 16",
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 dada_db",
+            bundle["prepare.sh"],
+        )
+        self.assertIn("Receive threads ready", bundle["start.sh"])
+
+    def test_two_receiver_shards_render_distinct_flows_and_poll_cpus(self):
+        plan = dataclasses.replace(
+            make_plan(
+                30.0, 30.0, compute_consumer="dbnull",
+                pipeline_stage="receive",
+            ),
+            receiver_shards=2,
+            receiver_poll_cpu_list="13,14",
+            receiver_copy_cpu=15,
+        )
+        flows = ["174.0.1.100:41001", "174.0.1.101:51001"]
+        start = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-shards", receiver_flows=flows
+        )["start.sh"]
+        self.assertIn("--receiver-shards 2", start)
+        self.assertIn("--poll-cpus 13,14 --copy-cpu 15", start)
+        self.assertIn("--receiver-flow 174.0.1.100:41001", start)
+        self.assertIn("--receiver-flow 174.0.1.101:51001", start)
+
+    def test_receiver_shard_configuration_requires_matching_poll_cpus(self):
+        MODULE.RateRequest(
+            30.0, 30.0, compute_consumer="dbnull",
+            pipeline_stage="receive", receiver_shards=2,
+            receiver_poll_cpu_list="13,14", receiver_copy_cpu=15,
+            worker_cpu_list="16", sink_cpu_list="17", numa_node=1,
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "receiver_shards"):
+            MODULE.RateRequest(
+                30.0, 30.0, compute_consumer="dbnull",
+                pipeline_stage="receive", receiver_shards=2,
+                receiver_poll_cpu_list="13", receiver_copy_cpu=15,
+                worker_cpu_list="16", sink_cpu_list="17", numa_node=1,
+            ).validate()
+
+    def test_partial_or_overlapping_cpu_placement_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            MODULE.RateRequest(
+                15.0, 30.0, compute_consumer="dbnull",
+                pipeline_stage="unpack", receiver_poll_cpu=13,
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            MODULE.RateRequest(
+                15.0, 30.0, compute_consumer="dbnull",
+                pipeline_stage="unpack", receiver_poll_cpu=13,
+                receiver_copy_cpu=14, worker_cpu_list="15",
+                sink_cpu_list="15", numa_node=1,
+            ).validate()
+
     def test_ring_creation_uses_compiler_ring_plan_values(self):
         plan = make_plan(0.1, 10.0, compute_consumer="dbnull")
         bundle = MODULE.build_qths_bundle(
@@ -861,7 +988,7 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn('exited during readiness', bundle["start.sh"])
         self.assertIn('tail -n 40 "$run_dir/$name.log"', bundle["start.sh"])
         self.assertIn(
-            "Initialization complete, ready to start",
+            "Receive threads ready",
             bundle["start.sh"],
         )
         self.assertIn("readiness timed out", bundle["start.sh"])
@@ -911,7 +1038,7 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertNotIn("vdif_unpack_worker", bundle["start.sh"])
         self.assertNotIn("worker.ready", bundle["start.sh"])
         self.assertNotIn("pipeline_worker", bundle["start.sh"])
-        self.assertIn("Initialization complete, ready to start", bundle["start.sh"])
+        self.assertIn("Receive threads ready", bundle["start.sh"])
         self.assertIn('touch "$run_dir/pipeline.ready"', bundle["start.sh"])
         self.assertNotIn("compute_key", plan.as_dict())
         self.assertNotIn("compute_block_bytes", plan.as_dict())
@@ -941,6 +1068,31 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(plan.as_dict()["receiver_nsge"], 1)
         self.assertEqual(plan.as_dict()["receiver_poll_batch"], 32)
         self.assertEqual(plan.as_dict()["receiver_wr_num"], 1024)
+
+    def test_receive_stage_uses_tuned_rdma_queue_defaults(self):
+        request = MODULE.RateRequest(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+
+        self.assertEqual(request.receiver_send_n, 64)
+        self.assertEqual(request.receiver_nsge, 1)
+        self.assertEqual(request.receiver_poll_batch, 32)
+        self.assertEqual(request.receiver_wr_num, 1024)
+
+        plan = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-default-rdma-queue")
+        self.assertIn(
+            '--send_n 64 --nsge 1 --poll-batch 32 --recv-wr-num 1024',
+            bundle["start.sh"],
+        )
 
     def test_receiver_cumulative_diagnostics_are_opt_in(self):
         default_plan = make_plan(
@@ -976,6 +1128,23 @@ class Task8cRatePointTest(unittest.TestCase):
             "Receive summary: accepted=180, wrong_length=0, "
             "published=180, blocks=1, partial_blocks=1, "
             "cq_tail_records=52\n"
+            "Receive pipeline summary: poll_calls=220, empty_polls=40, "
+            "full_polls=5, reposted_wrs=180, repost_failures=0, "
+            "copy_batches=4, min_posted_wrs=188, "
+            "completion_queue_high_watermark=96, "
+            "recycle_queue_high_watermark=64, "
+            "completion_to_recycle_ns_total=9000, "
+            "completion_to_recycle_ns_max=700\n"
+            "[RDMA] Receive shard summary: shard=0, poll_calls=120, "
+            "empty_polls=20, full_polls=3, completions=100, "
+            "reposted_wrs=100, repost_failures=0, min_posted_wrs=900, "
+            "completion_queue_high_watermark=80, "
+            "recycle_queue_high_watermark=20\n"
+            "[RDMA] Receive shard summary: shard=1, poll_calls=100, "
+            "empty_polls=20, full_polls=2, completions=80, "
+            "reposted_wrs=80, repost_failures=0, min_posted_wrs=920, "
+            "completion_queue_high_watermark=64, "
+            "recycle_queue_high_watermark=16\n"
         )
         statistics = MODULE.parse_receive_statistics(
             receiver,
@@ -1017,6 +1186,42 @@ class Task8cRatePointTest(unittest.TestCase):
                     "posted_wr": 204,
                     "min_posted_wr": 188,
                     "copy_batches": 2,
+                },
+            ],
+        )
+        self.assertEqual(
+            statistics["receiver"]["pipeline"]["min_posted_wrs"], 188
+        )
+        self.assertEqual(
+            statistics["receiver"]["pipeline"]
+            ["completion_queue_high_watermark"], 96
+        )
+        self.assertEqual(
+            statistics["receiver"]["shards"],
+            [
+                {
+                    "shard": 0,
+                    "poll_calls": 120,
+                    "empty_polls": 20,
+                    "full_polls": 3,
+                    "completions": 100,
+                    "reposted_wrs": 100,
+                    "repost_failures": 0,
+                    "min_posted_wrs": 900,
+                    "completion_queue_high_watermark": 80,
+                    "recycle_queue_high_watermark": 20,
+                },
+                {
+                    "shard": 1,
+                    "poll_calls": 100,
+                    "empty_polls": 20,
+                    "full_polls": 2,
+                    "completions": 80,
+                    "reposted_wrs": 80,
+                    "repost_failures": 0,
+                    "min_posted_wrs": 920,
+                    "completion_queue_high_watermark": 64,
+                    "recycle_queue_high_watermark": 16,
                 },
             ],
         )
@@ -1063,6 +1268,24 @@ class Task8cRatePointTest(unittest.TestCase):
             diagnostic_plan.as_dict()["unpack_missing_per_second"]
         )
 
+    def test_unpack_start_delay_adds_worker_pre_timeline_policy(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="unpack",
+            ),
+            unpack_start_delay_seconds=1,
+            preparation_groups=227_108,
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-unpack-delay")
+        self.assertIn("--pre-timeline-policy discard", bundle["start.sh"])
+        self.assertIn(
+            "--pre-timeline-policy",
+            json.loads(bundle["worker-argv.json"]),
+        )
+
     def test_receive_queue_cli_parameters_are_recorded_in_dry_run(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             return_code = MODULE.main([
@@ -1082,6 +1305,36 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(rendered["receiver_nsge"], 1)
         self.assertEqual(rendered["receiver_poll_batch"], 32)
         self.assertEqual(rendered["receiver_wr_num"], 1024)
+
+    def test_receive_stage_accepts_explicit_single_station_sender(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            try:
+                return_code = MODULE.main([
+                    "--aggregate-gbps", "15",
+                    "--duration-seconds", "30",
+                    "--compute-consumer", "dbnull",
+                    "--pipeline-stage", "receive",
+                    "--station-id", "101",
+                    "--sender-source-port", "41001",
+                    "--dry-run",
+                ])
+            except SystemExit as error:
+                self.fail(f"single-Station CLI was rejected: {error}")
+        self.assertEqual(return_code, 0)
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["station_id"], 101)
+        self.assertEqual(rendered["sender_source_port"], 41001)
+
+    def test_single_station_selection_is_receive_only(self):
+        with self.assertRaisesRegex(ValueError, "station_id requires receive"):
+            MODULE.RateRequest(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="unpack",
+                station_id=101,
+                sender_source_port=41001,
+            ).validate()
 
     def test_receive_stage_requires_dbnull(self):
         MODULE.RateRequest(
@@ -1172,6 +1425,50 @@ class Task8cRatePointTest(unittest.TestCase):
             expect_pipeline_worker=False,
         )
         self.assertNotIn("gpu", statistics)
+        MODULE._validate_statistics(statistics, plan, "")
+
+    def test_unpack_start_accepts_loss_only_during_preparation(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="unpack",
+            ),
+            unpack_start_delay_seconds=1,
+            preparation_groups=227_108,
+            packets_per_second=227_108,
+        )
+        formal_records = plan.group_count * plan.nant
+        statistics = {
+            "receiver": {
+                "accepted": formal_records + 400_000,
+                "published": formal_records + 400_000,
+                "wrong_length": 0,
+                "cq_errors": 0,
+            },
+            "unpack": {
+                "records": formal_records,
+                "accepted": formal_records,
+                "bad_header": 0,
+                "invalid_data": 0,
+                "unknown_station": 0,
+                "duplicate": 0,
+                "late": 0,
+                "out_of_range": 0,
+                "complete_groups": plan.group_count,
+                "incomplete_groups": 0,
+                "fully_missing_groups": 0,
+                "missing_station": 0,
+            },
+            "compute": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+
         MODULE._validate_statistics(statistics, plan, "")
 
     def test_unpack_missing_per_second_statistics_are_parsed_and_reconciled(self):
@@ -1278,6 +1575,41 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(second["station"]["station_id"], 102)
         self.assertEqual(first["destination"], second["destination"])
 
+    def test_sender_starts_one_vdif_second_before_formal_timeline(self):
+        base = make_plan(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="unpack",
+        )
+        source = base.source
+        resolved_plan = dict(base.resolved_plan)
+        resolved_plan["source_json"] = json.dumps(source)
+        plan = dataclasses.replace(
+            base,
+            resolved_plan=resolved_plan,
+            unpack_start_delay_seconds=1,
+            preparation_groups=227_108,
+            packets_per_second=227_108,
+        )
+
+        sender = MODULE.build_sender_config(
+            plan, 101, "174.0.1.100", 41001, "2030-01-01-00:03:00"
+        )
+
+        self.assertEqual(sender["packet"]["sample_interval_ps"], "1000000")
+        self.assertEqual(sender["time"]["groups_per_second"], 227_108)
+        self.assertEqual(
+            sender["time"]["start_seconds"],
+            plan.resolved_plan["resolved"]["group_start_seconds"] - 1,
+        )
+        self.assertEqual(
+            sender["time"]["group_count"], plan.group_count + 227_108
+        )
+        self.assertAlmostEqual(
+            sender["transmit"]["target_gbps"], 7.500014592
+        )
+
     def test_sender_source_ports_are_deterministic_per_run_and_distinct(self):
         first = MODULE.derive_sender_source_ports("suite-a-measured-01")
         repeated = MODULE.derive_sender_source_ports("suite-a-measured-01")
@@ -1366,6 +1698,55 @@ class Task8cRatePointTest(unittest.TestCase):
         ]
         self.assertEqual(len(sender_commands), 2)
         self.assertTrue(all(expected in command for command in sender_commands))
+
+    def test_single_station_backend_only_prepares_and_starts_selected_sender(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "suite" / "measured-01"
+            run_dir.mkdir(parents=True)
+            transport = RecordingTransport()
+            backend = MODULE.SshBackend(
+                transport=transport,
+                project_root=root,
+                known_hosts=root / "known-hosts",
+                sender_binary_dir=pathlib.Path("/opt/task8c-sender"),
+            )
+            plan = select_single_station(
+                make_plan(
+                    15.0,
+                    30.0,
+                    compute_consumer="dbnull",
+                    pipeline_stage="receive",
+                ),
+                101,
+            )
+            preparation = backend.prepare(plan, run_dir)
+            try:
+                evidence = backend.prepare_configs(plan, run_dir, preparation)
+                processes = backend.start_senders(plan, run_dir)
+            except MODULE.StageError as error:
+                self.fail(f"single-Station receive-only setup failed: {error}")
+
+            self.assertTrue((run_dir / "bundle" / "sender101.json").exists())
+            self.assertFalse((run_dir / "bundle" / "sender102.json").exists())
+            self.assertEqual(evidence["sender_endpoints"], ["174.0.1.100:41001"])
+            self.assertIn("qtpulsar1:fpga_sender_sim", evidence["binary_sha"])
+            self.assertNotIn("qtpulsar2:fpga_sender_sim", evidence["binary_sha"])
+            self.assertEqual(len(processes), 1)
+            try:
+                backend._capture_sender_nic("after")
+            except AttributeError as error:
+                self.fail(f"sender NIC capture is unavailable: {error}")
+
+        remote_commands = [call[2] for call in transport.calls]
+        self.assertTrue(any("qtpulsar1" in command for command in remote_commands))
+        self.assertFalse(any("qtpulsar2" in command for command in remote_commands))
+        sender_nic_commands = [
+            command for command in remote_commands
+            if any("capture_nic_counters.py" in item for item in command)
+            and any("sender-nic-" in item for item in command)
+        ]
+        self.assertEqual(len(sender_nic_commands), 2)
 
     def test_dbnull_consumer_uses_single_transfer_zero_copy_without_disk_output(self):
         plan = make_plan(
@@ -1562,8 +1943,10 @@ class Task8cRatePointTest(unittest.TestCase):
                 "qths1:validation_report.json",
                 "qths1:worker-argv.json",
                 "qtpulsar1:101.json",
+                "qtpulsar1:capture_nic_counters.py",
                 "qtpulsar1:probe_sender_endpoint.py",
                 "qtpulsar2:102.json",
+                "qtpulsar2:capture_nic_counters.py",
                 "qtpulsar2:probe_sender_endpoint.py",
             ],
         )
@@ -1575,7 +1958,9 @@ class Task8cRatePointTest(unittest.TestCase):
                 "qths1:ethtool",
                 "qths1:rdma2dada",
                 "qths1:vdif_unpack_worker",
+                "qtpulsar1:ethtool",
                 "qtpulsar1:fpga_sender_sim",
+                "qtpulsar2:ethtool",
                 "qtpulsar2:fpga_sender_sim",
             ],
         )
