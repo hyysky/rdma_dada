@@ -62,15 +62,9 @@ class RateRequest:
     worker_cpu_list: str | None = None
     sink_cpu_list: str | None = None
     receiver_poll_cpu: int | None = None
-    receiver_poll_cpu_list: str | None = None
-    receiver_copy_cpu: int | None = None
-    receiver_shards: int = 1
     numa_node: int | None = None
-    receiver_send_n: int = 64
-    receiver_nsge: int = 1
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
-    receiver_diagnostics: bool = False
     unpack_missing_per_second: bool = False
     unpack_start_delay_seconds: int = 0
     station_id: int | None = None
@@ -94,10 +88,9 @@ class RateRequest:
         if self.batch_packets <= 0:
             raise ValueError("batch_packets must be positive")
         if (
-            self.receiver_send_n <= 0
-            or self.receiver_nsge <= 0
-            or self.receiver_poll_batch <= 0
-            or self.receiver_wr_num < 0
+            self.receiver_poll_batch <= 0
+            or self.receiver_wr_num <= 0
+            or self.receiver_poll_batch > self.receiver_wr_num
         ):
             raise ValueError("receiver queue parameters are invalid")
         if self.compute_consumer not in ("dbdisk", "dbnull"):
@@ -135,59 +128,38 @@ class RateRequest:
                 "with dbnull"
             )
         if self.worker_cpu_list is not None:
-            if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*",
+            if not re.fullmatch(r"[0-9]+(?:,[0-9]+){2,}",
                                 self.worker_cpu_list):
-                raise ValueError("worker_cpu_list must use Linux CPU-list syntax")
-            for part in self.worker_cpu_list.split(","):
-                bounds = [int(value) for value in part.split("-")]
-                if len(bounds) == 2 and bounds[0] > bounds[1]:
-                    raise ValueError("worker_cpu_list range must be ascending")
-        if self.receiver_shards <= 0:
-            raise ValueError("receiver_shards must be positive")
-        if self.receiver_poll_cpu is not None and self.receiver_poll_cpu_list:
-            raise ValueError(
-                "receiver_poll_cpu and receiver_poll_cpu_list conflict"
-            )
-        poll_cpus: list[int] = []
-        if self.receiver_poll_cpu_list:
-            if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*",
-                                self.receiver_poll_cpu_list):
-                raise ValueError("receiver poll CPU list is invalid")
-            poll_cpus = [int(value) for value in
-                         self.receiver_poll_cpu_list.split(",")]
-            if len(poll_cpus) != self.receiver_shards:
                 raise ValueError(
-                    "receiver_shards must match receiver poll CPU count"
+                    "worker_cpu_list must be ordered coordinator,worker...,writer CPUs"
                 )
-        elif self.receiver_poll_cpu is not None:
-            if self.receiver_shards != 1:
-                raise ValueError(
-                    "receiver_shards greater than one requires poll CPU list"
-                )
-            poll_cpus = [self.receiver_poll_cpu]
-        placement_active = bool(poll_cpus) or any(value is not None for value in (
-            self.receiver_copy_cpu, self.sink_cpu_list, self.numa_node,
+            unpack_cpus = [int(value) for value in self.worker_cpu_list.split(",")]
+            if len(set(unpack_cpus)) != len(unpack_cpus):
+                raise ValueError("unpack thread CPUs must be distinct")
+        placement_active = any(value is not None for value in (
+            self.receiver_poll_cpu, self.sink_cpu_list, self.numa_node,
+            self.worker_cpu_list,
         ))
         if placement_active:
-            if (not poll_cpus or self.receiver_copy_cpu is None or
+            worker_required = self.pipeline_stage != "receive"
+            if (self.receiver_poll_cpu is None or
                     self.sink_cpu_list is None or self.numa_node is None or
-                    self.worker_cpu_list is None):
+                    (worker_required and self.worker_cpu_list is None)):
                 raise ValueError(
-                    "receiver poll/copy, worker, sink and NUMA placement "
+                    "receiver poll, worker when used, sink and NUMA placement "
                     "must be supplied together"
                 )
             if (
-                any(cpu < 0 for cpu in poll_cpus)
-                or self.receiver_copy_cpu < 0
+                self.receiver_poll_cpu < 0
                 or self.numa_node < 0
-                or not re.fullmatch(r"[0-9]+", self.worker_cpu_list)
                 or not re.fullmatch(r"[0-9]+", self.sink_cpu_list)
             ):
                 raise ValueError("explicit CPU/NUMA placement is invalid")
-            roles = poll_cpus + [
-                self.receiver_copy_cpu, int(self.worker_cpu_list),
-                int(self.sink_cpu_list),
-            ]
+            roles = [self.receiver_poll_cpu, int(self.sink_cpu_list)]
+            if worker_required:
+                roles.extend(
+                    int(value) for value in self.worker_cpu_list.split(",")
+                )
             if len(set(roles)) != len(roles):
                 raise ValueError("receive, worker and sink CPUs must be distinct")
 
@@ -250,15 +222,9 @@ class RatePlan:
     worker_cpu_list: str | None = None
     sink_cpu_list: str | None = None
     receiver_poll_cpu: int | None = None
-    receiver_poll_cpu_list: str | None = None
-    receiver_copy_cpu: int | None = None
-    receiver_shards: int = 1
     numa_node: int | None = None
-    receiver_send_n: int = 64
-    receiver_nsge: int = 1
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
-    receiver_diagnostics: bool = False
     unpack_missing_per_second: bool = False
     unpack_start_delay_seconds: int = 0
     preparation_groups: int = 0
@@ -756,15 +722,9 @@ def compile_rate_plan(
         worker_cpu_list=request.worker_cpu_list,
         sink_cpu_list=request.sink_cpu_list,
         receiver_poll_cpu=request.receiver_poll_cpu,
-        receiver_poll_cpu_list=request.receiver_poll_cpu_list,
-        receiver_copy_cpu=request.receiver_copy_cpu,
-        receiver_shards=request.receiver_shards,
         numa_node=request.numa_node,
-        receiver_send_n=request.receiver_send_n,
-        receiver_nsge=request.receiver_nsge,
         receiver_poll_batch=request.receiver_poll_batch,
         receiver_wr_num=request.receiver_wr_num,
-        receiver_diagnostics=request.receiver_diagnostics,
         unpack_missing_per_second=request.unpack_missing_per_second,
         unpack_start_delay_seconds=request.unpack_start_delay_seconds,
         preparation_groups=preparation_groups,
@@ -912,7 +872,6 @@ def build_qths_bundle(
     dbnull_path: str = "dada_dbnull",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
     ethtool_path: str = "ethtool",
-    receiver_flows: Sequence[str] = (),
 ) -> dict[str, str | bytes]:
     if not plan.artifact_files:
         raise ValueError("compiler artifact bundle is required")
@@ -924,17 +883,9 @@ def build_qths_bundle(
         else plan.compute_key
     )
     receiver_device = str(plan.source["receiver"]["device"])
-    if plan.receiver_shards != 1 and len(receiver_flows) != plan.receiver_shards:
-        raise ValueError("receiver flow count must equal receiver_shards")
-    shard_args = f" --receiver-shards {plan.receiver_shards}"
-    if plan.receiver_poll_cpu_list:
-        shard_args += f" --poll-cpus {plan.receiver_poll_cpu_list}"
-    elif plan.receiver_poll_cpu is not None:
-        shard_args += f" --poll-cpu {plan.receiver_poll_cpu}"
-    if plan.receiver_copy_cpu is not None:
-        shard_args += f" --copy-cpu {plan.receiver_copy_cpu}"
-    for flow in receiver_flows:
-        shard_args += f" --receiver-flow {flow}"
+    receiver_args = ""
+    if plan.receiver_poll_cpu is not None:
+        receiver_args += f" --poll-cpu {plan.receiver_poll_cpu}"
     capture_nic_counters = '''#!/usr/bin/env python3
 import datetime
 import json
@@ -1116,11 +1067,6 @@ report_readiness_failure() {
 }
 '''
     worker_program = numa_prefix + '"$project/vdif_unpack_worker"'
-    if plan.worker_cpu_list is not None:
-        worker_program = (
-            numa_prefix + f'/usr/bin/taskset -c {plan.worker_cpu_list} '
-            '"$project/vdif_unpack_worker"'
-        )
     worker_start = ""
     if not receive_only:
         worker_diagnostics = (
@@ -1135,8 +1081,12 @@ report_readiness_failure() {
             f" --groups-per-second {plan.packets_per_second}"
             if plan.packets_per_second else ""
         )
+        thread_cpus = (
+            f" --thread-cpus {plan.worker_cpu_list}"
+            if plan.worker_cpu_list is not None else ""
+        )
         worker_start = f'''rm -f "$run_dir/worker.ready"
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics}{pre_timeline_policy}{fixed_packet_rate} >"$run_dir/worker.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics}{pre_timeline_policy}{fixed_packet_rate}{thread_cpus} >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
 for _ in $(seq 1 300); do
   if ! kill -0 "$(cat "$run_dir/worker.pid")" 2>/dev/null; then
@@ -1164,7 +1114,11 @@ if [[ ! -f "$run_dir/worker.child.pid" ]]; then
   exit 1
 fi
 worker_child_pid=$(cat "$run_dir/worker.child.pid")
-/usr/bin/taskset -pc "$worker_child_pid" >"$run_dir/worker-affinity.txt"
+: >"$run_dir/worker-affinity.txt"
+for task_path in /proc/"$worker_child_pid"/task/*; do
+  task_id=${{task_path##*/}}
+  /usr/bin/taskset -pc "$task_id" >>"$run_dir/worker-affinity.txt"
+done
 '''
     start = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -1176,7 +1130,7 @@ project={qths_binary_dir}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {numa_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --send_n {plan.receiver_send_n} --nsge {plan.receiver_nsge} --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{shard_args}{' --debug' if plan.receiver_diagnostics else ''} >"$run_dir/receiver.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {numa_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{receiver_args} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
@@ -1315,14 +1269,14 @@ summary = {{
             worker_argv += [
                 "/usr/bin/numactl", f"--membind={plan.numa_node}"
             ]
-        if plan.worker_cpu_list is not None:
-            worker_argv += ["/usr/bin/taskset", "-c", plan.worker_cpu_list]
         worker_argv += [
             f"{qths_binary_dir}/vdif_unpack_worker",
             "--plan", f"{remote_run_dir}/resolved_observation.json",
             "--reorder-horizon-groups", str(plan.reorder_horizon_groups),
             "--ready-file", f"{remote_run_dir}/worker.ready",
         ]
+        if plan.worker_cpu_list is not None:
+            worker_argv += ["--thread-cpus", plan.worker_cpu_list]
         if plan.unpack_missing_per_second:
             worker_argv += ["--diagnostics", "missing-per-second"]
         if plan.unpack_start_delay_seconds:
@@ -1640,11 +1594,6 @@ class SshBackend:
                 json.dumps(plan.source.get("observation", {}).get("station_ids", [])),
                 str(error),
             ) from error
-        receiver_flows = (
-            [f"{spec.source_ip}:{spec.source_port}"
-             for spec in self._sender_specs]
-            if plan.receiver_shards > 1 else []
-        )
         for name, content in build_qths_bundle(
             plan,
             self.remote_run_dir,
@@ -1653,7 +1602,6 @@ class SshBackend:
             self._psrdada_paths["dada_dbnull"],
             str(self.qths_binary_dir),
             self._diagnostic_paths["ethtool"],
-            receiver_flows,
         ).items():
             path = qths_root / name
             if isinstance(content, bytes):
@@ -1881,18 +1829,8 @@ class SshBackend:
             f"{self.remote_run_dir}/resolved_observation.json",
             "--preflight-only",
         ]
-        preflight_argv += ["--receiver-shards", str(plan.receiver_shards)]
-        if plan.receiver_poll_cpu_list:
-            preflight_argv += ["--poll-cpus", plan.receiver_poll_cpu_list]
-        elif plan.receiver_poll_cpu is not None:
+        if plan.receiver_poll_cpu is not None:
             preflight_argv += ["--poll-cpu", str(plan.receiver_poll_cpu)]
-        if plan.receiver_copy_cpu is not None:
-            preflight_argv += ["--copy-cpu", str(plan.receiver_copy_cpu)]
-        if plan.receiver_shards > 1:
-            for spec in self._sender_specs:
-                preflight_argv += [
-                    "--receiver-flow", f"{spec.source_ip}:{spec.source_port}"
-                ]
         receiver_preflight = self._ssh(
             "qths1", preflight_argv, "CONFIG_READY"
         )
@@ -2268,10 +2206,7 @@ class SshBackend:
         receiver_log = (qths_copy / "receiver.log").read_text()
         summary = json.loads((qths_copy / summary_name).read_text())
         if plan.pipeline_stage == "receive":
-            statistics = parse_receive_statistics(
-                receiver_log, summary,
-                expect_receiver_diagnostics=plan.receiver_diagnostics,
-            )
+            statistics = parse_receive_statistics(receiver_log, summary)
         else:
             pipeline_worker_log = ""
             if plan.uses_pipeline_worker:
@@ -2283,7 +2218,6 @@ class SshBackend:
                 pipeline_worker_log,
                 expect_pipeline_worker=plan.uses_pipeline_worker,
                 expect_missing_per_second=plan.unpack_missing_per_second,
-                expect_receiver_diagnostics=plan.receiver_diagnostics,
             )
         statistics["nic"] = nic_counter_evidence(
             json.loads((qths_copy / "nic-before.json").read_text()),
@@ -2601,12 +2535,11 @@ def _validate_statistics(
         )
 
 
-def _parse_receiver_statistics(
-    receiver_log: str, expect_diagnostics: bool = False
-) -> dict[str, Any]:
+def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
     receiver_match = re.search(
         r"Receive summary:\s*accepted=(\d+),\s*wrong_length=(\d+),\s*"
-        r"published=(\d+),\s*blocks=(\d+),\s*partial_blocks=(\d+),\s*"
+        r"(?:zeroed=(\d+),\s*)?published=(\d+),\s*blocks=(\d+),\s*"
+        r"partial_blocks=(\d+),\s*"
         r"cq_tail_records=(\d+)",
         receiver_log,
     )
@@ -2616,94 +2549,40 @@ def _parse_receiver_statistics(
             receiver_log, "missing receiver summary",
         )
     cq_patterns = (
-        "CQ status error", "invalid WR ID", "unexpected opcode", "repost failed",
+        "Fatal receive completion", "Failed to poll direct raw CQ",
+        "Failed to post receive WR batch", "Invalid direct raw slot completion",
     )
     result: dict[str, Any] = {
         "accepted": int(receiver_match.group(1)),
         "wrong_length": int(receiver_match.group(2)),
-        "published": int(receiver_match.group(3)),
-        "blocks": int(receiver_match.group(4)),
-        "partial_blocks": int(receiver_match.group(5)),
-        "cq_tail_records": int(receiver_match.group(6)),
+        "zeroed": int(receiver_match.group(3) or 0),
+        "published": int(receiver_match.group(4)),
+        "blocks": int(receiver_match.group(5)),
+        "partial_blocks": int(receiver_match.group(6)),
+        "cq_tail_records": int(receiver_match.group(7)),
         "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
     }
-    pipeline_match = re.search(
-        r"Receive pipeline summary:\s*poll_calls=(\d+),\s*"
+    direct_match = re.search(
+        r"Direct receive summary:\s*poll_calls=(\d+),\s*"
         r"empty_polls=(\d+),\s*full_polls=(\d+),\s*"
         r"reposted_wrs=(\d+),\s*repost_failures=(\d+),\s*"
-        r"copy_batches=(\d+),\s*min_posted_wrs=(\d+),\s*"
-        r"completion_queue_high_watermark=(\d+),\s*"
-        r"recycle_queue_high_watermark=(\d+),\s*"
-        r"completion_to_recycle_ns_total=(\d+),\s*"
-        r"completion_to_recycle_ns_max=(\d+)",
+        r"repost_batches=(\d+),\s*min_posted_wrs=(\d+),\s*"
+        r"poll_batch_high_watermark=(\d+),\s*"
+        r"completion_to_repost_ns_total=(\d+),\s*"
+        r"completion_to_repost_ns_max=(\d+)",
         receiver_log,
     )
-    if pipeline_match:
-        result["pipeline"] = dict(zip(
+    if direct_match:
+        result["direct"] = dict(zip(
             (
                 "poll_calls", "empty_polls", "full_polls",
-                "reposted_wrs", "repost_failures", "copy_batches",
-                "min_posted_wrs", "completion_queue_high_watermark",
-                "recycle_queue_high_watermark",
-                "completion_to_recycle_ns_total",
-                "completion_to_recycle_ns_max",
+                "reposted_wrs", "repost_failures", "repost_batches",
+                "min_posted_wrs", "poll_batch_high_watermark",
+                "completion_to_repost_ns_total",
+                "completion_to_repost_ns_max",
             ),
-            (int(value) for value in pipeline_match.groups()),
+            (int(value) for value in direct_match.groups()),
         ))
-    shard_pattern = re.compile(
-        r"\[RDMA\] Receive shard summary:\s*shard=(\d+),\s*"
-        r"poll_calls=(\d+),\s*empty_polls=(\d+),\s*"
-        r"full_polls=(\d+),\s*completions=(\d+),\s*"
-        r"reposted_wrs=(\d+),\s*repost_failures=(\d+),\s*"
-        r"min_posted_wrs=(\d+),\s*"
-        r"completion_queue_high_watermark=(\d+),\s*"
-        r"recycle_queue_high_watermark=(\d+)"
-    )
-    shards = [
-        dict(zip(
-            (
-                "shard", "poll_calls", "empty_polls", "full_polls",
-                "completions", "reposted_wrs", "repost_failures",
-                "min_posted_wrs", "completion_queue_high_watermark",
-                "recycle_queue_high_watermark",
-            ),
-            (int(value) for value in match.groups()),
-        ))
-        for match in shard_pattern.finditer(receiver_log)
-    ]
-    if shards:
-        result["shards"] = shards
-    diagnostic_pattern = re.compile(
-        r"\[RDMA_DIAG\]\s+sample=(\d+)\s+elapsed_ns=(\d+)\s+"
-        r"poll_calls=(\d+)\s+empty_polls=(\d+)\s+completions=(\d+)\s+"
-        r"full_polls=(\d+)\s+accepted=(\d+)\s+reposted=(\d+)\s+"
-        r"repost_failures=(\d+)\s+posted_wr=(\d+)\s+"
-        r"min_posted_wr=(\d+)\s+copy_batches=(\d+)"
-    )
-    diagnostics = []
-    for match in diagnostic_pattern.finditer(receiver_log):
-        values = [int(value) for value in match.groups()]
-        diagnostics.append(dict(zip(
-            (
-                "sample", "elapsed_ns", "poll_calls", "empty_polls",
-                "completions", "full_polls", "accepted", "reposted",
-                "repost_failures", "posted_wr", "min_posted_wr",
-                "copy_batches",
-            ),
-            values,
-        )))
-    if diagnostics:
-        if [item["sample"] for item in diagnostics] != list(range(len(diagnostics))):
-            raise StageError(
-                "COLLECTING", ["parse", "receiver.log"], 1,
-                receiver_log, "receiver diagnostic samples are not contiguous",
-            )
-        result["diagnostics"] = diagnostics
-    elif expect_diagnostics:
-        raise StageError(
-            "COLLECTING", ["parse", "receiver.log"], 1,
-            receiver_log, "missing cumulative receiver diagnostics",
-        )
     return result
 
 
@@ -2725,12 +2604,9 @@ def _parse_dbnull_summary(summary: dict[str, Any], filename: str) -> dict[str, A
 def parse_receive_statistics(
     receiver_log: str,
     raw_summary: dict[str, Any],
-    expect_receiver_diagnostics: bool = False,
 ) -> dict[str, Any]:
     return {
-        "receiver": _parse_receiver_statistics(
-            receiver_log, expect_receiver_diagnostics
-        ),
+        "receiver": _parse_receiver_statistics(receiver_log),
         "raw": _parse_dbnull_summary(raw_summary, "raw-summary.json"),
     }
 
@@ -2742,11 +2618,8 @@ def parse_qths_statistics(
     pipeline_worker_log: str = "",
     expect_pipeline_worker: bool = True,
     expect_missing_per_second: bool = False,
-    expect_receiver_diagnostics: bool = False,
 ) -> dict[str, Any]:
-    receiver = _parse_receiver_statistics(
-        receiver_log, expect_receiver_diagnostics
-    )
+    receiver = _parse_receiver_statistics(receiver_log)
     unpack_match = re.search(
         r"VDIF unpack statistics:\s*records=(\d+)\s+accepted=(\d+)\s+"
         r"bad_header=(\d+)\s+invalid_data=(\d+)\s+unknown_station=(\d+)\s+"
@@ -3439,19 +3312,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--worker-cpu-list",
-        help="optional Linux CPU list passed to taskset for vdif_unpack_worker",
+        help="ordered coordinator,worker...,writer CPU mapping for unpack",
     )
     parser.add_argument("--sink-cpu-list")
     parser.add_argument("--receiver-poll-cpu", type=int)
-    parser.add_argument(
-        "--receiver-poll-cpu-list",
-        help="comma-separated poll CPU, one per receiver shard",
-    )
-    parser.add_argument("--receiver-copy-cpu", type=int)
-    parser.add_argument("--receiver-shards", type=int, default=1)
     parser.add_argument("--numa-node", type=int)
-    parser.add_argument("--receiver-send-n", type=int, default=64)
-    parser.add_argument("--receiver-nsge", type=int, default=1)
     parser.add_argument("--receiver-poll-batch", type=int, default=32)
     parser.add_argument("--receiver-wr-num", type=int, default=1024)
     parser.add_argument(
@@ -3464,11 +3329,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sender-source-port",
         type=int,
         help="source UDP port for an explicitly selected Station",
-    )
-    parser.add_argument(
-        "--receiver-diagnostics",
-        action="store_true",
-        help="enable low-rate cumulative CQ/WR receiver diagnostics",
     )
     parser.add_argument(
         "--unpack-missing-per-second",
@@ -3543,15 +3403,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         worker_cpu_list=args.worker_cpu_list,
         sink_cpu_list=args.sink_cpu_list,
         receiver_poll_cpu=args.receiver_poll_cpu,
-        receiver_poll_cpu_list=args.receiver_poll_cpu_list,
-        receiver_copy_cpu=args.receiver_copy_cpu,
-        receiver_shards=args.receiver_shards,
         numa_node=args.numa_node,
-        receiver_send_n=args.receiver_send_n,
-        receiver_nsge=args.receiver_nsge,
         receiver_poll_batch=args.receiver_poll_batch,
         receiver_wr_num=args.receiver_wr_num,
-        receiver_diagnostics=args.receiver_diagnostics,
         unpack_missing_per_second=args.unpack_missing_per_second,
         unpack_start_delay_seconds=args.unpack_start_delay_seconds,
         station_id=args.station_id,

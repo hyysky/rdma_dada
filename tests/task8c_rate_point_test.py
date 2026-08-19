@@ -837,17 +837,19 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn('report_readiness_state worker', start)
         self.assertIn('touch "$run_dir/pipeline.ready"', start)
 
-    def test_worker_cpu_list_wraps_worker_with_taskset(self):
+    def test_worker_cpu_list_maps_coordinator_workers_and_writer(self):
         plan = dataclasses.replace(
             make_plan(1.0, 30.0, compute_consumer="dbnull"),
-            worker_cpu_list="16-23",
+            worker_cpu_list="14,15,16,17,18,19",
         )
         bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-taskset")
         self.assertIn(
-            '/usr/bin/taskset -c 16-23 "$project/vdif_unpack_worker"',
+            '--thread-cpus 14,15,16,17,18,19',
             bundle["start.sh"],
         )
-        self.assertIn('taskset -pc "$worker_child_pid"', bundle["start.sh"])
+        self.assertNotIn(
+            '/usr/bin/taskset -c 14,15,16,17,18,19', bundle["start.sh"]
+        )
 
     def test_worker_cpu_list_omitted_keeps_default_scheduler(self):
         plan = make_plan(1.0, 30.0, compute_consumer="dbnull")
@@ -856,18 +858,23 @@ class Task8cRatePointTest(unittest.TestCase):
         )["start.sh"]
         self.assertNotIn('/usr/bin/taskset -c', start)
 
-    def test_worker_cpu_list_cli_accepts_linux_cpu_list(self):
+    def test_worker_cpu_list_cli_accepts_ordered_thread_cores(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             return_code = MODULE.main([
                 "--aggregate-gbps", "15",
                 "--duration-seconds", "30",
                 "--compute-consumer", "dbnull",
                 "--pipeline-stage", "unpack",
-                "--worker-cpu-list", "16-23",
+                "--worker-cpu-list", "14,15,16",
+                "--receiver-poll-cpu", "13",
+                "--sink-cpu-list", "17",
+                "--numa-node", "1",
                 "--dry-run",
             ])
         self.assertEqual(return_code, 0)
-        self.assertEqual(json.loads(stdout.getvalue())["worker_cpu_list"], "16-23")
+        self.assertEqual(
+            json.loads(stdout.getvalue())["worker_cpu_list"], "14,15,16"
+        )
 
     def test_explicit_receive_pipeline_cpu_and_numa_placement(self):
         plan = dataclasses.replace(
@@ -876,21 +883,22 @@ class Task8cRatePointTest(unittest.TestCase):
                 pipeline_stage="unpack",
             ),
             receiver_poll_cpu=13,
-            receiver_copy_cpu=14,
-            worker_cpu_list="15",
-            sink_cpu_list="16",
+            worker_cpu_list="14,15,16,17,18,19",
+            sink_cpu_list="20",
             numa_node=1,
         )
         bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-placement")
+        self.assertIn("--poll-cpu 13", bundle["start.sh"])
         self.assertIn(
-            "--poll-cpu 13 --copy-cpu 14", bundle["start.sh"]
+            "--thread-cpus 14,15,16,17,18,19", bundle["start.sh"]
         )
+        self.assertNotIn("--copy-cpu", bundle["start.sh"])
         self.assertIn(
-            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 15",
+            "/usr/bin/numactl --membind=1 \"$project/vdif_unpack_worker\"",
             bundle["start.sh"],
         )
         self.assertIn(
-            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 16",
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 20",
             bundle["start.sh"],
         )
         self.assertIn(
@@ -898,40 +906,6 @@ class Task8cRatePointTest(unittest.TestCase):
             bundle["prepare.sh"],
         )
         self.assertIn("Receive threads ready", bundle["start.sh"])
-
-    def test_two_receiver_shards_render_distinct_flows_and_poll_cpus(self):
-        plan = dataclasses.replace(
-            make_plan(
-                30.0, 30.0, compute_consumer="dbnull",
-                pipeline_stage="receive",
-            ),
-            receiver_shards=2,
-            receiver_poll_cpu_list="13,14",
-            receiver_copy_cpu=15,
-        )
-        flows = ["174.0.1.100:41001", "174.0.1.101:51001"]
-        start = MODULE.build_qths_bundle(
-            plan, "/tmp/task8c-shards", receiver_flows=flows
-        )["start.sh"]
-        self.assertIn("--receiver-shards 2", start)
-        self.assertIn("--poll-cpus 13,14 --copy-cpu 15", start)
-        self.assertIn("--receiver-flow 174.0.1.100:41001", start)
-        self.assertIn("--receiver-flow 174.0.1.101:51001", start)
-
-    def test_receiver_shard_configuration_requires_matching_poll_cpus(self):
-        MODULE.RateRequest(
-            30.0, 30.0, compute_consumer="dbnull",
-            pipeline_stage="receive", receiver_shards=2,
-            receiver_poll_cpu_list="13,14", receiver_copy_cpu=15,
-            worker_cpu_list="16", sink_cpu_list="17", numa_node=1,
-        ).validate()
-        with self.assertRaisesRegex(ValueError, "receiver_shards"):
-            MODULE.RateRequest(
-                30.0, 30.0, compute_consumer="dbnull",
-                pipeline_stage="receive", receiver_shards=2,
-                receiver_poll_cpu_list="13", receiver_copy_cpu=15,
-                worker_cpu_list="16", sink_cpu_list="17", numa_node=1,
-            ).validate()
 
     def test_partial_or_overlapping_cpu_placement_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "supplied together"):
@@ -943,8 +917,7 @@ class Task8cRatePointTest(unittest.TestCase):
             MODULE.RateRequest(
                 15.0, 30.0, compute_consumer="dbnull",
                 pipeline_stage="unpack", receiver_poll_cpu=13,
-                receiver_copy_cpu=14, worker_cpu_list="15",
-                sink_cpu_list="15", numa_node=1,
+                worker_cpu_list="14,15,16", sink_cpu_list="16", numa_node=1,
             ).validate()
 
     def test_ring_creation_uses_compiler_ring_plan_values(self):
@@ -1051,8 +1024,6 @@ class Task8cRatePointTest(unittest.TestCase):
                 compute_consumer="dbnull",
                 pipeline_stage="receive",
             ),
-            receiver_send_n=64,
-            receiver_nsge=1,
             receiver_poll_batch=32,
             receiver_wr_num=1024,
         )
@@ -1062,10 +1033,11 @@ class Task8cRatePointTest(unittest.TestCase):
         )
 
         self.assertIn(
-            '--send_n 64 --nsge 1 --poll-batch 32 --recv-wr-num 1024',
+            '--poll-batch 32 --recv-wr-num 1024',
             bundle["start.sh"],
         )
-        self.assertEqual(plan.as_dict()["receiver_nsge"], 1)
+        self.assertNotIn('--send_n', bundle["start.sh"])
+        self.assertNotIn('--nsge', bundle["start.sh"])
         self.assertEqual(plan.as_dict()["receiver_poll_batch"], 32)
         self.assertEqual(plan.as_dict()["receiver_wr_num"], 1024)
 
@@ -1077,8 +1049,6 @@ class Task8cRatePointTest(unittest.TestCase):
             pipeline_stage="receive",
         )
 
-        self.assertEqual(request.receiver_send_n, 64)
-        self.assertEqual(request.receiver_nsge, 1)
         self.assertEqual(request.receiver_poll_batch, 32)
         self.assertEqual(request.receiver_wr_num, 1024)
 
@@ -1090,158 +1060,17 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-default-rdma-queue")
         self.assertIn(
-            '--send_n 64 --nsge 1 --poll-batch 32 --recv-wr-num 1024',
+            '--poll-batch 32 --recv-wr-num 1024',
             bundle["start.sh"],
         )
 
-    def test_receiver_cumulative_diagnostics_are_opt_in(self):
-        default_plan = make_plan(
-            15.0,
-            30.0,
-            compute_consumer="dbnull",
-            pipeline_stage="unpack",
-        )
-        default_bundle = MODULE.build_qths_bundle(
-            default_plan, "/tmp/task8c-receiver-default-diagnostics"
-        )
-        self.assertNotIn(" --debug", default_bundle["start.sh"])
-
-        diagnostic_plan = dataclasses.replace(
-            default_plan, receiver_diagnostics=True
-        )
-        diagnostic_bundle = MODULE.build_qths_bundle(
-            diagnostic_plan, "/tmp/task8c-receiver-cumulative-diagnostics"
-        )
-        self.assertIn(" --debug", diagnostic_bundle["start.sh"])
-        self.assertTrue(diagnostic_plan.as_dict()["receiver_diagnostics"])
-
-    def test_receiver_cumulative_diagnostics_are_parsed(self):
-        receiver = (
-            "[RDMA_DIAG] sample=0 elapsed_ns=100000000 "
-            "poll_calls=100 empty_polls=20 completions=80 full_polls=2 "
-            "accepted=80 reposted=64 repost_failures=0 posted_wr=240 "
-            "min_posted_wr=192 copy_batches=1\n"
-            "[RDMA_DIAG] sample=1 elapsed_ns=200000000 "
-            "poll_calls=220 empty_polls=40 completions=180 full_polls=5 "
-            "accepted=180 reposted=128 repost_failures=0 posted_wr=204 "
-            "min_posted_wr=188 copy_batches=2\n"
-            "Receive summary: accepted=180, wrong_length=0, "
-            "published=180, blocks=1, partial_blocks=1, "
-            "cq_tail_records=52\n"
-            "Receive pipeline summary: poll_calls=220, empty_polls=40, "
-            "full_polls=5, reposted_wrs=180, repost_failures=0, "
-            "copy_batches=4, min_posted_wrs=188, "
-            "completion_queue_high_watermark=96, "
-            "recycle_queue_high_watermark=64, "
-            "completion_to_recycle_ns_total=9000, "
-            "completion_to_recycle_ns_max=700\n"
-            "[RDMA] Receive shard summary: shard=0, poll_calls=120, "
-            "empty_polls=20, full_polls=3, completions=100, "
-            "reposted_wrs=100, repost_failures=0, min_posted_wrs=900, "
-            "completion_queue_high_watermark=80, "
-            "recycle_queue_high_watermark=20\n"
-            "[RDMA] Receive shard summary: shard=1, poll_calls=100, "
-            "empty_polls=20, full_polls=2, completions=80, "
-            "reposted_wrs=80, repost_failures=0, min_posted_wrs=920, "
-            "completion_queue_high_watermark=64, "
-            "recycle_queue_high_watermark=16\n"
-        )
-        statistics = MODULE.parse_receive_statistics(
-            receiver,
-            {
-                "consumer": "dada_dbnull",
-                "exit_code": 0,
-                "zero_copy": True,
-                "single_transfer": True,
-            },
-            expect_receiver_diagnostics=True,
-        )
-        self.assertEqual(
-            statistics["receiver"]["diagnostics"],
-            [
-                {
-                    "sample": 0,
-                    "elapsed_ns": 100000000,
-                    "poll_calls": 100,
-                    "empty_polls": 20,
-                    "completions": 80,
-                    "full_polls": 2,
-                    "accepted": 80,
-                    "reposted": 64,
-                    "repost_failures": 0,
-                    "posted_wr": 240,
-                    "min_posted_wr": 192,
-                    "copy_batches": 1,
-                },
-                {
-                    "sample": 1,
-                    "elapsed_ns": 200000000,
-                    "poll_calls": 220,
-                    "empty_polls": 40,
-                    "completions": 180,
-                    "full_polls": 5,
-                    "accepted": 180,
-                    "reposted": 128,
-                    "repost_failures": 0,
-                    "posted_wr": 204,
-                    "min_posted_wr": 188,
-                    "copy_batches": 2,
-                },
-            ],
-        )
-        self.assertEqual(
-            statistics["receiver"]["pipeline"]["min_posted_wrs"], 188
-        )
-        self.assertEqual(
-            statistics["receiver"]["pipeline"]
-            ["completion_queue_high_watermark"], 96
-        )
-        self.assertEqual(
-            statistics["receiver"]["shards"],
-            [
-                {
-                    "shard": 0,
-                    "poll_calls": 120,
-                    "empty_polls": 20,
-                    "full_polls": 3,
-                    "completions": 100,
-                    "reposted_wrs": 100,
-                    "repost_failures": 0,
-                    "min_posted_wrs": 900,
-                    "completion_queue_high_watermark": 80,
-                    "recycle_queue_high_watermark": 20,
-                },
-                {
-                    "shard": 1,
-                    "poll_calls": 100,
-                    "empty_polls": 20,
-                    "full_polls": 2,
-                    "completions": 80,
-                    "reposted_wrs": 80,
-                    "repost_failures": 0,
-                    "min_posted_wrs": 920,
-                    "completion_queue_high_watermark": 64,
-                    "recycle_queue_high_watermark": 16,
-                },
-            ],
-        )
-        with self.assertRaises(MODULE.StageError) as raised:
-            MODULE.parse_receive_statistics(
-                receiver.split("Receive summary:", 1)[1].join(
-                    ("Receive summary:", "")
-                ),
-                {
-                    "consumer": "dada_dbnull",
-                    "exit_code": 0,
-                    "zero_copy": True,
-                    "single_transfer": True,
-                },
-                expect_receiver_diagnostics=True,
-            )
-        self.assertEqual(
-            raised.exception.stderr,
-            "missing cumulative receiver diagnostics",
-        )
+    def test_direct_receiver_queue_geometry_is_rejected_early(self):
+        with self.assertRaisesRegex(ValueError, "queue parameters"):
+            MODULE.RateRequest(15.0, 30.0, receiver_wr_num=0).validate()
+        with self.assertRaisesRegex(ValueError, "queue parameters"):
+            MODULE.RateRequest(
+                15.0, 30.0, receiver_poll_batch=33, receiver_wr_num=32
+            ).validate()
 
     def test_unpack_missing_per_second_diagnostics_are_opt_in(self):
         default_plan = make_plan(
@@ -1293,16 +1122,12 @@ class Task8cRatePointTest(unittest.TestCase):
                 "--duration-seconds", "30",
                 "--compute-consumer", "dbnull",
                 "--pipeline-stage", "receive",
-                "--receiver-send-n", "64",
-                "--receiver-nsge", "1",
                 "--receiver-poll-batch", "32",
                 "--receiver-wr-num", "1024",
                 "--dry-run",
             ])
         self.assertEqual(return_code, 0)
         rendered = json.loads(stdout.getvalue())
-        self.assertEqual(rendered["receiver_send_n"], 64)
-        self.assertEqual(rendered["receiver_nsge"], 1)
         self.assertEqual(rendered["receiver_poll_batch"], 32)
         self.assertEqual(rendered["receiver_wr_num"], 1024)
 
@@ -1382,6 +1207,25 @@ class Task8cRatePointTest(unittest.TestCase):
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "")
         self.assertEqual(raised.exception.classification, "PERFORMANCE_FAIL")
+
+    def test_direct_receiver_summary_is_parsed(self):
+        receiver = (
+            "[RDMA] Receive summary: accepted=99, wrong_length=1, zeroed=1, "
+            "published=100, blocks=1, partial_blocks=1, cq_tail_records=4\n"
+            "[RDMA] Direct receive summary: poll_calls=10, empty_polls=3, "
+            "full_polls=2, reposted_wrs=100, repost_failures=0, "
+            "repost_batches=7, min_posted_wrs=900, "
+            "poll_batch_high_watermark=32, "
+            "completion_to_repost_ns_total=1234, "
+            "completion_to_repost_ns_max=80\n"
+        )
+        parsed = MODULE._parse_receiver_statistics(receiver)
+        self.assertEqual(parsed["zeroed"], 1)
+        self.assertEqual(parsed["published"], 100)
+        self.assertEqual(parsed["direct"]["repost_batches"], 7)
+        self.assertEqual(
+            parsed["direct"]["poll_batch_high_watermark"], 32
+        )
 
     def test_unpack_stage_dbnull_statistics_do_not_require_gpu_marker(self):
         plan = make_plan(
