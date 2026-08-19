@@ -19,7 +19,7 @@ result and clean only resources owned by that run.
 Finite network fixtures must preserve the requested observation stop boundary;
 they must not round `group_count` to a sender batch or raw-ring block. On
 orderly stop, every accepted complete record is published, including CQ entries
-below `send_n` and the final partial raw block. Acceptance requires
+below the configured poll batch and the final partial raw block. Acceptance requires
 `sender sent = receiver accepted = receiver published = unpack records`; a
 partial final block is normal finite-transfer behavior and must not be counted
 as packet loss or a throughput failure.
@@ -154,9 +154,11 @@ gate. It creates the rings, starts the compute consumer, starts
 starts `rdma2dada` and waits for receiver readiness. Only then does it write
 `pipeline.ready` and allow both Station senders to start. `worker.ready`
 records the process identity, CONFIG_ID/GEOMETRY_ID, prepared window geometry
-and preparation timing. An optional `--worker-cpu-list` wraps only the worker
-with `/usr/bin/taskset -c`; omission preserves normal scheduling. The rendered
-argv and observed affinity are retained with the run artifacts.
+and preparation timing. For unpack runs, `--worker-cpu-list` is an ordered,
+explicit mapping `COORDINATOR,WORKER...,WRITER`; the worker binds those threads
+itself while `numactl --membind` keeps their memory on the selected NUMA node.
+Omission preserves normal scheduling. The rendered argv and observed affinity
+are retained with the run artifacts.
 
 ## Environment and synchronization lessons
 
@@ -293,11 +295,8 @@ These are harness failures, not evidence that UDP sender, RDMA ingest or VDIF
 unpack failed. The policy above exists so the same mistakes become automated
 regression cases and cannot recur as undocumented manual knowledge.
 
-The receiver-focused `rdma_receiver_integration.sh` additionally assumes that
-the machine executing it can SSH directly to both sender hosts. The deployed
-topology does not satisfy that assumption: only `HF` is the controller. Remote
-multi-host acceptance therefore uses `scripts/task8c_rate_point.py` from `HF`;
-copying the shell test to `qths1` and attempting `qths1 -> qtpulsar*` is a
+Only `HF` is the controller. Remote multi-host acceptance uses
+`scripts/task8c_rate_point.py` from `HF`; attempting `qths1 -> qtpulsar*` is a
 harness topology error, not an environment requirement or product failure.
 
 The versioned controller accepts one observation JSON and the
@@ -320,18 +319,18 @@ waiting indefinitely. This signal-forwarding path requires an executable
 regression test before a formal finite-transfer run.
 
 Receiver readiness must use the flushed `Receive threads ready` marker, which
-is emitted only after the CQ poll/repost and copy/raw-ring threads are running
-and any requested affinity has been verified. The earlier resource marker
+is emitted only after the direct CQ poll/repost thread is running and any
+requested affinity has been verified. The earlier resource marker
 `Initialization complete, ready to start` is not sufficient. A readiness
 timeout must print every managed
 process PID, running state, recorded exit code and log tail; a silent timeout is
 a harness failure and provides no product evidence.
 
-The tuned receive defaults are `--send_n 64 --nsge 1 --poll-batch 32
---recv-wr-num 1024`. In the dual-thread path, `send_n` is a maximum copy/repost
-batch, never a requirement to wait for 64 completions. Explicit qths1 Node-1
-placement uses `--poll-cpu 13 --copy-cpu 14`, worker CPU 15, sink CPU 16 and
-NUMA node 1; these values belong to the versioned runner invocation and are not
+The direct receive path fixes one destination-only flow, one QP/CQ/thread,
+NSGE=2, a 42-byte header scratch SGE and two outstanding PSRDADA blocks. Its
+tunable defaults are `--poll-batch 32 --recv-wr-num 1024`. Explicit qths1
+Node-1 placement uses `--poll-cpu 13`, worker CPU 14, sink CPU 15 and NUMA node
+1; these values belong to the versioned runner invocation and are not
 hard-coded product defaults.
 
 Failure-time diagnostic collection and resource cleanup are reported

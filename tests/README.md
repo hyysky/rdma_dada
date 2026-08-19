@@ -97,12 +97,11 @@ ctest --test-dir build-linux --output-on-failure
 | `worker_resolved_plan_test` | `worker_resolved_plan_test.cpp` | 验证 worker 只从 Resolved Plan 获得 ring key、F/A/P/T、可配置 conversion scale、NPY B/NBEAM、Beamform-only/Power/Stokes/积分链和最终 block 几何，并拒绝 stale geometry 与变更后的权重 digest | `BUILD_TESTING=ON` |
 | `pipeline_worker_resolved_integration_test` | `pipeline_worker_resolved_integration.sh` | 从 Observation 编译 plan，使用每次运行独立的受控 ring key，运行 compute ring→CUDA worker→output ring，验证完整编译 header、Power+Integration 数值、EOD、错误 input header、ring capacity 门禁和定向清理 | Linux、`BUILD_RDMA_PIPELINE=ON`、`USE_CUDA=ON`、PSRDADA CLI；缺少时 skip 77 |
 | `dada_header_roundtrip_test` | `dada_header_roundtrip_test.cpp` | 从统一 observation 配置生成 RAW header，经 PSRDADA ASCII codec 验证 Project VDIF 几何、CONFIG_ID、GEOMETRY_ID 及版本拒绝 | `BUILD_RDMA_PIPELINE=ON` |
-| `rdma_receiver_integration_test` | `rdma_receiver_integration.sh` + `rdma_udp_probe.py` | 两台远端发送 11 个正常 record 与 1 个短包；以 `records_per_block=16/send_n=4` 验证 2 个完整 batch + 3-record CQ tail 在停止时发布为一个无截断 partial raw block，并满足 accepted=published=11、wrong_length=1 | `BUILD_RDMA_PIPELINE=ON`、真实 RDMA NIC/PSRDADA/SSH sender 环境；未配置时 skip 77 |
 | `vdif_unpack_worker_integration_test` | `vdif_unpack_worker_integration.sh` | 从统一 observation 编译 plan/header/ring 几何，验证 full/partial/完全缺失 group、连续双 transfer、ATFP 字节及 EOD，并拒绝错误 CONFIG_ID 和 raw/compute ring block capacity | `BUILD_RDMA_PIPELINE=ON` 且具备 PSRDADA CLI；缺少时 skip 77 |
 
 ## 单项调用
 
-### RDMA 接收策略与真实多来源测试
+### RDMA direct raw 接收策略
 
 可移植策略测试：
 
@@ -111,36 +110,8 @@ ctest --test-dir build-linux --output-on-failure
 ctest --test-dir build -R '^rdma_receive_policy_test$' --output-on-failure
 ```
 
-这个小型真实 NIC 测试要求“执行该脚本的主机”能够免交互 SSH 到两台已同步本项目的
-发送服务器：
-
-```bash
-export RDMA_TEST_DEVICE=1
-export RDMA_TEST_DMAC=10:70:fd:11:e2:e3
-export RDMA_TEST_DIP=10.17.16.11
-export RDMA_TEST_DPORT=17201
-export RDMA_TEST_SENDER_A=sender-a
-export RDMA_TEST_SENDER_A_IP=10.17.16.60
-export RDMA_TEST_SENDER_B=sender-b
-export RDMA_TEST_SENDER_B_IP=10.17.16.61
-export RDMA_TEST_REMOTE_SOURCE_DIR=/path/to/rdma_dada
-export RDMA_TEST_SSH_KNOWN_HOSTS=/tmp/rdma-task7-known-hosts
-
-ctest --test-dir build-linux \
-  -R '^rdma_receiver_integration_test$' --output-on-failure
-```
-
-两台发送服务器分别显式绑定 `RDMA_TEST_SENDER_A_IP`/`B_IP` 和 UDP source port
-41001/41002。A 发送端在第 2 个正常
-record 后插入一个少 1 byte 的 record；B 发送端随后补足第二种来源的正常数据。测试
-使用 1056-byte UDP payload，避免依赖 jumbo MTU。未设置上述变量时测试返回 skip 77。
-`RDMA_TEST_SSH_KNOWN_HOSTS` 应是本次测试专用文件；脚本启用严格 host-key 校验，不会
-读取或修改运行账户的永久 `~/.ssh/known_hosts`。
-
-当前部署中只有 HF 能分别直连 qths1、qtpulsar1 和 qtpulsar2，qths1 不能反向 SSH
-两台 sender。因此不要把本脚本复制到 qths1 作为正式验收入口，也不要为适配脚本修改
-服务器认证。当前三机正式测试必须从 HF 运行版本化
-`scripts/task8c_rate_point.py`；该控制器分别连接接收端和两个发送端，并覆盖有限传输
+真实 NIC/PSRDADA 三机测试统一由 HF 上的版本化
+`scripts/task8c_rate_point.py` 驱动；qths1 不反向 SSH 到 sender。该控制器分别连接接收端和两个发送端，并覆盖有限传输
 CQ tail、partial raw block、unpack 计数守恒和 compute 输出验证。
 
 ### `pipeline_config_test`

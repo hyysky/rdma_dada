@@ -127,19 +127,11 @@ wire 字段表见 [doc/PROJECT_VDIF_PROFILE_V1.md](doc/PROJECT_VDIF_PROFILE_V1.m
 python3 scripts/convert_config_to_json.py old.conf config/pipeline.json
 ```
 
-## 运行当前 demo
+## 运行 RDMA 接收测试
 
-先修改 [scripts/run_demo.sh](scripts/run_demo.sh) 顶部的接收端 MAC/IP/port、NIC 参数，
-以及 JSON 配置。接收 flow 不限制发送端 MAC/IP/port。当前 launcher 没有启动下游
-worker，所以要求 `disk.enabled=true`，由 `dada_dbdisk` 作为 raw ring 的 reader。
-
-```bash
-bash scripts/run_demo.sh start
-```
-
-该脚本在前台持有本次运行的所有 PID 和 ring key。在同一终端按 `Ctrl+C` 会停止 receiver、等待 reader 处理 EOD，然后清理 ring。`stop` 和 `status` 子命令已禁用，因为脚本不保存跨进程的 PID 状态。
-
-数据和日志默认写入 `data_out/`。当前可执行文件名为 `build/rdma2dada`。
+当前唯一入口是 `scripts/task8c_rate_point.py`，由它按 resolved plan 创建
+ring、启动 consumer、`rdma2dada` 和 sender，并保存计数与清理证据。
+`rdma2dada` 本身只保留 direct raw-ring 接收路径。
 
 ## 当前限制
 

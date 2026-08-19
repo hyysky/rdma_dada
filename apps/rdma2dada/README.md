@@ -11,11 +11,9 @@ rdma2dada --plan artifacts/resolved_observation.json
 ```
 
 Receiver device, destination MAC/IP/port, raw ring key, record size and block
-geometry come only from the resolved plan. `--send_n`, `--recv-wr-num`,
-`--poll-batch`, `--nsge`, `--cpu` and `--debug` remain runtime tuning options;
-no geometry-changing override exists. A zero `--recv-wr-num` keeps the legacy
-`send_n * 4` receive depth; positive values decouple queue depth from copy
-batching.
+geometry come only from the resolved plan. Only `--recv-wr-num`,
+`--poll-batch`, `--poll-cpu` and `--debug` are runtime
+tuning options; no geometry-changing override exists.
 `--preflight-only` validates the plan and receiver device without accessing the
 ring.
 
@@ -23,15 +21,12 @@ The RAW_PACKET flow matches only destination MAC, destination IPv4 and
 destination UDP port. Source MAC, IPv4 and UDP port are wildcarded so packets
 from every configured FPGA/Station reach the same receive queue.
 
-A successful receive completion with a length different from the configured
-Ethernet-frame length is dropped, counted and immediately reposted; it is never
-written to the raw ring and does not stop reception. CQ status errors, invalid
-WR IDs, unexpected opcodes and repost failures remain fatal. Wrong-length logs
-are emitted at power-of-two counts, and shutdown prints accepted and
-wrong-length totals plus their ratio.
+A single RAW_PACKET QP/CQ and receive thread use exactly two SGEs per WR. SGE0
+receives the fixed 42-byte Ethernet/IPv4/UDP header into scratch memory; SGE1
+receives one VDIF record directly into one of two outstanding PSRDADA blocks.
+There is no packet-to-ring memcpy and no legacy copy/SPSC or multi-QP mode.
 
-有限 transfer 停止时，接收线程先处理已经从 CQ 取出但不足 `send_n` 的 completion，
-将这些完整 record 追加到当前 raw block；随后按实际有效字节发布最后一个 partial block，
-再由主线程发送 PSRDADA EOD。发布字节数必须是 raw record size 的整数倍。空 transfer
-不会预先获取或发布空 block。shutdown summary 同时给出 `accepted`、`published`、
-full/partial block 和 `cq_tail_records`，正常结束必须满足 `accepted=published`。
+正确长度的 completion 保留对应 VDIF slot。错误长度会将该 slot 清零；连续 16 个
+错误长度包或任何 CQ/WR/repost 错误会终止 transfer。有限 transfer 只发布连续完成的
+完整 record 前缀，随后发送 PSRDADA EOD。正常无错误结束必须满足
+`accepted=published`。
