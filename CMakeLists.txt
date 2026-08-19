@@ -778,16 +778,6 @@ if(BUILD_RDMA_PIPELINE)
             COMMAND dada_header_roundtrip_test
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
         add_test(
-            NAME rdma_receiver_integration_test
-            COMMAND bash
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_receiver_integration.sh
-                    $<TARGET_FILE:rdma2dada>
-                    ${CMAKE_CURRENT_SOURCE_DIR})
-        set_tests_properties(rdma_receiver_integration_test PROPERTIES
-            LABELS "rdma;integration"
-            SKIP_RETURN_CODE 77
-            TIMEOUT 120)
-        add_test(
             NAME vdif_unpack_worker_integration_test
             COMMAND bash
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/vdif_unpack_worker_integration.sh

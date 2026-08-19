@@ -19,8 +19,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // Machine-readable numeric output used by scripts/run_demo.sh. Keeping
-    // this list numeric avoids shell evaluation of arbitrary config content.
+    // Keep this machine-readable list numeric so consumers never evaluate
+    // arbitrary configuration content.
     std::cout << "RAW_RECORD_BYTES=" << layout.raw_record_bytes << '\n'
               << "PACKETS_PER_ANTENNA_PER_BLOCK="
               << layout.packets_per_antenna_per_block << '\n'
