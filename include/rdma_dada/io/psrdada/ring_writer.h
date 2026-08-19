@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include <deque>
 #include <vector>
 #include <mutex>
 
@@ -19,6 +20,14 @@ struct BlockMrInfo {
     uint64_t block_idx;   // block索引
 };
 
+struct WriteBlockLease {
+    char *addr;
+    uint64_t bytes;
+    uint64_t token;
+    uint64_t block_idx;
+    struct ibv_mr *mr;
+};
+
 // PSRDADA write-side adapter. Algorithm modules must not depend on this type.
 class PsrdadaRingBuf {
 public:
@@ -26,8 +35,8 @@ public:
     int Init(key_t key, uint64_t block_bytes, uint64_t nbufs,
              uint64_t record_bytes,
              const rdma_dada::pipeline::Metadata& runtime_header);
-    char* GetWriteBuffer(uint64_t bytes);
-    int MarkWritten(uint64_t bytes);
+    int AcquireWriteBlock(WriteBlockLease *lease);
+    int CommitWriteBlock(uint64_t token, uint64_t bytes);
     int StartBlock();
     int StopBlock();
     uint64_t GetFreeSpace();
@@ -44,9 +53,6 @@ public:
     // 新方法：为每个block分别注册MR（支持非连续内存）
     int RegisterRingBlocks(struct ibv_pd *pd, int access);
     
-    // 获取当前写入block的MR
-    struct ibv_mr* GetCurrentBlockMr();
-    
     // 清理所有已注册的block MRs
     void UnregisterAllBlocks();
     
@@ -57,8 +63,6 @@ private:
     void *hdu;
     void *log;
     void *data_block;  // ipcio_t* (ת����void*����)
-    char *current_ptr;
-    uint64_t current_block;
     uint64_t block_bytes;
     uint64_t record_bytes;
     int is_initialized;
@@ -68,9 +72,18 @@ private:
     std::vector<BlockMrInfo> block_mrs;
     struct ibv_pd *registered_pd;
     bool use_block_registration;  // 是否使用分块注册模式
+    struct OutstandingWriteBlock {
+        char *addr;
+        uint64_t token;
+        uint64_t block_idx;
+        struct ibv_mr *mr;
+    };
+    std::deque<OutstandingWriteBlock> outstanding_blocks_;
+    uint64_t next_write_token_;
     
     void GetBufferStats(uint64_t &free_space, uint64_t &used_space);
     void ResetAfterInitFailure(bool write_locked);
+    int CloseOutstandingBlocks();
 
     // 线程安全：互斥锁保护关键方法
     std::mutex ring_mutex_;

@@ -26,53 +26,32 @@ int open_ib_device(uint8_t device_id, struct ibv_utils_res *ib_res)
 
 int open_ib_device_by_name(const char *device_name) { (void)device_name; return -1; }
 
-int create_ib_res(struct ibv_utils_res *ib_res, int send_wr_num, int recv_wr_num)
+int create_ib_res(struct ibv_utils_res *ib_res, int recv_wr_num)
 {
-    if(ib_res->recv_nsge == 0) ib_res->recv_nsge = 4;
-    if(ib_res->send_nsge == 0) ib_res->send_nsge = 4;
-    int wr_num = send_wr_num > recv_wr_num ? send_wr_num : recv_wr_num;
-    ib_res->send_wr_num = send_wr_num;
+    if(ib_res->recv_nsge == 0) return -1;
     ib_res->recv_wr_num = recv_wr_num;
     ib_res->pd = ibv_alloc_pd(ib_res->context);
     if (!ib_res->pd) { ibv_utils_error("Failed to allocate PD."); return -1; }
-    ib_res->cq = ibv_create_cq(ib_res->context, wr_num, NULL, NULL, 0);
+    ib_res->cq = ibv_create_cq(ib_res->context, recv_wr_num, NULL, NULL, 0);
     if(!ib_res->cq){ ibv_utils_error("Couldn't create CQ."); return -2; }
-    struct ibv_qp_init_attr qp_init_attr = { .qp_context = NULL, .send_cq = ib_res->cq, .recv_cq = ib_res->cq, .cap = { .max_send_wr = (uint32_t)send_wr_num, .max_recv_wr = (uint32_t)recv_wr_num, .max_send_sge = (uint32_t)ib_res->send_nsge, .max_recv_sge = (uint32_t)ib_res->recv_nsge, }, .qp_type = IBV_QPT_RAW_PACKET, };
+    struct ibv_qp_init_attr qp_init_attr = { .qp_context = NULL, .send_cq = ib_res->cq, .recv_cq = ib_res->cq, .cap = { .max_send_wr = 0, .max_recv_wr = (uint32_t)recv_wr_num, .max_send_sge = 0, .max_recv_sge = (uint32_t)ib_res->recv_nsge, }, .qp_type = IBV_QPT_RAW_PACKET, };
     ib_res->qp = ibv_create_qp(ib_res->pd, &qp_init_attr);
     if(!ib_res->qp){ ibv_utils_error("Couldn't create QP."); return -4; }
-    int max_sge = ib_res->send_nsge > ib_res->recv_nsge ? ib_res->send_nsge : ib_res->recv_nsge;
-    
-    // 优化：单次分配所有缓冲区，减少 malloc 调用次数
-    size_t total_size = 0;
-    size_t sge_size = wr_num * sizeof(struct ibv_sge) * max_sge;
-    size_t send_wr_size = (send_wr_num > 0) ? send_wr_num * sizeof(struct ibv_send_wr) : 0;
-    size_t recv_wr_size = (recv_wr_num > 0) ? recv_wr_num * sizeof(struct ibv_recv_wr) : 0;
-    size_t wc_size = wr_num * sizeof(struct ibv_wc);
-    
-    // 计算总所需内存
-    total_size = sge_size + send_wr_size + recv_wr_size + wc_size * 2;  // wc + wc_tmp
+    const size_t sge_size = recv_wr_num * sizeof(struct ibv_sge) *
+                            ib_res->recv_nsge;
+    const size_t recv_wr_size = recv_wr_num * sizeof(struct ibv_recv_wr);
+    const size_t wc_size = recv_wr_num * sizeof(struct ibv_wc);
+    const size_t total_size = sge_size + recv_wr_size + wc_size;
     
     void *pool = malloc(total_size);
     if (!pool) { ibv_utils_error("Failed to allocate memory pool."); return -9; }
     
-    // 分片分配
     char *ptr = (char *)pool;
     ib_res->sge = (struct ibv_sge *)ptr;
     ptr += sge_size;
-    
-    if (send_wr_size > 0) {
-        ib_res->send_wr = (struct ibv_send_wr *)ptr;
-        ptr += send_wr_size;
-    }
-    if (recv_wr_size > 0) {
-        ib_res->recv_wr = (struct ibv_recv_wr *)ptr;
-        ptr += recv_wr_size;
-    }
+    ib_res->recv_wr = (struct ibv_recv_wr *)ptr;
+    ptr += recv_wr_size;
     ib_res->wc = (struct ibv_wc *)ptr;
-    ptr += wc_size;
-    ib_res->wc_tmp = (struct ibv_wc *)ptr;
-    
-    // 记录 pool 起始地址用于后续释放
     ib_res->pool_ptr = pool;
     
     return 0;
@@ -133,65 +112,6 @@ int init_ib_res(struct ibv_utils_res *ib_res)
     return 0;
 }
 
-int register_memory(struct ibv_utils_res *ib_res, void *addr, size_t total_length, size_t chunck_size)
-{
-    ib_res->mr = ibv_reg_mr(ib_res->pd, addr, total_length, IBV_ACCESS_LOCAL_WRITE);
-    if(!ib_res->mr){ ibv_utils_error("Failed to register memory."); return -1; }
-
-    int max_sge = ib_res->send_nsge > ib_res->recv_nsge ? ib_res->send_nsge : ib_res->recv_nsge;
-    if (max_sge <= 0) {
-        ibv_utils_error("Invalid SGE count.");
-        return -1;
-    }
-
-    if (chunck_size == 0 || total_length == 0 || total_length % chunck_size != 0) {
-        ibv_utils_error("Invalid chunk size or total length for memory registration.");
-        return -2;
-    }
-
-    int wr_num = (int)(total_length / chunck_size);
-    if ((ib_res->send_wr_num > 0 && wr_num != ib_res->send_wr_num) &&
-        (ib_res->recv_wr_num > 0 && wr_num != ib_res->recv_wr_num)) {
-        ibv_utils_error("The number of WRs does not match queue configuration.");
-        return -3;
-    }
-
-    if ((size_t)max_sge > chunck_size) {
-        ibv_utils_error("chunk size is smaller than nsge, cannot split buffer.");
-        return -4;
-    }
-
-    char *addr_char = (char*)addr;  // Cast to char* for pointer arithmetic
-    size_t base_len = chunck_size / max_sge;
-    size_t remainder = chunck_size % max_sge;
-
-    for(int wr = 0; wr < wr_num; wr++) {
-        char *wr_base = addr_char + ((size_t)wr * chunck_size);
-        size_t offset = 0;
-        for(int sge_idx = 0; sge_idx < max_sge; sge_idx++) {
-            size_t seg_len = base_len;
-            if (remainder > 0) {
-                // 均匀分摊余数，确保总长度一致
-                size_t distribute = (remainder > (size_t)sge_idx) ? 1 : 0;
-                seg_len += distribute;
-            }
-
-            if (seg_len == 0) {
-                ibv_utils_error("Computed SGE length is zero.");
-                return -5;
-            }
-
-            struct ibv_sge *sge = &ib_res->sge[wr * max_sge + sge_idx];
-            sge->addr = (uint64_t)(wr_base + offset);
-            sge->length = (uint32_t)seg_len;
-            sge->lkey = ib_res->mr->lkey;
-            offset += seg_len;
-        }
-        ib_res->wc[wr].wr_id = wr;
-    }
-    return 0;
-}
-
 int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
 {
     struct ibv_qp *qp = ib_res->qp;
@@ -225,12 +145,8 @@ int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
         } 
     };
     const rdma_dada::io::rdma::DestinationUdpFilter filter =
-        (pkt_info->src_ip != 0 && pkt_info->src_port != 0)
-        ? rdma_dada::io::rdma::BuildSourceUdpFilter(
-              pkt_info->dst_mac, pkt_info->src_ip, pkt_info->src_port,
-              pkt_info->dst_ip, pkt_info->dst_port)
-        : rdma_dada::io::rdma::BuildDestinationUdpFilter(
-              pkt_info->dst_mac, pkt_info->dst_ip, pkt_info->dst_port);
+        rdma_dada::io::rdma::BuildDestinationUdpFilter(
+            pkt_info->dst_mac, pkt_info->dst_ip, pkt_info->dst_port);
 
     // Match IPv4 UDP traffic for this destination. All source values and masks
     // stay zero so every FPGA/Station source is accepted by the same QP.
@@ -290,37 +206,6 @@ int create_flow(struct ibv_utils_res *ib_res, struct ibv_pkt_info *pkt_info)
     return 0;
 }
 
-int ib_send(struct ibv_utils_res *ibv_res)
-{
-    memset(ibv_res->send_wr, 0, sizeof(struct ibv_send_wr));
-    for(int i = 0; i < ibv_res->send_wr_num; i++){
-        ibv_res->send_wr[i].wr_id = i;
-        ibv_res->send_wr[i].sg_list = &ibv_res->sge[i*ibv_res->send_nsge];
-        ibv_res->send_wr[i].num_sge = ibv_res->send_nsge;
-        ibv_res->send_wr[i].next = (i == ibv_res->send_wr_num - 1) ? NULL : &ibv_res->send_wr[i+1];
-        ibv_res->send_wr[i].opcode = IBV_WR_SEND;
-        ibv_res->send_wr[i].send_flags |= IBV_SEND_SIGNALED;
-    }
-    int state = ibv_post_send(ibv_res->qp, ibv_res->send_wr, &ibv_res->bad_send_wr);
-    if(state < 0){ ibv_utils_error("Failed to post send."); return -1; }
-    return 0;
-}
-
-int ib_recv(struct ibv_utils_res *ibv_res)
-{
-    if(ibv_res->recv_completed > 0){ 
-        for(int i = 0; i < ibv_res->recv_completed; i++){ 
-            ibv_res->recv_wr->wr_id = ibv_res->wc[i].wr_id; 
-            ibv_res->recv_wr->sg_list = &ibv_res->sge[ibv_res->wc[i].wr_id*ibv_res->recv_nsge]; 
-            ibv_res->recv_wr->num_sge = ibv_res->recv_nsge; 
-            ibv_res->recv_wr->next = NULL; 
-            ibv_post_recv(ibv_res->qp, ibv_res->recv_wr, &ibv_res->bad_recv_wr); 
-        } 
-    }
-    ibv_res->recv_completed = ibv_poll_cq(ibv_res->cq, ibv_res->poll_n, ibv_res->wc);
-    return ibv_res->recv_completed;
-}
-
 int destroy_ib_res(struct ibv_utils_res *ib_res)
 {
     int ret = 0;
@@ -334,15 +219,7 @@ int destroy_ib_res(struct ibv_utils_res *ib_res)
         }
     }
     
-    // 2. 注销MR（依赖PD）
-    if (ib_res->mr && !ib_res->mr_external) {
-        if (ibv_dereg_mr(ib_res->mr) != 0) {
-            ibv_utils_error("Failed to deregister MR");
-            ret = -1;
-        }
-    }
-    
-    // 3. 销毁CQ（依赖PD）
+    // 2. 销毁CQ（依赖PD）
     if (ib_res->cq) {
         if (ibv_destroy_cq(ib_res->cq) != 0) {
             ibv_utils_error("Failed to destroy CQ");
@@ -350,7 +227,7 @@ int destroy_ib_res(struct ibv_utils_res *ib_res)
         }
     }
     
-    // 4. 释放PD（最后释放）
+    // 3. 释放PD（最后释放）
     if (ib_res->pd) {
         if (ibv_dealloc_pd(ib_res->pd) != 0) {
             ibv_utils_error("Failed to deallocate PD");
@@ -365,10 +242,8 @@ int destroy_ib_res(struct ibv_utils_res *ib_res)
     }
     // 清空指针避免悬空
     ib_res->sge = NULL;
-    ib_res->send_wr = NULL;
     ib_res->recv_wr = NULL;
     ib_res->wc = NULL;
-    ib_res->wc_tmp = NULL;
     
     return ret;
 }

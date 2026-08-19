@@ -1,137 +1,11 @@
 #include "rdma_dada/io/rdma/receive_policy.h"
 
-#include <arpa/inet.h>
-#include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <set>
 
 namespace rdma_dada {
 namespace io {
 namespace rdma {
-
-ReceiveSpscQueue::ReceiveSpscQueue(std::size_t capacity)
-    : entries_(capacity + 1), storage_size_(capacity + 1), head_(0), tail_(0),
-      high_watermark_(0) {}
-
-bool ReceiveSpscQueue::TryPush(const ReceiveWorkItem& item) {
-    const std::size_t head = head_.load(std::memory_order_relaxed);
-    const std::size_t next = (head + 1) % storage_size_;
-    const std::size_t tail = tail_.load(std::memory_order_acquire);
-    if (next == tail) return false;
-
-    entries_[head] = item;
-    head_.store(next, std::memory_order_release);
-
-    const std::size_t occupancy = next >= tail
-        ? next - tail
-        : storage_size_ - tail + next;
-    std::size_t observed = high_watermark_.load(std::memory_order_relaxed);
-    while (observed < occupancy &&
-           !high_watermark_.compare_exchange_weak(
-               observed, occupancy, std::memory_order_relaxed,
-               std::memory_order_relaxed)) {}
-    return true;
-}
-
-bool ReceiveSpscQueue::TryPop(ReceiveWorkItem* item) {
-    if (!item) return false;
-    const std::size_t tail = tail_.load(std::memory_order_relaxed);
-    const std::size_t head = head_.load(std::memory_order_acquire);
-    if (tail == head) return false;
-
-    *item = entries_[tail];
-    tail_.store((tail + 1) % storage_size_, std::memory_order_release);
-    return true;
-}
-
-std::size_t ReceiveSpscQueue::size() const {
-    const std::size_t head = head_.load(std::memory_order_acquire);
-    const std::size_t tail = tail_.load(std::memory_order_acquire);
-    return head >= tail ? head - tail : storage_size_ - tail + head;
-}
-
-bool ReceiveSpscQueue::empty() const {
-    return head_.load(std::memory_order_acquire) ==
-           tail_.load(std::memory_order_acquire);
-}
-
-std::size_t ReceiveSpscQueue::capacity() const {
-    return storage_size_ - 1;
-}
-
-std::size_t ReceiveSpscQueue::high_watermark() const {
-    return high_watermark_.load(std::memory_order_relaxed);
-}
-
-std::size_t SelectAvailableBatch(std::size_t available,
-                                 std::size_t maximum_batch) {
-    return available < maximum_batch ? available : maximum_batch;
-}
-
-ReceiveCpuPlacement ResolveReceiveCpuPlacement(int legacy_cpu,
-                                               int poll_cpu,
-                                               int copy_cpu) {
-    ReceiveCpuPlacement result = {false, poll_cpu, copy_cpu};
-    if (legacy_cpu < -1 || poll_cpu < -1 || copy_cpu < -1) return result;
-    if (legacy_cpu >= 0) {
-        if (poll_cpu >= 0 && poll_cpu != legacy_cpu) return result;
-        result.poll_cpu = legacy_cpu;
-    }
-    if (result.poll_cpu >= 0 && result.copy_cpu == result.poll_cpu)
-        return result;
-    result.valid = true;
-    return result;
-}
-
-ReceiveShardCpuPlacement ResolveReceiveShardCpuPlacement(
-    int legacy_cpu, const std::vector<int>& poll_cpus, int copy_cpu,
-    std::size_t shard_count) {
-    ReceiveShardCpuPlacement result = {false, poll_cpus, copy_cpu};
-    if (shard_count == 0 || legacy_cpu < -1 || copy_cpu < -1) return result;
-    if (legacy_cpu >= 0) {
-        if (shard_count != 1 || !poll_cpus.empty()) return result;
-        result.poll_cpus.push_back(legacy_cpu);
-    }
-    if (!result.poll_cpus.empty() && result.poll_cpus.size() != shard_count)
-        return result;
-    std::set<int> assigned;
-    for (std::size_t index = 0; index < result.poll_cpus.size(); ++index) {
-        const int cpu = result.poll_cpus[index];
-        if (cpu < 0 || cpu == copy_cpu || !assigned.insert(cpu).second)
-            return result;
-    }
-    result.valid = true;
-    return result;
-}
-
-bool ParseReceiveFlowSpec(const std::string& text, ReceiveFlowSpec* flow,
-                          std::string* error) {
-    if (!flow) return false;
-    const std::string::size_type separator = text.rfind(':');
-    if (separator == std::string::npos || separator == 0 ||
-        separator + 1 >= text.size()) {
-        if (error) *error = "receive flow must use IPv4:port";
-        return false;
-    }
-    const std::string ip = text.substr(0, separator);
-    const std::string port_text = text.substr(separator + 1);
-    struct in_addr address = {};
-    if (inet_pton(AF_INET, ip.c_str(), &address) != 1) {
-        if (error) *error = "receive flow has invalid IPv4 address";
-        return false;
-    }
-    char* end = NULL;
-    const unsigned long port = std::strtoul(port_text.c_str(), &end, 10);
-    if (!end || *end != '\0' || port == 0 || port > 65535) {
-        if (error) *error = "receive flow has invalid UDP port";
-        return false;
-    }
-    flow->source_ip = ip;
-    flow->source_port = static_cast<std::uint16_t>(port);
-    return true;
-}
 
 DestinationUdpFilter BuildDestinationUdpFilter(
     const std::uint8_t destination_mac[6],
@@ -149,37 +23,6 @@ DestinationUdpFilter BuildDestinationUdpFilter(
     filter.destination_port_mask =
         std::numeric_limits<std::uint16_t>::max();
     return filter;
-}
-
-DestinationUdpFilter BuildSourceUdpFilter(
-    const std::uint8_t destination_mac[6],
-    std::uint32_t source_ip, std::uint16_t source_port,
-    std::uint32_t destination_ip, std::uint16_t destination_port) {
-    DestinationUdpFilter filter = BuildDestinationUdpFilter(
-        destination_mac, destination_ip, destination_port);
-    filter.source_ip = source_ip;
-    filter.source_ip_mask = std::numeric_limits<std::uint32_t>::max();
-    filter.source_port = source_port;
-    filter.source_port_mask = std::numeric_limits<std::uint16_t>::max();
-    return filter;
-}
-
-ReceiveDisposition ClassifyReceiveCompletion(
-    const ReceiveCompletion& completion,
-    std::uint64_t wr_limit,
-    std::uint32_t expected_byte_len) {
-    if (!completion.success || !completion.receive_opcode ||
-        completion.wr_id >= wr_limit) {
-        return ReceiveDisposition::kFatal;
-    }
-    if (completion.byte_len != expected_byte_len) {
-        return ReceiveDisposition::kDropWrongLength;
-    }
-    return ReceiveDisposition::kAccept;
-}
-
-bool ShouldLogWrongLengthDrop(std::uint64_t drop_count) {
-    return drop_count != 0 && (drop_count & (drop_count - 1)) == 0;
 }
 
 bool ShouldEmitPeriodicReceiveStatus(bool debug_mode) {
@@ -203,6 +46,88 @@ RawBlockTail ClassifyRawBlockTail(std::uint64_t block_bytes,
         ? RawBlockTailDisposition::kNoData
         : RawBlockTailDisposition::kPublish;
     return result;
+}
+
+bool ValidateDirectRawConfiguration(std::size_t recv_wr_num,
+                                    std::size_t records_per_block,
+                                    std::size_t raw_ring_blocks) {
+    return recv_wr_num != 0U && records_per_block != 0U &&
+           recv_wr_num <= records_per_block && raw_ring_blocks >= 2U;
+}
+
+DirectRawCompletionAction ClassifyDirectRawCompletion(
+    bool success, bool receive_opcode, bool valid_wr_id,
+    std::uint32_t byte_len, std::uint32_t expected_byte_len,
+    std::uint32_t* consecutive_wrong_length) {
+    if (!success || !receive_opcode || !valid_wr_id ||
+        !consecutive_wrong_length || expected_byte_len == 0U) {
+        return DirectRawCompletionAction::kFatal;
+    }
+    if (byte_len == expected_byte_len) {
+        *consecutive_wrong_length = 0;
+        return DirectRawCompletionAction::kKeepSlot;
+    }
+    ++(*consecutive_wrong_length);
+    return *consecutive_wrong_length >=
+                   kDirectRawMaxConsecutiveWrongLength
+        ? DirectRawCompletionAction::kFatal
+        : DirectRawCompletionAction::kZeroSlot;
+}
+
+DirectRawBlockProgress::DirectRawBlockProgress(std::size_t slot_count)
+    : assigned_(slot_count, 0), completed_(slot_count, 0),
+      assigned_count_(0), completed_count_(0) {}
+
+bool DirectRawBlockProgress::AssignSlot(std::size_t slot) {
+    if (slot >= assigned_.size() || assigned_[slot] != 0) return false;
+    assigned_[slot] = 1;
+    ++assigned_count_;
+    return true;
+}
+
+bool DirectRawBlockProgress::CompleteSlot(std::size_t slot) {
+    if (slot >= assigned_.size() || assigned_[slot] == 0 ||
+        completed_[slot] != 0) {
+        return false;
+    }
+    completed_[slot] = 1;
+    ++completed_count_;
+    return true;
+}
+
+std::size_t DirectRawBlockProgress::ContiguousCompletedSlots() const {
+    std::size_t count = 0;
+    while (count < completed_.size() && completed_[count] != 0) ++count;
+    return count;
+}
+
+bool DirectRawBlockProgress::ready_to_publish() const {
+    return !assigned_.empty() && assigned_count_ == assigned_.size() &&
+           completed_count_ == assigned_.size();
+}
+
+bool DirectRawOutstandingBlockOrder::Push(std::uint64_t token) {
+    if (tokens_.size() >= 2U) return false;
+    tokens_.push_back(token);
+    return true;
+}
+
+bool DirectRawOutstandingBlockOrder::PopFront(std::uint64_t token) {
+    if (tokens_.empty() || tokens_.front() != token) return false;
+    tokens_.pop_front();
+    return true;
+}
+
+std::uint64_t DirectRawOutstandingBlockOrder::front() const {
+    return tokens_.empty() ? 0U : tokens_.front();
+}
+
+std::size_t DirectRawOutstandingBlockOrder::size() const {
+    return tokens_.size();
+}
+
+bool DirectRawOutstandingBlockOrder::empty() const {
+    return tokens_.empty();
 }
 
 }  // namespace rdma

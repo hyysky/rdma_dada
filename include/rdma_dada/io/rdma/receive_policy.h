@@ -1,78 +1,19 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <deque>
 #include <vector>
 
 namespace rdma_dada {
 namespace io {
 namespace rdma {
 
-constexpr unsigned int kDefaultReceiveCopyBatch = 64;
-constexpr unsigned int kDefaultReceiveNsge = 1;
 constexpr unsigned int kDefaultReceivePollBatch = 32;
 constexpr unsigned int kDefaultReceiveWrDepth = 1024;
-
-struct ReceiveWorkItem {
-    std::uint64_t wr_id;
-    std::uint64_t completion_ns;
-};
-
-class ReceiveSpscQueue {
-  public:
-    explicit ReceiveSpscQueue(std::size_t capacity);
-
-    bool TryPush(const ReceiveWorkItem& item);
-    bool TryPop(ReceiveWorkItem* item);
-
-    std::size_t size() const;
-    bool empty() const;
-    std::size_t capacity() const;
-    std::size_t high_watermark() const;
-
-  private:
-    ReceiveSpscQueue(const ReceiveSpscQueue&) = delete;
-    ReceiveSpscQueue& operator=(const ReceiveSpscQueue&) = delete;
-
-    std::vector<ReceiveWorkItem> entries_;
-    const std::size_t storage_size_;
-    std::atomic<std::size_t> head_;
-    std::atomic<std::size_t> tail_;
-    std::atomic<std::size_t> high_watermark_;
-};
-
-std::size_t SelectAvailableBatch(std::size_t available,
-                                 std::size_t maximum_batch);
-
-struct ReceiveCpuPlacement {
-    bool valid;
-    int poll_cpu;
-    int copy_cpu;
-};
-
-ReceiveCpuPlacement ResolveReceiveCpuPlacement(int legacy_cpu,
-                                               int poll_cpu,
-                                               int copy_cpu);
-
-struct ReceiveShardCpuPlacement {
-    bool valid;
-    std::vector<int> poll_cpus;
-    int copy_cpu;
-};
-
-ReceiveShardCpuPlacement ResolveReceiveShardCpuPlacement(
-    int legacy_cpu, const std::vector<int>& poll_cpus, int copy_cpu,
-    std::size_t shard_count);
-
-struct ReceiveFlowSpec {
-    std::string source_ip;
-    std::uint16_t source_port;
-};
-
-bool ParseReceiveFlowSpec(const std::string& text, ReceiveFlowSpec* flow,
-                          std::string* error);
+constexpr unsigned int kDirectRawNsge = 2;
+constexpr std::uint32_t kDirectRawHeaderBytes = 42;
+constexpr std::uint32_t kDirectRawMaxConsecutiveWrongLength = 16;
 
 struct DestinationUdpFilter {
     std::uint8_t source_mac[6];
@@ -94,31 +35,6 @@ DestinationUdpFilter BuildDestinationUdpFilter(
     std::uint32_t destination_ip,
     std::uint16_t destination_port);
 
-DestinationUdpFilter BuildSourceUdpFilter(
-    const std::uint8_t destination_mac[6],
-    std::uint32_t source_ip, std::uint16_t source_port,
-    std::uint32_t destination_ip, std::uint16_t destination_port);
-
-struct ReceiveCompletion {
-    bool success;
-    bool receive_opcode;
-    std::uint64_t wr_id;
-    std::uint32_t byte_len;
-};
-
-enum class ReceiveDisposition {
-    kAccept,
-    kDropWrongLength,
-    kFatal
-};
-
-ReceiveDisposition ClassifyReceiveCompletion(
-    const ReceiveCompletion& completion,
-    std::uint64_t wr_limit,
-    std::uint32_t expected_byte_len);
-
-bool ShouldLogWrongLengthDrop(std::uint64_t drop_count);
-
 bool ShouldEmitPeriodicReceiveStatus(bool debug_mode);
 
 enum class RawBlockTailDisposition {
@@ -136,6 +52,49 @@ struct RawBlockTail {
 RawBlockTail ClassifyRawBlockTail(std::uint64_t block_bytes,
                                   std::uint64_t record_bytes,
                                   std::uint64_t valid_bytes);
+
+bool ValidateDirectRawConfiguration(std::size_t recv_wr_num,
+                                    std::size_t records_per_block,
+                                    std::size_t raw_ring_blocks);
+
+enum class DirectRawCompletionAction {
+    kKeepSlot,
+    kZeroSlot,
+    kFatal
+};
+
+DirectRawCompletionAction ClassifyDirectRawCompletion(
+    bool success, bool receive_opcode, bool valid_wr_id,
+    std::uint32_t byte_len, std::uint32_t expected_byte_len,
+    std::uint32_t* consecutive_wrong_length);
+
+class DirectRawBlockProgress {
+  public:
+    explicit DirectRawBlockProgress(std::size_t slot_count);
+
+    bool AssignSlot(std::size_t slot);
+    bool CompleteSlot(std::size_t slot);
+    std::size_t ContiguousCompletedSlots() const;
+    bool ready_to_publish() const;
+
+  private:
+    std::vector<std::uint8_t> assigned_;
+    std::vector<std::uint8_t> completed_;
+    std::size_t assigned_count_;
+    std::size_t completed_count_;
+};
+
+class DirectRawOutstandingBlockOrder {
+  public:
+    bool Push(std::uint64_t token);
+    bool PopFront(std::uint64_t token);
+    std::uint64_t front() const;
+    std::size_t size() const;
+    bool empty() const;
+
+  private:
+    std::deque<std::uint64_t> tokens_;
+};
 
 }  // namespace rdma
 }  // namespace io

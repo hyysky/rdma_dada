@@ -51,227 +51,11 @@ void TestDestinationFilterWildcardsEverySourceField() {
            "source UDP port is wildcarded");
 }
 
-void TestSourceUdpFilterMatchesOneSenderFlow() {
-    const std::uint8_t destination_mac[6] = {
-        0x98, 0x03, 0x9b, 0xaa, 0x99, 0xd8
-    };
-    const std::uint32_t source_ip = UINT32_C(0x640100ae);
-    const std::uint32_t destination_ip = UINT32_C(0x6f0100ae);
-    const std::uint16_t source_port = UINT16_C(41001);
-    const std::uint16_t destination_port = UINT16_C(1000);
-
-    const rdma_dada::io::rdma::DestinationUdpFilter filter =
-        rdma_dada::io::rdma::BuildSourceUdpFilter(
-            destination_mac, source_ip, source_port,
-            destination_ip, destination_port);
-
-    Expect(filter.source_ip == source_ip &&
-               filter.source_ip_mask == UINT32_MAX,
-           "source IPv4 is matched exactly for one receiver shard");
-    Expect(filter.source_port == source_port &&
-               filter.source_port_mask == UINT16_MAX,
-           "source UDP port is matched exactly for one receiver shard");
-    Expect(filter.destination_ip == destination_ip &&
-               filter.destination_ip_mask == UINT32_MAX,
-           "sharded filter preserves exact destination IPv4");
-    Expect(filter.destination_port == destination_port &&
-               filter.destination_port_mask == UINT16_MAX,
-           "sharded filter preserves exact destination UDP port");
-}
-
-void TestReceiveFlowSpecParser() {
-    namespace rdma = rdma_dada::io::rdma;
-    rdma::ReceiveFlowSpec flow;
-    std::string error;
-    Expect(rdma::ParseReceiveFlowSpec("174.0.1.100:41001", &flow, &error),
-           "IPv4 and UDP source port form a valid receive flow");
-    Expect(flow.source_ip == "174.0.1.100" && flow.source_port == 41001,
-           "receive flow parser preserves source endpoint");
-    Expect(!rdma::ParseReceiveFlowSpec("174.0.1.100", &flow, &error),
-           "receive flow without a source port is rejected");
-    Expect(!rdma::ParseReceiveFlowSpec("174.0.1.100:0", &flow, &error),
-           "receive flow rejects port zero");
-    Expect(!rdma::ParseReceiveFlowSpec("not-an-ip:41001", &flow, &error),
-           "receive flow rejects invalid IPv4 text");
-}
-
-void TestReceiveShardCpuPlacement() {
-    namespace rdma = rdma_dada::io::rdma;
-    rdma::ReceiveShardCpuPlacement placement =
-        rdma::ResolveReceiveShardCpuPlacement(-1, {13, 14}, 15, 2);
-    Expect(placement.valid && placement.poll_cpus.size() == 2 &&
-               placement.poll_cpus[0] == 13 && placement.poll_cpus[1] == 14 &&
-               placement.copy_cpu == 15,
-           "two receiver shards use distinct poll CPUs and one writer CPU");
-    Expect(!rdma::ResolveReceiveShardCpuPlacement(-1, {13}, 15, 2).valid,
-           "poll CPU count must equal receiver shard count");
-    Expect(!rdma::ResolveReceiveShardCpuPlacement(-1, {13, 13}, 15, 2).valid,
-           "receiver shards cannot share an explicitly assigned poll CPU");
-    Expect(!rdma::ResolveReceiveShardCpuPlacement(-1, {13, 15}, 15, 2).valid,
-           "writer CPU cannot overlap a receiver poll CPU");
-    placement = rdma::ResolveReceiveShardCpuPlacement(13, {}, 15, 1);
-    Expect(placement.valid && placement.poll_cpus == std::vector<int>({13}),
-           "legacy poll CPU remains compatible with one receiver shard");
-}
-
-void TestWrongLengthIsRecoverable() {
-    rdma_dada::io::rdma::ReceiveCompletion completion;
-    completion.success = true;
-    completion.receive_opcode = true;
-    completion.wr_id = 7;
-    completion.byte_len = 1057;
-
-    Expect(rdma_dada::io::rdma::ClassifyReceiveCompletion(
-               completion, 32, 1066) ==
-               rdma_dada::io::rdma::ReceiveDisposition::kDropWrongLength,
-           "successful wrong-length receive is recoverable");
-
-    completion.byte_len = 1066;
-    Expect(rdma_dada::io::rdma::ClassifyReceiveCompletion(
-               completion, 32, 1066) ==
-               rdma_dada::io::rdma::ReceiveDisposition::kAccept,
-           "matching receive completion is accepted");
-}
-
-void TestTransportErrorsRemainFatal() {
-    rdma_dada::io::rdma::ReceiveCompletion completion;
-    completion.success = false;
-    completion.receive_opcode = true;
-    completion.wr_id = 7;
-    completion.byte_len = 1066;
-    Expect(rdma_dada::io::rdma::ClassifyReceiveCompletion(
-               completion, 32, 1066) ==
-               rdma_dada::io::rdma::ReceiveDisposition::kFatal,
-           "failed CQ status is fatal");
-
-    completion.success = true;
-    completion.receive_opcode = false;
-    Expect(rdma_dada::io::rdma::ClassifyReceiveCompletion(
-               completion, 32, 1066) ==
-               rdma_dada::io::rdma::ReceiveDisposition::kFatal,
-           "unexpected CQ opcode is fatal");
-
-    completion.receive_opcode = true;
-    completion.wr_id = 32;
-    Expect(rdma_dada::io::rdma::ClassifyReceiveCompletion(
-               completion, 32, 1066) ==
-               rdma_dada::io::rdma::ReceiveDisposition::kFatal,
-           "out-of-range WR ID is fatal");
-}
-
-void TestWrongLengthLogIsRateLimited() {
-    Expect(!rdma_dada::io::rdma::ShouldLogWrongLengthDrop(0),
-           "zero drops do not log");
-    Expect(rdma_dada::io::rdma::ShouldLogWrongLengthDrop(1),
-           "first drop logs");
-    Expect(rdma_dada::io::rdma::ShouldLogWrongLengthDrop(2),
-           "second drop logs");
-    Expect(!rdma_dada::io::rdma::ShouldLogWrongLengthDrop(3),
-           "third drop is rate limited");
-    Expect(rdma_dada::io::rdma::ShouldLogWrongLengthDrop(4),
-           "power-of-two drop count logs");
-    Expect(!rdma_dada::io::rdma::ShouldLogWrongLengthDrop(5),
-           "non-power-of-two drop count is rate limited");
-}
-
 void TestPeriodicReceiveStatusRequiresDebugMode() {
     Expect(!rdma_dada::io::rdma::ShouldEmitPeriodicReceiveStatus(false),
            "normal receive mode suppresses periodic status work");
     Expect(rdma_dada::io::rdma::ShouldEmitPeriodicReceiveStatus(true),
            "debug receive mode retains periodic status work");
-}
-
-void TestTunedReceiveQueueDefaults() {
-    namespace rdma = rdma_dada::io::rdma;
-    Expect(rdma::kDefaultReceiveCopyBatch == 64,
-           "default receive copy batch is 64 packets");
-    Expect(rdma::kDefaultReceiveNsge == 1,
-           "default receive WR uses one SGE");
-    Expect(rdma::kDefaultReceivePollBatch == 32,
-           "default CQ poll batch is 32 completions");
-    Expect(rdma::kDefaultReceiveWrDepth == 1024,
-           "default receive WR depth is 1024");
-}
-
-void TestReceiveSpscQueuePreservesOwnershipOrder() {
-    namespace rdma = rdma_dada::io::rdma;
-    rdma::ReceiveSpscQueue queue(4);
-    rdma::ReceiveWorkItem item = {};
-
-    Expect(queue.empty(), "new receive SPSC queue is empty");
-    Expect(queue.TryPush({10, 100}), "first ownership push succeeds");
-    Expect(queue.TryPush({11, 110}), "second ownership push succeeds");
-    Expect(queue.size() == 2, "queue size counts pending ownership items");
-    Expect(queue.TryPop(&item) && item.wr_id == 10 &&
-               item.completion_ns == 100,
-           "first ownership item is popped first");
-    Expect(queue.TryPop(&item) && item.wr_id == 11 &&
-               item.completion_ns == 110,
-           "second ownership item follows first");
-    Expect(!queue.TryPop(&item), "empty ownership pop fails cleanly");
-}
-
-void TestReceiveSpscQueueWrapsAtUsableCapacity() {
-    namespace rdma = rdma_dada::io::rdma;
-    rdma::ReceiveSpscQueue queue(3);
-    rdma::ReceiveWorkItem item = {};
-
-    Expect(queue.capacity() == 3, "reported capacity is fully usable");
-    Expect(queue.TryPush({1, 10}), "capacity slot one is usable");
-    Expect(queue.TryPush({2, 20}), "capacity slot two is usable");
-    Expect(queue.TryPush({3, 30}), "capacity slot three is usable");
-    Expect(!queue.TryPush({4, 40}), "full ownership queue rejects push");
-    Expect(queue.TryPop(&item) && item.wr_id == 1,
-           "oldest item is released before wrap");
-    Expect(queue.TryPush({4, 40}), "push succeeds after index wrap");
-    Expect(queue.high_watermark() == 3,
-           "high-water mark preserves peak occupancy");
-    Expect(queue.TryPop(&item) && item.wr_id == 2,
-           "wrapped queue preserves second item");
-    Expect(queue.TryPop(&item) && item.wr_id == 3,
-           "wrapped queue preserves third item");
-    Expect(queue.TryPop(&item) && item.wr_id == 4,
-           "wrapped queue appends fourth item");
-    Expect(queue.empty(), "wrapped queue drains completely");
-}
-
-void TestReceiveBatchUsesAvailableWorkImmediately() {
-    namespace rdma = rdma_dada::io::rdma;
-    Expect(rdma::SelectAvailableBatch(0, 64) == 0,
-           "empty ownership queue produces no batch");
-    Expect(rdma::SelectAvailableBatch(1, 64) == 1,
-           "one available record does not wait for 64");
-    Expect(rdma::SelectAvailableBatch(63, 64) == 63,
-           "partial available batch is processed immediately");
-    Expect(rdma::SelectAvailableBatch(64, 64) == 64,
-           "full available batch uses send_n");
-    Expect(rdma::SelectAvailableBatch(100, 64) == 64,
-           "available work is capped at send_n");
-    Expect(rdma::SelectAvailableBatch(10, 0) == 0,
-           "zero maximum batch rejects work");
-}
-
-void TestReceiveCpuPlacementResolution() {
-    namespace rdma = rdma_dada::io::rdma;
-    rdma::ReceiveCpuPlacement placement =
-        rdma::ResolveReceiveCpuPlacement(-1, -1, -1);
-    Expect(placement.valid && placement.poll_cpu == -1 &&
-               placement.copy_cpu == -1,
-           "unbound receive placement remains valid");
-    placement = rdma::ResolveReceiveCpuPlacement(13, -1, 14);
-    Expect(placement.valid && placement.poll_cpu == 13 &&
-               placement.copy_cpu == 14,
-           "legacy cpu aliases poll cpu");
-    placement = rdma::ResolveReceiveCpuPlacement(-1, 13, 14);
-    Expect(placement.valid && placement.poll_cpu == 13 &&
-               placement.copy_cpu == 14,
-           "distinct explicit receive CPUs are valid");
-    Expect(!rdma::ResolveReceiveCpuPlacement(12, 13, 14).valid,
-           "conflicting legacy and poll CPUs are rejected");
-    Expect(!rdma::ResolveReceiveCpuPlacement(-2, -1, -1).valid,
-           "CPU values below minus one are rejected");
-    Expect(!rdma::ResolveReceiveCpuPlacement(-1, 13, 13).valid,
-           "poll and copy threads cannot share an explicit CPU");
 }
 
 void TestRawBlockTailAccounting() {
@@ -316,23 +100,104 @@ void TestRawBlockTailAccounting() {
            "zero record geometry is rejected");
 }
 
+void TestDirectRawConfigurationContract() {
+    namespace rdma = rdma_dada::io::rdma;
+    Expect(rdma::kDirectRawNsge == 2 &&
+               rdma::kDirectRawHeaderBytes == 42,
+           "direct raw fixes two SGEs and a 42-byte network header");
+    Expect(rdma::ValidateDirectRawConfiguration(1024, 12800, 16),
+           "direct raw accepts a bounded WR queue and ring geometry");
+    Expect(!rdma::ValidateDirectRawConfiguration(12801, 12800, 16),
+           "two-block direct raw rejects WR depth larger than one block");
+    Expect(!rdma::ValidateDirectRawConfiguration(1024, 12800, 1),
+           "direct raw requires at least two ring blocks");
+}
+
+void TestDirectRawWrongLengthPolicy() {
+    namespace rdma = rdma_dada::io::rdma;
+    std::uint32_t consecutive = 0;
+    for (std::uint32_t count = 1; count < 16; ++count) {
+        const rdma::DirectRawCompletionAction action =
+            rdma::ClassifyDirectRawCompletion(true, true, true, 4169, 4170,
+                                               &consecutive);
+        Expect(action == rdma::DirectRawCompletionAction::kZeroSlot,
+               "isolated direct raw wrong-length packet zeroes one slot");
+        Expect(consecutive == count,
+               "direct raw counts consecutive wrong-length packets");
+    }
+    Expect(rdma::ClassifyDirectRawCompletion(
+               true, true, true, 4169, 4170, &consecutive) ==
+               rdma::DirectRawCompletionAction::kFatal,
+           "sixteenth consecutive wrong-length packet stops the transfer");
+
+    consecutive = 7;
+    Expect(rdma::ClassifyDirectRawCompletion(
+               true, true, true, 4170, 4170, &consecutive) ==
+               rdma::DirectRawCompletionAction::kKeepSlot &&
+               consecutive == 0,
+           "valid direct raw packet resets the consecutive error count");
+    Expect(rdma::ClassifyDirectRawCompletion(
+               false, true, true, 4170, 4170, &consecutive) ==
+               rdma::DirectRawCompletionAction::kFatal,
+           "CQ failure remains fatal in direct raw mode");
+    Expect(rdma::ClassifyDirectRawCompletion(
+               true, false, true, 4170, 4170, &consecutive) ==
+               rdma::DirectRawCompletionAction::kFatal,
+           "unexpected CQ opcode remains fatal in direct raw mode");
+    Expect(rdma::ClassifyDirectRawCompletion(
+               true, true, false, 4170, 4170, &consecutive) ==
+               rdma::DirectRawCompletionAction::kFatal,
+           "invalid WR identity remains fatal in direct raw mode");
+}
+
+void TestDirectRawBlockProgress() {
+    namespace rdma = rdma_dada::io::rdma;
+    rdma::DirectRawBlockProgress progress(4);
+    Expect(progress.AssignSlot(0) && progress.AssignSlot(1) &&
+               progress.AssignSlot(2) && progress.AssignSlot(3),
+           "direct raw assigns every block slot once");
+    Expect(!progress.AssignSlot(3) && !progress.AssignSlot(4),
+           "direct raw rejects duplicate and out-of-range slot assignment");
+    Expect(progress.CompleteSlot(1) && progress.CompleteSlot(0),
+           "direct raw accepts out-of-order CQ completion within one block");
+    Expect(progress.ContiguousCompletedSlots() == 2,
+           "direct raw reports only the continuous completed prefix");
+    Expect(!progress.ready_to_publish(),
+           "partially completed full block is not publishable");
+    Expect(progress.CompleteSlot(3) && progress.CompleteSlot(2),
+           "all assigned direct raw slots can complete");
+    Expect(progress.ready_to_publish() &&
+               progress.ContiguousCompletedSlots() == 4,
+           "full block publishes only after every slot completes");
+}
+
+void TestDirectRawOutstandingBlockOrder() {
+    namespace rdma = rdma_dada::io::rdma;
+    rdma::DirectRawOutstandingBlockOrder order;
+    Expect(order.Push(7) && order.Push(8),
+           "direct raw keeps exactly two acquired ring blocks");
+    Expect(!order.Push(9),
+           "direct raw refuses a third outstanding ring block");
+    Expect(!order.PopFront(8),
+           "direct raw cannot commit the second ring block first");
+    Expect(order.PopFront(7) && order.Push(9),
+           "committing the oldest block opens one replacement slot");
+    Expect(order.front() == 8 && order.size() == 2,
+           "direct raw preserves FIFO ring ownership");
+    Expect(order.PopFront(8) && order.PopFront(9) && order.empty(),
+           "direct raw drains outstanding ring blocks in order");
+}
+
 }  // namespace
 
 int main() {
     TestDestinationFilterWildcardsEverySourceField();
-    TestSourceUdpFilterMatchesOneSenderFlow();
-    TestReceiveFlowSpecParser();
-    TestReceiveShardCpuPlacement();
-    TestWrongLengthIsRecoverable();
-    TestTransportErrorsRemainFatal();
-    TestWrongLengthLogIsRateLimited();
     TestPeriodicReceiveStatusRequiresDebugMode();
-    TestTunedReceiveQueueDefaults();
-    TestReceiveSpscQueuePreservesOwnershipOrder();
-    TestReceiveSpscQueueWrapsAtUsableCapacity();
-    TestReceiveBatchUsesAvailableWorkImmediately();
-    TestReceiveCpuPlacementResolution();
     TestRawBlockTailAccounting();
+    TestDirectRawConfigurationContract();
+    TestDirectRawWrongLengthPolicy();
+    TestDirectRawBlockProgress();
+    TestDirectRawOutstandingBlockOrder();
     if (failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", failures);
         return 1;

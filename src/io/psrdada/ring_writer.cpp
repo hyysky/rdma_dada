@@ -24,10 +24,10 @@ extern "C" {
 
 // 注意：data_block和hdu改为成员变量，不再使用全局变量
 
-PsrdadaRingBuf::PsrdadaRingBuf(): hdu(NULL), log(NULL), data_block(NULL), current_ptr(NULL), current_block(0),
+PsrdadaRingBuf::PsrdadaRingBuf(): hdu(NULL), log(NULL), data_block(NULL),
     block_bytes(0), record_bytes(0),
     is_initialized(0), buffer_key(0), 
-    registered_pd(NULL), use_block_registration(false) {}
+    registered_pd(NULL), use_block_registration(false), next_write_token_(1) {}
 
 // 初始化 PSRDADA 环形缓冲区
 int PsrdadaRingBuf::Init(key_t key, uint64_t requested_block_bytes,
@@ -132,47 +132,61 @@ void PsrdadaRingBuf::ResetAfterInitFailure(bool write_locked)
     hdu = NULL;
     log = NULL;
     data_block = NULL;
-    current_ptr = NULL;
+    outstanding_blocks_.clear();
+    next_write_token_ = 1;
     block_bytes = 0;
     record_bytes = 0;
     is_initialized = 0;
 }
 
-char* PsrdadaRingBuf::GetWriteBuffer(uint64_t bytes)
+int PsrdadaRingBuf::AcquireWriteBlock(WriteBlockLease *lease)
 {
     std::lock_guard<std::mutex> lock(ring_mutex_);
-    if (!is_initialized) return NULL;
-    // 使用底层ipcbuf API获取下一个写入block
-    // 这样RoCE可以直接写入到这个block
+    if (!is_initialized || !lease || !use_block_registration ||
+        outstanding_blocks_.size() >= 2U) {
+        return -1;
+    }
     ipcbuf_t *buf = (ipcbuf_t*)data_block;
-    current_ptr = ipcbuf_get_next_write(buf);
-    if (!current_ptr) {
+    if (ipcbuf_get_bufsz(buf) != block_bytes) {
+        fprintf(stderr, "PSRDADA block geometry changed unexpectedly\n");
+        return -1;
+    }
+    char *ptr = ipcbuf_get_next_write(buf);
+    if (!ptr) {
         fprintf(stderr, "Failed to get next write block from ipcbuf\n");
-        return NULL;
+        return -1;
     }
-    
-    // 记录当前block索引（用于获取对应的MR）
-    current_block = (uint64_t)ipcbuf_get_write_count(buf) % ipcbuf_get_nbufs(buf);
-    
-    // 验证请求的大小不超过block大小
-    uint64_t bufsz = ipcbuf_get_bufsz(buf);
-    if (bytes > bufsz) {
-        fprintf(stderr, "Requested size %lu exceeds block size %lu\n", 
-                (unsigned long)bytes, (unsigned long)bufsz);
-        ipcbuf_mark_cleared(buf);  // 释放刚获取的block
-        current_ptr = NULL;
-        return NULL;
+    uint64_t block_idx = UINT64_MAX;
+    struct ibv_mr *mr = NULL;
+    for (size_t index = 0; index < block_mrs.size(); ++index) {
+        if (block_mrs[index].addr == ptr) {
+            block_idx = index;
+            mr = block_mrs[index].mr;
+            break;
+        }
     }
-    
-    return current_ptr;
+    if (!mr) {
+        fprintf(stderr, "No registered MR for acquired PSRDADA block\n");
+        return -1;
+    }
+    const OutstandingWriteBlock block = {
+        ptr, next_write_token_++, block_idx, mr};
+    outstanding_blocks_.push_back(block);
+    lease->addr = block.addr;
+    lease->bytes = block_bytes;
+    lease->token = block.token;
+    lease->block_idx = block.block_idx;
+    lease->mr = block.mr;
+    return 0;
 }
 
-int PsrdadaRingBuf::MarkWritten(uint64_t bytes)
+int PsrdadaRingBuf::CommitWriteBlock(uint64_t token, uint64_t bytes)
 {
     std::lock_guard<std::mutex> lock(ring_mutex_);
     if (!is_initialized) return -1;
-    if (!current_ptr) {
-        fprintf(stderr, "MarkWritten called but no current block\n");
+    if (outstanding_blocks_.empty() ||
+        outstanding_blocks_.front().token != token) {
+        fprintf(stderr, "PSRDADA blocks must be committed in acquisition order\n");
         return -1;
     }
     if (bytes == 0 || bytes > block_bytes || bytes % record_bytes != 0) {
@@ -188,11 +202,22 @@ int PsrdadaRingBuf::MarkWritten(uint64_t bytes)
     ipcbuf_t *buf = (ipcbuf_t*)data_block;
     if (ipcbuf_mark_filled(buf, bytes) < 0) {
         fprintf(stderr, "Failed to mark block as filled\n");
-        current_ptr = NULL;
         return -1;
     }
-    
-    current_ptr = NULL;  // 清空当前指针，准备下一次获取
+    outstanding_blocks_.pop_front();
+    return 0;
+}
+
+int PsrdadaRingBuf::CloseOutstandingBlocks()
+{
+    ipcbuf_t *buf = (ipcbuf_t*)data_block;
+    while (!outstanding_blocks_.empty()) {
+        if (ipcbuf_mark_filled(buf, 0) < 0) {
+            fprintf(stderr, "Failed to close outstanding PSRDADA block\n");
+            return -1;
+        }
+        outstanding_blocks_.pop_front();
+    }
     return 0;
 }
 
@@ -259,6 +284,8 @@ void PsrdadaRingBuf::Cleanup()
     if (!is_initialized) return;
     
     printf("[Cleanup] Starting cleanup sequence...\n");
+    if (CloseOutstandingBlocks() != 0)
+        fprintf(stderr, "[Cleanup] Warning: outstanding block close failed\n");
     
     // Step 1: Send EOD (End of Data) signal to readers
     dada_hdu_t *hdu_ptr = (dada_hdu_t*)hdu;
@@ -384,8 +411,7 @@ struct ibv_mr* PsrdadaRingBuf::RegisterWholeRing(struct ibv_pd *pd, int access)
                    " blocks individually\n", nbufs);
             use_block_registration = true;
             registered_pd = pd;
-            // 注意：分块注册模式下返回NULL，因为没有单一的MR代表整个ring
-            // 调用方应该使用GetCurrentBlockMr()来获取每个block的MR
+            // 分块注册模式没有代表整个 ring 的单一 MR。
             return NULL;
         } else {
             fprintf(stderr, "[RegisterWholeRing] Failed to register blocks individually\n");
@@ -465,6 +491,11 @@ int PsrdadaRingBuf::SendEODAndDisconnect()
     if (!is_initialized) return -1;
     
     printf("[SendEODAndDisconnect] Sending EOD and disconnecting...\n");
+    if (CloseOutstandingBlocks() != 0) {
+        fprintf(stderr,
+                "[SendEODAndDisconnect] Failed to close outstanding blocks\n");
+        return -1;
+    }
     
     dada_hdu_t *hdu_ptr = (dada_hdu_t*)hdu;
     if (hdu_ptr) {
@@ -522,6 +553,7 @@ int PsrdadaRingBuf::SendEODAndDisconnect()
     is_initialized = 0;
     block_bytes = 0;
     record_bytes = 0;
+    next_write_token_ = 1;
     printf("[SendEODAndDisconnect] ✓ Complete\n");
     return 0;
 }
@@ -616,44 +648,6 @@ int PsrdadaRingBuf::RegisterRingBlocks(struct ibv_pd *pd, int access)
            (nbufs * bufsz) / 1024 / 1024);
     
     return 0;
-}
-
-// 获取当前写入block的MR
-struct ibv_mr* PsrdadaRingBuf::GetCurrentBlockMr()
-{
-    if (!use_block_registration) {
-        // 使用整块注册模式，不需要单独的block MR
-        return NULL;
-    }
-    
-    if (block_mrs.empty()) {
-        fprintf(stderr, "[GetCurrentBlockMr] No blocks registered\n");
-        return NULL;
-    }
-    
-    if (!current_ptr) {
-        fprintf(stderr, "[GetCurrentBlockMr] No current block\n");
-        return NULL;
-    }
-    
-    // 优先使用 current_block 索引做 O(1) 查找
-    if (current_block < block_mrs.size() && block_mrs[current_block].addr == current_ptr) {
-        return block_mrs[current_block].mr;
-    }
-
-    // 索引与地址不匹配（异常情况），回退到线性查找
-    for (size_t i = 0; i < block_mrs.size(); i++) {
-        if (block_mrs[i].addr == current_ptr) {
-            fprintf(stderr, "[GetCurrentBlockMr] WARNING: current_block=%" PRIu64 " does not "
-                    "match current_ptr=%p (found at index %zu)\n",
-                    current_block, current_ptr, i);
-            return block_mrs[i].mr;
-        }
-    }
-
-    fprintf(stderr, "[GetCurrentBlockMr] Block MR not found for ptr=%p idx=%" PRIu64 "\n",
-            current_ptr, current_block);
-    return NULL;
 }
 
 // 清理所有已注册的block MRs
