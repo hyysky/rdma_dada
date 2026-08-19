@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.18)
 
 project(rdma_dada VERSION 0.1.0 LANGUAGES C CXX)
 
+find_package(Threads REQUIRED)
+
 include(CTest)
 
 set(CMAKE_CXX_STANDARD 11)
@@ -77,7 +79,9 @@ add_library(rdma_module_vdif_unpack STATIC
 target_include_directories(rdma_module_vdif_unpack
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(rdma_module_vdif_unpack PUBLIC rdma_pipeline_core)
+target_link_libraries(rdma_module_vdif_unpack PUBLIC
+    rdma_pipeline_core
+    Threads::Threads)
 
 add_library(rdma_observation_compiler STATIC
     src/config/observation_artifacts.cpp)

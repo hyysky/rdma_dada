@@ -4,6 +4,8 @@
 #include "rdma_dada/pipeline/group_block_writer.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 
 namespace rdma_dada {
@@ -36,6 +38,35 @@ private:
     bool finished_;
     bool failed_;
     AtfpBlockWriterStatistics statistics_;
+};
+
+struct AsyncAtfpBlockWriterStatistics {
+    std::uint64_t enqueued_blocks;
+    std::uint64_t queue_high_watermark;
+    std::uint64_t enqueue_wait_ns;
+};
+
+class AsyncAtfpBlockWriter {
+public:
+    AsyncAtfpBlockWriter();
+    ~AsyncAtfpBlockWriter();
+
+    bool Configure(std::uint64_t block_capacity,
+                   std::uint64_t queue_capacity,
+                   int writer_cpu,
+                   pipeline::WritableBlockSink* sink,
+                   const std::function<bool(std::uint64_t, std::string*)>&
+                       release,
+                   std::string* error);
+    bool Enqueue(const AtfpBlockView& view, std::string* error);
+    bool Finish(std::string* error);
+    void Abort();
+    const AtfpBlockWriterStatistics& writer_statistics() const;
+    const AsyncAtfpBlockWriterStatistics& statistics() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace vdif_unpack

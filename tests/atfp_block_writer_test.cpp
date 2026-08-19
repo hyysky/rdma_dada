@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -204,6 +206,38 @@ void TestSinkFailuresPoisonOnlyThatWriter() {
            "failed commit is counted but not reported as published");
 }
 
+void TestAsyncWriterPreservesFifoAndReleasesLeases() {
+    namespace unpack = rdma_dada::modules::vdif_unpack;
+    const std::vector<std::uint8_t> window = MakeWindow();
+    MemorySink sink(24);
+    std::vector<std::uint64_t> released;
+    std::mutex released_mutex;
+    unpack::AsyncAtfpBlockWriter writer;
+    std::string error;
+    Expect(writer.Configure(
+               24, 2, -1, &sink,
+               [&released, &released_mutex](std::uint64_t lease,
+                                            std::string*) {
+                   std::lock_guard<std::mutex> lock(released_mutex);
+                   released.push_back(lease);
+                   return true;
+               },
+               &error),
+           "async writer configures: " + error);
+    unpack::AtfpBlockView first = MakeView(window, 0, 2);
+    unpack::AtfpBlockView second = MakeView(window, 2, 2);
+    first.lease_id = 11;
+    second.lease_id = 12;
+    Expect(writer.Enqueue(first, &error), "first lease enqueues: " + error);
+    Expect(writer.Enqueue(second, &error), "second lease enqueues: " + error);
+    Expect(writer.Finish(&error), "async writer drains: " + error);
+    Expect(sink.committed.size() == 2U, "async writer commits two blocks");
+    Expect(released == std::vector<std::uint64_t>({11, 12}),
+           "async writer releases leases in FIFO order");
+    Expect(writer.statistics().enqueued_blocks == 2U,
+           "async writer reports enqueue count");
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +245,7 @@ int main() {
     TestPartialBlockUsesActualAntennaStride();
     TestInvalidViewDoesNotAcquire();
     TestSinkFailuresPoisonOnlyThatWriter();
+    TestAsyncWriterPreservesFifoAndReleasesLeases();
     if (failures != 0) return 1;
     std::cout << "atfp_block_writer_test passed\n";
     return 0;

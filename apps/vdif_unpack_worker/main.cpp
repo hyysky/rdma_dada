@@ -24,10 +24,16 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <set>
 #include <string>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace {
 
@@ -50,6 +56,50 @@ bool ParsePositiveUint64(const char* text, std::uint64_t* value) {
     if (errno == ERANGE || end == text || *end != '\0' || parsed == 0U)
         return false;
     *value = static_cast<std::uint64_t>(parsed);
+    return true;
+}
+
+bool ParseThreadCpus(const std::string& text, std::vector<int>* cpus) {
+    if (!cpus || text.empty()) return false;
+    std::vector<int> parsed;
+    std::set<int> unique;
+    std::size_t begin = 0U;
+    while (begin < text.size()) {
+        const std::size_t end = text.find(',', begin);
+        const std::string token = text.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        errno = 0;
+        char* parse_end = NULL;
+        const unsigned long long value =
+            std::strtoull(token.c_str(), &parse_end, 10);
+        if (token.empty() || token[0] == '-' || errno == ERANGE ||
+            parse_end == token.c_str() || *parse_end != '\0' ||
+            value > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+            !unique.insert(static_cast<int>(value)).second) {
+            return false;
+        }
+        parsed.push_back(static_cast<int>(value));
+        if (end == std::string::npos) break;
+        begin = end + 1U;
+    }
+    if (parsed.size() < 3U) return false;
+    cpus->swap(parsed);
+    return true;
+}
+
+bool BindCurrentThread(int cpu, std::string* error) {
+#if defined(__linux__)
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) != 0) {
+        if (error) *error = "cannot bind unpack coordinator CPU";
+        return false;
+    }
+#else
+    (void)cpu;
+    (void)error;
+#endif
     return true;
 }
 
@@ -148,7 +198,7 @@ struct WorkerRuntime {
     unpack::VdifUnpackLayout unpack_layout;
     unpack::VdifTimeline timeline;
     unpack::VdifAtfpUnpackEngine engine;
-    unpack::AtfpBlockWriter writer;
+    unpack::AsyncAtfpBlockWriter writer;
     PsrdadaBlockSink sink;
     multilog_t* log;
     dada_hdu_t* output_hdu;
@@ -163,6 +213,7 @@ struct WorkerRuntime {
     bool collect_missing_per_second;
     bool discard_before_timeline_start;
     std::uint64_t groups_per_second;
+    std::vector<int> thread_cpus;
 };
 
 void SetFailure(WorkerRuntime* runtime, const std::string& message) {
@@ -175,6 +226,7 @@ void SetFailure(WorkerRuntime* runtime, const std::string& message) {
 bool EndOutputTransfer(WorkerRuntime* runtime) {
     bool ok = true;
     if (!runtime || !runtime->output_locked) return ok;
+    runtime->writer.Abort();
     if (!runtime->sink.Abort()) {
         SetFailure(runtime, "cannot discard open output DADA block");
         ok = false;
@@ -198,7 +250,20 @@ bool EndOutputTransfer(WorkerRuntime* runtime) {
 bool EmitAtfpBlock(WorkerRuntime* runtime,
                    const unpack::AtfpBlockView& view,
                    std::string* error) {
-    return runtime->writer.Write(view, error);
+    return runtime->writer.Enqueue(view, error);
+}
+
+bool ConfigureAsyncWriter(WorkerRuntime* runtime, std::string* error) {
+    const int writer_cpu = runtime->thread_cpus.empty()
+                               ? -1
+                               : runtime->thread_cpus.back();
+    return runtime->writer.Configure(
+        runtime->output_block_capacity, runtime->config.window_blocks,
+        writer_cpu, &runtime->sink,
+        [runtime](std::uint64_t lease, std::string* release_error) {
+            return runtime->engine.ReleasePublishedBlock(lease, release_error);
+        },
+        error);
 }
 
 bool ValidateRingCapacities(WorkerRuntime* runtime, ipcio_t* input_data,
@@ -259,7 +324,13 @@ bool WriteReadyFile(const std::string& path,
            << "  \"raw_block_bytes\": "
            << runtime.pipeline_layout.raw_block_bytes << ",\n"
            << "  \"compute_block_bytes\": "
-           << runtime.unpack_layout.compute_block_bytes << "\n"
+           << runtime.unpack_layout.compute_block_bytes << ",\n"
+           << "  \"thread_cpus\": [";
+    for (std::size_t index = 0; index < runtime.thread_cpus.size(); ++index) {
+        if (index != 0U) output << ", ";
+        output << runtime.thread_cpus[index];
+    }
+    output << "]\n"
            << "}\n";
     output.close();
     if (!output) {
@@ -342,8 +413,8 @@ int OpenTransfer(dada_client_t* client) {
             SetFailure(runtime, "cannot begin VDIF unpack transfer: " + error);
             return -1;
         }
-        if (runtime->transfers_started != 0U && !runtime->writer.Configure(
-                runtime->output_block_capacity, &runtime->sink, &error)) {
+        if (runtime->transfers_started != 0U &&
+            !ConfigureAsyncWriter(runtime, &error)) {
             SetFailure(runtime, "cannot configure compute block writer: " + error);
             return -1;
         }
@@ -417,7 +488,7 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                       std::string* emit_error) {
                 return EmitAtfpBlock(runtime, view, emit_error);
             };
-        if (!runtime->engine.ConsumeRawBlock(
+        if (!runtime->engine.ConsumeRawBlockAsync(
                 static_cast<const std::uint8_t*>(data), data_size,
                 runtime->raw_block_sequence++, emitter, &error)) {
             SetFailure(runtime, "raw block unpack failed: " + error);
@@ -430,6 +501,7 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
     } catch (...) {
         SetFailure(runtime, "unknown exception while unpacking block");
     }
+    runtime->writer.Abort();
     runtime->sink.Abort();
     return -1;
 }
@@ -446,7 +518,7 @@ int CloseTransferBody(dada_client_t* client) {
                       std::string* emit_error) {
                 return EmitAtfpBlock(runtime, view, emit_error);
             };
-        if (!runtime->engine.Finish(emitter, &error)) {
+        if (!runtime->engine.FinishAsync(emitter, &error)) {
             SetFailure(runtime, "cannot flush VDIF reorder window: " + error);
         } else if (!runtime->writer.Finish(&error)) {
             SetFailure(runtime, "cannot flush final compute block: " + error);
@@ -456,6 +528,8 @@ int CloseTransferBody(dada_client_t* client) {
     const unpack::VdifAtfpStatistics& statistics =
         runtime->engine.statistics();
     const unpack::AtfpBlockWriterStatistics& writer_statistics =
+        runtime->writer.writer_statistics();
+    const unpack::AsyncAtfpBlockWriterStatistics& async_statistics =
         runtime->writer.statistics();
     const double loss_percent =
         statistics.expected_station_packets == 0
@@ -475,7 +549,8 @@ int CloseTransferBody(dada_client_t* client) {
              "payload_copies=%llu/%llu "
              "emitted_blocks=%llu emitted_bytes=%llu "
              "writer_acquire=%llu commit=%llu blocks=%llu bytes=%llu "
-             "acquire_wait_ns=%llu\n",
+             "acquire_wait_ns=%llu writer_queue_hwm=%llu "
+             "writer_enqueue_wait_ns=%llu\n",
              static_cast<unsigned long long>(statistics.received_records),
              static_cast<unsigned long long>(statistics.accepted_packets),
              static_cast<unsigned long long>(
@@ -514,7 +589,11 @@ int CloseTransferBody(dada_client_t* client) {
              static_cast<unsigned long long>(writer_statistics.commit_calls),
              static_cast<unsigned long long>(writer_statistics.committed_blocks),
              static_cast<unsigned long long>(writer_statistics.committed_bytes),
-             static_cast<unsigned long long>(writer_statistics.acquire_wait_ns));
+             static_cast<unsigned long long>(writer_statistics.acquire_wait_ns),
+             static_cast<unsigned long long>(
+                 async_statistics.queue_high_watermark),
+             static_cast<unsigned long long>(
+                 async_statistics.enqueue_wait_ns));
 
     for (std::size_t antenna = 0;
          antenna < runtime->config.antenna_map.size(); ++antenna) {
@@ -571,6 +650,7 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
     } catch (...) {
         SetFailure(runtime, "unknown exception while closing transfer");
     }
+    runtime->writer.Abort();
     runtime->sink.Abort();
     EndOutputTransfer(runtime);
     return -1;
@@ -583,7 +663,8 @@ void PrintUsage(const char* program) {
               << " [--ready-file PATH]"
               << " [--diagnostics missing-per-second]"
               << " [--pre-timeline-policy discard]"
-              << " [--groups-per-second GROUPS]\n";
+              << " [--groups-per-second GROUPS]"
+              << " [--thread-cpus COORDINATOR,WORKER...,WRITER]\n";
 }
 
 }  // namespace
@@ -595,6 +676,7 @@ int main(int argc, char** argv) {
     bool collect_missing_per_second = false;
     bool discard_before_timeline_start = false;
     std::uint64_t groups_per_second = 0U;
+    std::vector<int> thread_cpus;
     for (int index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) {
             PrintUsage(argv[0]);
@@ -622,6 +704,8 @@ int main(int argc, char** argv) {
         } else if (option == "--groups-per-second" &&
                    groups_per_second == 0U &&
                    ParsePositiveUint64(value.c_str(), &groups_per_second)) {
+        } else if (option == "--thread-cpus" && thread_cpus.empty() &&
+                   ParseThreadCpus(value, &thread_cpus)) {
         } else {
             PrintUsage(argv[0]);
             return EXIT_FAILURE;
@@ -648,6 +732,7 @@ int main(int argc, char** argv) {
     runtime.collect_missing_per_second = collect_missing_per_second;
     runtime.discard_before_timeline_start = discard_before_timeline_start;
     runtime.groups_per_second = groups_per_second;
+    runtime.thread_cpus = thread_cpus;
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
@@ -687,6 +772,11 @@ int main(int argc, char** argv) {
                 &runtime, input_hdu->data_block, &error))
             SetFailure(&runtime, error);
         const std::uint64_t prepare_start = ClockNanoseconds(CLOCK_MONOTONIC_RAW);
+        if (!runtime.failed && !runtime.thread_cpus.empty() &&
+            (!BindCurrentThread(runtime.thread_cpus.front(), &error) ||
+             !runtime.engine.ConfigureThreadCpus(runtime.thread_cpus,
+                                                 &error)))
+            SetFailure(&runtime, error);
         if (!runtime.failed && !runtime.engine.Prepare(
                 runtime.config, runtime.pipeline_config,
                 runtime.unpack_layout, &error))
@@ -694,8 +784,7 @@ int main(int argc, char** argv) {
         if (!runtime.failed) {
             runtime.sink.Configure(runtime.output_hdu->data_block,
                                    runtime.output_block_capacity);
-            if (!runtime.writer.Configure(runtime.output_block_capacity,
-                                          &runtime.sink, &error))
+            if (!ConfigureAsyncWriter(&runtime, &error))
                 SetFailure(&runtime,
                            "cannot configure compute block writer: " + error);
         }
@@ -760,6 +849,7 @@ int main(int argc, char** argv) {
     }
 
     if (runtime.output_locked) EndOutputTransfer(&runtime);
+    runtime.writer.Abort();
     if (input_locked && dada_hdu_unlock_read(input_hdu) < 0) {
         result = EXIT_FAILURE;
     }

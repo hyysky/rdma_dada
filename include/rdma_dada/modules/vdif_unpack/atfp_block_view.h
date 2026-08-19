@@ -17,6 +17,9 @@ struct AtfpBlockView {
     std::uint64_t group_count;
     std::uint32_t nant;
     std::uint64_t packet_payload_bytes;
+    // Non-zero only for asynchronous publication. The consumer must release
+    // this lease after it has finished reading the circular window range.
+    std::uint64_t lease_id;
 };
 
 }  // namespace vdif_unpack

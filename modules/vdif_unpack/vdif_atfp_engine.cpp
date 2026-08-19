@@ -3,9 +3,18 @@
 #include "rdma_dada/modules/vdif_unpack/project_vdif_v1.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace rdma_dada {
 namespace modules {
@@ -37,12 +46,16 @@ struct VdifAtfpUnpackEngine::Impl {
         bool active;
     };
 
-    struct ParsedRecord {
-        const std::uint8_t* record;
-        std::uint64_t ordinal;
-        std::uint32_t antenna;
-        bool invalid_data;
+    enum DescriptorFlags {
+        kRecordPresent = 1U,
+        kHeaderValid = 2U,
+        kStationKnown = 4U,
+        kOrdinalValid = 8U,
+        kInvalidData = 16U,
+        kAccepted = 32U
     };
+
+    enum WorkerPhase { kWorkerIdle, kWorkerParse, kWorkerCopy, kWorkerStop };
 
     VdifUnpackConfig config;
     PipelineConfig pipeline;
@@ -56,7 +69,24 @@ struct VdifAtfpUnpackEngine::Impl {
     std::vector<std::int32_t> station_to_antenna;
     std::vector<std::uint8_t> station_has_ordinal;
     std::vector<std::uint64_t> block_station_counts;
-    std::vector<ParsedRecord> parsed_records;
+    std::vector<ParsedRecordDescriptor> parsed_records;
+    std::vector<int> thread_cpus;
+    std::vector<std::thread> workers;
+    std::size_t worker_count;
+    std::mutex worker_mutex;
+    std::condition_variable worker_start;
+    std::condition_variable worker_done;
+    WorkerPhase worker_phase;
+    std::uint64_t worker_generation;
+    std::size_t workers_completed;
+    std::size_t workers_ready;
+    bool worker_affinity_failed;
+    const std::uint8_t* worker_raw_data;
+    std::uint64_t worker_record_count;
+    std::mutex lease_mutex;
+    std::condition_variable lease_released;
+    std::vector<std::uint64_t> slot_leases;
+    std::uint64_t next_lease_id;
     std::uint64_t groups_per_compute_block;
     std::uint64_t reorder_horizon_groups;
     std::uint64_t next_emit_ordinal;
@@ -73,7 +103,194 @@ struct VdifAtfpUnpackEngine::Impl {
           reorder_horizon_groups(0), next_emit_ordinal(0),
           raw_block_bytes(0), last_raw_block_sequence(0),
           has_raw_block_sequence(false), prepared(false), configured(false),
-          finished(false), discard_before_timeline_start(false) {}
+          finished(false), discard_before_timeline_start(false),
+          worker_count(0U), worker_phase(kWorkerIdle), worker_generation(0U),
+          workers_completed(0U), workers_ready(0U),
+          worker_affinity_failed(false), worker_raw_data(NULL),
+          worker_record_count(0U), next_lease_id(1U) {}
+
+    ~Impl() { StopWorkers(); }
+
+    bool BindCurrentThread(int cpu) {
+#if defined(__linux__)
+        if (cpu >= 0) {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            CPU_SET(cpu, &mask);
+            return pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) ==
+                   0;
+        }
+#else
+        (void)cpu;
+#endif
+        return true;
+    }
+
+    void WorkerLoop(std::size_t worker_index, int cpu) {
+        const bool affinity_ok = BindCurrentThread(cpu);
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex);
+            if (!affinity_ok) worker_affinity_failed = true;
+            ++workers_ready;
+            worker_done.notify_one();
+        }
+        std::uint64_t observed_generation = 0U;
+        for (;;) {
+            WorkerPhase phase = kWorkerIdle;
+            const std::uint8_t* data = NULL;
+            std::uint64_t record_count = 0U;
+            {
+                std::unique_lock<std::mutex> lock(worker_mutex);
+                worker_start.wait(lock, [this, &observed_generation] {
+                    return worker_generation != observed_generation;
+                });
+                observed_generation = worker_generation;
+                phase = worker_phase;
+                data = worker_raw_data;
+                record_count = worker_record_count;
+            }
+            if (phase == kWorkerStop) break;
+            const std::uint64_t first =
+                record_count * worker_index / worker_count;
+            const std::uint64_t last =
+                record_count * (worker_index + 1U) / worker_count;
+            if (phase == kWorkerParse) ParseRange(data, first, last);
+            if (phase == kWorkerCopy) CopyRange(data, first, last);
+            {
+                std::lock_guard<std::mutex> lock(worker_mutex);
+                ++workers_completed;
+                if (workers_completed == worker_count)
+                    worker_done.notify_one();
+            }
+        }
+    }
+
+    bool StartWorkers(std::string* error) {
+        if (!workers.empty()) return true;
+        worker_count =
+            thread_cpus.size() >= 3U ? thread_cpus.size() - 2U : 1U;
+        workers.reserve(worker_count);
+        for (std::size_t index = 0; index < worker_count; ++index) {
+            const int cpu = thread_cpus.size() >= 3U
+                                ? thread_cpus[index + 1U]
+                                : -1;
+            workers.push_back(std::thread(&Impl::WorkerLoop, this, index, cpu));
+        }
+        std::unique_lock<std::mutex> lock(worker_mutex);
+        worker_done.wait(lock, [this] { return workers_ready == worker_count; });
+        if (worker_affinity_failed) {
+            lock.unlock();
+            StopWorkers();
+            return Fail("cannot bind ATFP parse/copy worker CPU", error);
+        }
+        return true;
+    }
+
+    void StopWorkers() {
+        if (workers.empty()) return;
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex);
+            worker_phase = kWorkerStop;
+            ++worker_generation;
+        }
+        worker_start.notify_all();
+        for (std::size_t index = 0; index < workers.size(); ++index)
+            if (workers[index].joinable()) workers[index].join();
+        workers.clear();
+    }
+
+    void RunWorkers(WorkerPhase phase, const std::uint8_t* data,
+                    std::uint64_t record_count) {
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex);
+            worker_phase = phase;
+            worker_raw_data = data;
+            worker_record_count = record_count;
+            workers_completed = 0U;
+            ++worker_generation;
+        }
+        worker_start.notify_all();
+        std::unique_lock<std::mutex> lock(worker_mutex);
+        worker_done.wait(lock, [this] {
+            return workers_completed == worker_count;
+        });
+    }
+
+    void WaitSlotWritable(std::uint64_t slot) {
+        std::unique_lock<std::mutex> lock(lease_mutex);
+        lease_released.wait(lock, [this, slot] {
+            return slot_leases[static_cast<std::size_t>(slot)] == 0U;
+        });
+    }
+
+    void WaitRangeWritable(std::uint64_t first, std::uint64_t count) {
+        for (std::uint64_t offset = 0; offset < count; ++offset)
+            WaitSlotWritable(SlotIndex(first + offset));
+    }
+
+    void ParseRange(const std::uint8_t* data, std::uint64_t first,
+                    std::uint64_t last) {
+        for (std::uint64_t index = first; index < last; ++index) {
+            ParsedRecordDescriptor descriptor = {};
+            descriptor.record_index = static_cast<std::uint32_t>(index);
+            descriptor.antenna = std::numeric_limits<std::uint16_t>::max();
+            descriptor.flags = kRecordPresent;
+            const std::uint8_t* record =
+                data + index * layout.raw_record_bytes;
+            ProjectVdifHeader header = {};
+            std::string ignored;
+            const bool decoded =
+                DecodeProjectVdifV1(record, 32U, &header, &ignored);
+            if (decoded && discard_before_timeline_start &&
+                header.reference_epoch == timeline.start_reference_epoch &&
+                (header.seconds_from_reference_epoch < timeline.start_seconds ||
+                 (header.seconds_from_reference_epoch == timeline.start_seconds &&
+                  header.frame_number_within_second < timeline.start_frame))) {
+                descriptor.flags = 0U;
+                parsed_records[static_cast<std::size_t>(index)] = descriptor;
+                continue;
+            }
+            if (!decoded || !ValidateProjectVdifV1(
+                    header, geometry, layout.raw_record_bytes, &ignored)) {
+                parsed_records[static_cast<std::size_t>(index)] = descriptor;
+                continue;
+            }
+            descriptor.flags |= kHeaderValid;
+            const std::int32_t antenna = station_to_antenna[header.station_id];
+            if (antenna < 0) {
+                parsed_records[static_cast<std::size_t>(index)] = descriptor;
+                continue;
+            }
+            descriptor.flags |= kStationKnown;
+            descriptor.antenna = static_cast<std::uint16_t>(antenna);
+            std::uint64_t ordinal = 0U;
+            if (!VdifTimeToOrdinal(timeline, header.reference_epoch,
+                                   header.seconds_from_reference_epoch,
+                                   header.frame_number_within_second,
+                                   &ordinal, &ignored)) {
+                parsed_records[static_cast<std::size_t>(index)] = descriptor;
+                continue;
+            }
+            descriptor.flags |= kOrdinalValid;
+            if (header.invalid_data) descriptor.flags |= kInvalidData;
+            descriptor.ordinal = ordinal;
+            parsed_records[static_cast<std::size_t>(index)] = descriptor;
+        }
+    }
+
+    void CopyRange(const std::uint8_t* data, std::uint64_t first,
+                   std::uint64_t last) {
+        for (std::uint64_t index = first; index < last; ++index) {
+            const ParsedRecordDescriptor& parsed =
+                parsed_records[static_cast<std::size_t>(index)];
+            if ((parsed.flags & kAccepted) == 0U) continue;
+            const std::uint8_t* record =
+                data + parsed.record_index * layout.raw_record_bytes;
+            std::memcpy(Payload(SlotIndex(parsed.ordinal), parsed.antenna),
+                        record + pipeline.packet_header_bytes,
+                        static_cast<std::size_t>(pipeline.packet_payload_bytes));
+        }
+    }
 
     std::uint64_t SlotIndex(std::uint64_t ordinal) const {
         return ordinal % layout.window_capacity_groups;
@@ -191,7 +408,15 @@ struct VdifAtfpUnpackEngine::Impl {
             count > timeline.expected_groups - next_emit_ordinal) {
             return Fail("invalid ATFP publication range", error);
         }
+        WaitRangeWritable(next_emit_ordinal, count);
         PrepareMissing(next_emit_ordinal, count);
+        const std::uint64_t lease_id = next_lease_id++;
+        {
+            std::lock_guard<std::mutex> lock(lease_mutex);
+            for (std::uint64_t offset = 0; offset < count; ++offset)
+                slot_leases[static_cast<std::size_t>(
+                    SlotIndex(next_emit_ordinal + offset))] = lease_id;
+        }
         AtfpBlockView view = {};
         view.window_data = payload_window.data();
         view.window_capacity_groups = layout.window_capacity_groups;
@@ -200,7 +425,12 @@ struct VdifAtfpUnpackEngine::Impl {
         view.group_count = count;
         view.nant = pipeline.nant;
         view.packet_payload_bytes = pipeline.packet_payload_bytes;
-        if (!emit(view, error)) return false;
+        view.lease_id = lease_id;
+        if (!emit(view, error)) {
+            std::string ignored;
+            ReleaseLease(lease_id, &ignored);
+            return false;
+        }
 
         if (!CountPublishedGroups(next_emit_ordinal, count, error)) return false;
         std::uint64_t emitted_bytes = 0;
@@ -217,6 +447,23 @@ struct VdifAtfpUnpackEngine::Impl {
             }
         }
         next_emit_ordinal += count;
+        return true;
+    }
+
+    bool ReleaseLease(std::uint64_t lease_id, std::string* error) {
+        if (lease_id == 0U) return Fail("ATFP lease id must be non-zero", error);
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(lease_mutex);
+            for (std::size_t index = 0; index < slot_leases.size(); ++index) {
+                if (slot_leases[index] == lease_id) {
+                    slot_leases[index] = 0U;
+                    found = true;
+                }
+            }
+        }
+        if (!found) return Fail("ATFP lease is unknown or already released", error);
+        lease_released.notify_all();
         return true;
     }
 
@@ -257,6 +504,21 @@ struct VdifAtfpUnpackEngine::Impl {
 
 VdifAtfpUnpackEngine::VdifAtfpUnpackEngine() : impl_(new Impl) {}
 VdifAtfpUnpackEngine::~VdifAtfpUnpackEngine() {}
+
+bool VdifAtfpUnpackEngine::ConfigureThreadCpus(
+    const std::vector<int>& cpus, std::string* error) {
+    if (impl_->prepared)
+        return Fail("thread CPUs must be configured before Prepare", error);
+    if (cpus.size() < 3U)
+        return Fail("thread CPUs require coordinator, worker and writer", error);
+    std::set<int> unique;
+    for (std::size_t index = 0; index < cpus.size(); ++index) {
+        if (cpus[index] < 0 || !unique.insert(cpus[index]).second)
+            return Fail("thread CPUs must be distinct nonnegative values", error);
+    }
+    impl_->thread_cpus = cpus;
+    return true;
+}
 
 bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
                                    const PipelineConfig& pipeline,
@@ -335,6 +597,9 @@ bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
     next->block_station_counts.assign(pipeline.nant, 0U);
     next->parsed_records.resize(
         static_cast<std::size_t>(layout.records_per_raw_block));
+    next->thread_cpus = impl_->thread_cpus;
+    next->slot_leases.assign(
+        static_cast<std::size_t>(layout.window_capacity_groups), 0U);
     next->statistics.station_observed_packets.assign(pipeline.nant, 0U);
     next->statistics.station_accepted_packets.assign(pipeline.nant, 0U);
     next->statistics.station_late_packets.assign(pipeline.nant, 0U);
@@ -352,8 +617,8 @@ bool VdifAtfpUnpackEngine::Prepare(const VdifUnpackConfig& config,
     std::fill(next->station_seen.begin(), next->station_seen.end(), 0U);
     std::fill(next->slots.begin(), next->slots.end(), Impl::GroupSlot());
     std::fill(next->parsed_records.begin(), next->parsed_records.end(),
-              Impl::ParsedRecord());
-    next->parsed_records.clear();
+              ParsedRecordDescriptor());
+    if (!next->StartWorkers(error)) return false;
     next->prepared = true;
     impl_.swap(next);
     return true;
@@ -415,7 +680,16 @@ bool VdifAtfpUnpackEngine::BeginTransfer(
     std::fill(impl_->slots.begin(), impl_->slots.end(), Impl::GroupSlot());
     std::fill(impl_->station_has_ordinal.begin(),
               impl_->station_has_ordinal.end(), 0U);
-    impl_->parsed_records.clear();
+    std::fill(impl_->parsed_records.begin(), impl_->parsed_records.end(),
+              ParsedRecordDescriptor());
+    {
+        std::lock_guard<std::mutex> lock(impl_->lease_mutex);
+        if (std::find_if(impl_->slot_leases.begin(), impl_->slot_leases.end(),
+                         [](std::uint64_t value) { return value != 0U; }) !=
+            impl_->slot_leases.end()) {
+            return Fail("previous ATFP writer leases are still active", error);
+        }
+    }
     impl_->next_emit_ordinal = 0U;
     impl_->last_raw_block_sequence = 0U;
     impl_->has_raw_block_sequence = false;
@@ -438,6 +712,19 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
     const std::uint8_t* data, std::uint64_t size,
     std::uint64_t raw_block_sequence, const VdifAtfpBlockEmitter& emit,
     std::string* error) {
+    const VdifAtfpBlockEmitter synchronous =
+        [this, &emit](const AtfpBlockView& view, std::string* emit_error) {
+            if (!emit(view, emit_error)) return false;
+            return ReleasePublishedBlock(view.lease_id, emit_error);
+        };
+    return ConsumeRawBlockAsync(data, size, raw_block_sequence, synchronous,
+                                error);
+}
+
+bool VdifAtfpUnpackEngine::ConsumeRawBlockAsync(
+    const std::uint8_t* data, std::uint64_t size,
+    std::uint64_t raw_block_sequence, const VdifAtfpBlockEmitter& emit,
+    std::string* error) {
     if (!impl_->configured || impl_->finished)
         return Fail("ATFP engine is not configured for an active transfer",
                     error);
@@ -454,73 +741,55 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
     impl_->has_raw_block_sequence = true;
     impl_->last_raw_block_sequence = raw_block_sequence;
 
+    const std::uint64_t record_count =
+        size / impl_->layout.raw_record_bytes;
+    if (record_count > impl_->parsed_records.size())
+        return Fail("raw block record count exceeds prepared descriptors", error);
+    impl_->RunWorkers(Impl::kWorkerParse, data, record_count);
+
     std::fill(impl_->block_station_counts.begin(),
               impl_->block_station_counts.end(), 0U);
-    impl_->parsed_records.clear();
     std::uint64_t distinct_stations = 0U;
     std::int32_t last_antenna = -1;
     std::uint64_t consecutive_station_records = 0U;
     std::uint64_t max_consecutive_station_records = 0U;
 
-    for (std::uint64_t offset = 0; offset < size;
-         offset += impl_->layout.raw_record_bytes) {
-        const std::uint8_t* record = data + offset;
-        ProjectVdifHeader header = {};
-        std::string ignored;
-        const bool decoded =
-            DecodeProjectVdifV1(record, 32U, &header, &ignored);
-        if (decoded && impl_->discard_before_timeline_start &&
-            header.reference_epoch == impl_->timeline.start_reference_epoch &&
-            (header.seconds_from_reference_epoch < impl_->timeline.start_seconds ||
-             (header.seconds_from_reference_epoch == impl_->timeline.start_seconds &&
-              header.frame_number_within_second < impl_->timeline.start_frame))) {
-            continue;
-        }
+    for (std::uint64_t index = 0; index < record_count; ++index) {
+        ParsedRecordDescriptor& parsed =
+            impl_->parsed_records[static_cast<std::size_t>(index)];
+        if ((parsed.flags & Impl::kRecordPresent) == 0U) continue;
         ++impl_->statistics.received_records;
-        if (!decoded || !ValidateProjectVdifV1(
-                header, impl_->geometry, impl_->layout.raw_record_bytes,
-                &ignored)) {
+        if ((parsed.flags & Impl::kHeaderValid) == 0U) {
             ++impl_->statistics.invalid_header_packets;
             continue;
         }
-
-        const std::int32_t antenna = impl_->station_to_antenna[header.station_id];
-        if (antenna < 0) {
+        if ((parsed.flags & Impl::kStationKnown) == 0U) {
             ++impl_->statistics.unknown_station_packets;
             continue;
         }
-        std::uint64_t ordinal = 0;
-        if (!VdifTimeToOrdinal(impl_->timeline, header.reference_epoch,
-                               header.seconds_from_reference_epoch,
-                               header.frame_number_within_second, &ordinal,
-                               &ignored)) {
+        if ((parsed.flags & Impl::kOrdinalValid) == 0U) {
             ++impl_->statistics.out_of_range_packets;
             continue;
         }
-        const std::uint32_t antenna_index =
-            static_cast<std::uint32_t>(antenna);
+        const std::uint32_t antenna_index = parsed.antenna;
         ++impl_->statistics.station_observed_packets[antenna_index];
         if (impl_->block_station_counts[antenna_index]++ == 0U)
             ++distinct_stations;
-        if (last_antenna == antenna) {
+        if (last_antenna == static_cast<std::int32_t>(antenna_index)) {
             ++consecutive_station_records;
         } else {
-            last_antenna = antenna;
+            last_antenna = static_cast<std::int32_t>(antenna_index);
             consecutive_station_records = 1U;
         }
         max_consecutive_station_records = std::max(
             max_consecutive_station_records, consecutive_station_records);
         if (impl_->station_has_ordinal[antenna_index] == 0U ||
-            ordinal > impl_->statistics.station_highest_ordinals[antenna_index]) {
+            parsed.ordinal >
+                impl_->statistics.station_highest_ordinals[antenna_index]) {
             impl_->station_has_ordinal[antenna_index] = 1U;
-            impl_->statistics.station_highest_ordinals[antenna_index] = ordinal;
+            impl_->statistics.station_highest_ordinals[antenna_index] =
+                parsed.ordinal;
         }
-        Impl::ParsedRecord parsed = {};
-        parsed.record = record;
-        parsed.ordinal = ordinal;
-        parsed.antenna = antenna_index;
-        parsed.invalid_data = header.invalid_data;
-        impl_->parsed_records.push_back(parsed);
     }
     if (distinct_stations == 1U) {
         ++impl_->statistics.single_station_raw_blocks;
@@ -549,20 +818,28 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
             *bounds.second - *bounds.first);
     }
 
-    for (std::size_t index = 0; index < impl_->parsed_records.size(); ++index) {
-        const Impl::ParsedRecord& parsed = impl_->parsed_records[index];
+    for (std::uint64_t index = 0; index < record_count; ++index) {
+        ParsedRecordDescriptor& parsed =
+            impl_->parsed_records[static_cast<std::size_t>(index)];
+        if ((parsed.flags & (Impl::kHeaderValid | Impl::kStationKnown |
+                             Impl::kOrdinalValid)) !=
+            (Impl::kHeaderValid | Impl::kStationKnown |
+             Impl::kOrdinalValid)) {
+            continue;
+        }
         if (parsed.ordinal < impl_->next_emit_ordinal) {
             ++impl_->statistics.late_packets;
             ++impl_->statistics.station_late_packets[parsed.antenna];
             continue;
         }
         if (!impl_->EnsureFits(parsed.ordinal, emit, error)) return false;
-        if (parsed.invalid_data) {
+        if ((parsed.flags & Impl::kInvalidData) != 0U) {
             ++impl_->statistics.invalid_data_packets;
             continue;
         }
 
         const std::uint64_t slot_index = impl_->SlotIndex(parsed.ordinal);
+        impl_->WaitSlotWritable(slot_index);
         Impl::GroupSlot& slot =
             impl_->slots[static_cast<std::size_t>(slot_index)];
         if (slot.active && slot.owned_ordinal != parsed.ordinal) {
@@ -581,10 +858,7 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
             ++impl_->statistics.duplicate_packets;
             continue;
         }
-        std::memcpy(
-            impl_->Payload(slot_index, parsed.antenna),
-            parsed.record + impl_->pipeline.packet_header_bytes,
-            static_cast<std::size_t>(impl_->pipeline.packet_payload_bytes));
+        parsed.flags |= Impl::kAccepted;
         *impl_->Seen(slot_index, parsed.antenna) = 1U;
         ++slot.seen_count;
         ++impl_->statistics.accepted_packets;
@@ -593,11 +867,22 @@ bool VdifAtfpUnpackEngine::ConsumeRawBlock(
         impl_->statistics.payload_copy_bytes +=
             impl_->pipeline.packet_payload_bytes;
     }
+    impl_->RunWorkers(Impl::kWorkerCopy, data, record_count);
     return impl_->EmitReadyFullBlocks(emit, error);
 }
 
 bool VdifAtfpUnpackEngine::Finish(const VdifAtfpBlockEmitter& emit,
                                   std::string* error) {
+    const VdifAtfpBlockEmitter synchronous =
+        [this, &emit](const AtfpBlockView& view, std::string* emit_error) {
+            if (!emit(view, emit_error)) return false;
+            return ReleasePublishedBlock(view.lease_id, emit_error);
+        };
+    return FinishAsync(synchronous, error);
+}
+
+bool VdifAtfpUnpackEngine::FinishAsync(const VdifAtfpBlockEmitter& emit,
+                                       std::string* error) {
     if (!impl_->configured || impl_->finished)
         return Fail("ATFP engine is not configured for an active transfer",
                     error);
@@ -611,6 +896,11 @@ bool VdifAtfpUnpackEngine::Finish(const VdifAtfpBlockEmitter& emit,
     }
     impl_->finished = true;
     return true;
+}
+
+bool VdifAtfpUnpackEngine::ReleasePublishedBlock(
+    std::uint64_t lease_id, std::string* error) {
+    return impl_->ReleaseLease(lease_id, error);
 }
 
 const VdifAtfpStatistics& VdifAtfpUnpackEngine::statistics() const {

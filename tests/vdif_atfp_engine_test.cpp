@@ -16,6 +16,9 @@ namespace {
 namespace unpack = rdma_dada::modules::vdif_unpack;
 int failures = 0;
 
+static_assert(sizeof(unpack::ParsedRecordDescriptor) == 16,
+              "parallel unpack descriptor must remain 16 bytes");
+
 void Expect(bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -263,6 +266,9 @@ void TestArbitraryArrivalProducesAtfpBlock() {
     unpack::VdifAtfpUnpackEngine engine;
     unpack::VdifUnpackEngine legacy;
     std::string error;
+    Expect(engine.ConfigureThreadCpus(std::vector<int>{0, 1, 2, 3, 4},
+                                      &error),
+           "parallel thread map configures: " + error);
     Expect(engine.Configure(MakeConfig(), MakePipeline(), MakeLayout(),
                             MakeTimeline(2), &error),
            "ATFP engine configures: " + error);
@@ -707,6 +713,18 @@ void TestExpectedTransferOverflowIsRejected() {
 }  // namespace
 
 int main() {
+    {
+        unpack::VdifAtfpUnpackEngine engine;
+        std::string error;
+        Expect(!engine.ConfigureThreadCpus(std::vector<int>{14, 15}, &error),
+               "thread map requires coordinator, worker and writer");
+        Expect(!engine.ConfigureThreadCpus(std::vector<int>{14, 15, 15},
+                                           &error),
+               "thread map rejects duplicate cores");
+        Expect(engine.ConfigureThreadCpus(std::vector<int>{14, 15, 16},
+                                          &error),
+               "thread map accepts one worker between coordinator and writer");
+    }
     TestArbitraryArrivalProducesAtfpBlock();
     TestWatermarkZeroFillAndSlotReuse();
     TestStationSkewAndRawBlockCompositionStatistics();

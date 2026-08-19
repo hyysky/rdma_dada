@@ -47,6 +47,16 @@ struct VdifAtfpStatistics {
     std::vector<std::uint64_t> missing_station_packets_per_second;
 };
 
+// One cache-friendly parse result. The raw-record address is reconstructed
+// from record_index so descriptors never own pointers or heap storage.
+struct ParsedRecordDescriptor {
+    std::uint64_t ordinal;
+    std::uint32_t record_index;
+    std::uint16_t antenna;
+    std::uint8_t flags;
+    std::uint8_t reserved;
+};
+
 typedef std::function<bool(const AtfpBlockView&, std::string*)>
     VdifAtfpBlockEmitter;
 
@@ -59,6 +69,9 @@ public:
                  const PipelineConfig& pipeline,
                  const VdifUnpackLayout& layout,
                  std::string* error);
+    // Ordered CPUs: coordinator, one or more parse/copy workers, writer.
+    bool ConfigureThreadCpus(const std::vector<int>& cpus,
+                             std::string* error);
     bool BeginTransfer(const VdifTimeline& timeline, std::string* error);
     bool BeginTransfer(const VdifTimeline& timeline,
                        bool collect_missing_per_second,
@@ -77,7 +90,14 @@ public:
                          std::uint64_t raw_block_sequence,
                          const VdifAtfpBlockEmitter& emit,
                          std::string* error);
+    bool ConsumeRawBlockAsync(const std::uint8_t* data,
+                              std::uint64_t size,
+                              std::uint64_t raw_block_sequence,
+                              const VdifAtfpBlockEmitter& emit,
+                              std::string* error);
     bool Finish(const VdifAtfpBlockEmitter& emit, std::string* error);
+    bool FinishAsync(const VdifAtfpBlockEmitter& emit, std::string* error);
+    bool ReleasePublishedBlock(std::uint64_t lease_id, std::string* error);
     const VdifAtfpStatistics& statistics() const;
     bool prepared() const;
     std::uint64_t prepared_window_bytes() const;
