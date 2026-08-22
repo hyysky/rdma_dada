@@ -77,3 +77,13 @@ venv/
 # Local academic manuscript workspace and its planning artifacts
 /paper/
 /.superpowers/sdd/
+
+# Repository-local test/render scratch (not the system /tmp directory)
+/tmp/
+
+# Locally installed agent/skill bundles
+/AGENTS.md
+/.agents/
+/.claude/
+/agent/
+/skills-lock.json
