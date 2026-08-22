@@ -84,6 +84,7 @@ target_link_libraries(rdma_module_vdif_unpack PUBLIC
     Threads::Threads)
 
 add_library(rdma_observation_compiler STATIC
+    src/config/gpu_pipeline_budget.cpp
     src/config/observation_artifacts.cpp)
 target_include_directories(rdma_observation_compiler
     PUBLIC
@@ -472,7 +473,8 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/observation_config_compile_test.py
                     $<TARGET_FILE:observation_config_compile>
-                    ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/observation.example.json
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/testing/atfp-throughput-observation.json)
         add_test(
             NAME fpga_sender_sim_loopback_test
             COMMAND ${Python3_EXECUTABLE}

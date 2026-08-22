@@ -7,6 +7,13 @@
 
 namespace rdma_dada {
 
+struct ObservationArtifactOptions {
+    ObservationArtifactOptions()
+        : budget_target_payload_bits_per_second(0U) {}
+
+    std::uint64_t budget_target_payload_bits_per_second;
+};
+
 struct ObservationArtifacts {
     ResolvedObservationPlan plan;
     pipeline::Metadata raw_header;
@@ -23,8 +30,20 @@ bool BuildObservationArtifacts(const std::string& observation_path,
                                ObservationArtifacts* artifacts,
                                std::string* error);
 
+bool BuildObservationArtifactsWithOptions(
+    const std::string& observation_path,
+    const ObservationArtifactOptions& options,
+    ObservationArtifacts* artifacts,
+    std::string* error);
+
 bool BuildObservationArtifactsFromResolvedPlan(
     const ResolvedObservationPlan& plan,
+    ObservationArtifacts* artifacts,
+    std::string* error);
+
+bool BuildObservationArtifactsFromResolvedPlanWithOptions(
+    const ResolvedObservationPlan& plan,
+    const ObservationArtifactOptions& options,
     ObservationArtifacts* artifacts,
     std::string* error);
 

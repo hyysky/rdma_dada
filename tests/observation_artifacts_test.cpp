@@ -1,5 +1,6 @@
 #include "rdma_dada/config/observation_artifacts.h"
 #include "rdma_dada/config/observation_config.h"
+#include "rdma_dada/config/gpu_pipeline_budget.h"
 #include "rdma_dada/config/packet_format_config.h"
 #include "rdma_dada/config/resolved_plan_json.h"
 
@@ -167,6 +168,9 @@ int main(int argc, char** argv) {
     Expect(artifacts.validation_report_json.find("\"valid\":true") !=
                std::string::npos,
            "validation report records success");
+    Expect(artifacts.validation_report_json.find(
+               "\"gpu_pipeline_budget\":{") == std::string::npos,
+           "observation without GPU modules omits the GPU budget");
     Expect(artifacts.validation_report_json.find("\"formulas\":") !=
                std::string::npos,
            "validation report records formulas");
@@ -241,6 +245,171 @@ int main(int argc, char** argv) {
                "\"BEAMFORMED\",\"POWER_INTEGRATED\"]") !=
                std::string::npos,
            "processing validation report lists every generated stage");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"gpu_pipeline_budget\":{") != std::string::npos,
+           "processing validation report contains GPU pipeline budget");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"block_interval_ns\":524288000") != std::string::npos,
+           "GPU budget derives the compute block arrival interval");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"service_deadline_ns\":419430400") != std::string::npos,
+           "GPU budget reserves twenty percent of the block deadline");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"device_input_bytes\":8388608") != std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"device_converted_bytes\":33554432") !=
+                   std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"device_scratch_bytes\":75497472") !=
+                   std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"device_output_bytes\":196608") !=
+                   std::string::npos,
+           "GPU budget matches pipeline_worker device allocations");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"device_weight_bytes\":192") != std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"planned_device_bytes\":117637312") !=
+                   std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"recommended_free_device_bytes\":141164775") !=
+                   std::string::npos,
+           "GPU budget includes converted resident weights and memory reserve");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"required_h2d_bytes_per_second\":20000000") !=
+               std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"required_d2h_bytes_per_second\":468750") !=
+                   std::string::npos,
+           "GPU budget converts block transfers into reserved service rates");
+    Expect(processing_artifacts.validation_report_json.find(
+               "\"host_device_transfer_bytes_per_block\":8585216") !=
+               std::string::npos &&
+               processing_artifacts.validation_report_json.find(
+                   "\"required_combined_host_device_bytes_per_second\":"
+                   "20468750") != std::string::npos,
+           "GPU budget reports total sequential H2D and D2H volume");
+
+    rdma_dada::ObservationArtifactOptions performance_options;
+    performance_options.budget_target_payload_bits_per_second =
+        UINT64_C(30000000000);
+    rdma_dada::ObservationArtifacts performance_artifacts;
+    error.clear();
+    Expect(rdma_dada::BuildObservationArtifactsFromResolvedPlanWithOptions(
+               processing_plan, performance_options, &performance_artifacts,
+               &error),
+           "build 30 Gbps performance budget: " + error);
+    Expect(performance_artifacts.validation_report_json.find(
+               "\"observation_payload_bits_per_second\":128000000") !=
+               std::string::npos &&
+               performance_artifacts.validation_report_json.find(
+                   "\"budget_target_payload_bits_per_second\":30000000000") !=
+                   std::string::npos &&
+               performance_artifacts.validation_report_json.find(
+                   "\"rate_source\":\"PERFORMANCE_OVERRIDE\"") !=
+                   std::string::npos,
+           "performance budget preserves observation and override rates");
+    Expect(performance_artifacts.validation_report_json.find(
+               "\"block_interval_ns\":2236962") != std::string::npos &&
+               performance_artifacts.validation_report_json.find(
+                   "\"service_deadline_ns\":1789569") !=
+                   std::string::npos &&
+               performance_artifacts.validation_report_json.find(
+                   "\"required_h2d_bytes_per_second\":4687501852") !=
+                   std::string::npos,
+           "30 Gbps budget applies the twenty-percent service reserve");
+
+    rdma_dada::ObservationConfig beam_source = processing_source;
+    beam_source.modules.resize(1U);
+    rdma_dada::ResolvedObservationPlan beam_plan;
+    error.clear();
+    Expect(rdma_dada::ResolveObservationPlan(
+               beam_source, artifacts.plan.wire, &beam_plan, &error) &&
+               rdma_dada::ComputeObservationIdentities(&beam_plan, &error),
+           "resolve beam-only GPU budget geometry: " + error);
+    rdma_dada::ObservationArtifacts beam_artifacts;
+    error.clear();
+    Expect(rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+               beam_plan, &beam_artifacts, &error),
+           "build beam-only GPU budget: " + error);
+    Expect(beam_artifacts.validation_report_json.find(
+               "\"device_scratch_bytes\":0") != std::string::npos &&
+               beam_artifacts.validation_report_json.find(
+                   "\"planned_device_bytes\":92274880") !=
+                   std::string::npos &&
+               beam_artifacts.validation_report_json.find(
+                   "\"recommended_free_device_bytes\":110729856") !=
+                   std::string::npos &&
+               beam_artifacts.validation_report_json.find(
+                   "\"required_d2h_bytes_per_second\":120000000") !=
+                   std::string::npos,
+           "beam-only budget matches its output allocation and rate");
+
+    rdma_dada::ObservationConfig power_source = processing_source;
+    power_source.modules.resize(2U);
+    rdma_dada::ResolvedObservationPlan power_plan;
+    error.clear();
+    Expect(rdma_dada::ResolveObservationPlan(
+               power_source, artifacts.plan.wire, &power_plan, &error) &&
+               rdma_dada::ComputeObservationIdentities(&power_plan, &error),
+           "resolve power GPU budget geometry: " + error);
+    rdma_dada::ObservationArtifacts power_artifacts;
+    error.clear();
+    Expect(rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+               power_plan, &power_artifacts, &error),
+           "build power GPU budget: " + error);
+    Expect(power_artifacts.validation_report_json.find(
+               "\"device_scratch_bytes\":50331648") != std::string::npos &&
+               power_artifacts.validation_report_json.find(
+                   "\"planned_device_bytes\":117440704") !=
+                   std::string::npos &&
+               power_artifacts.validation_report_json.find(
+                   "\"recommended_free_device_bytes\":140928845") !=
+                   std::string::npos &&
+               power_artifacts.validation_report_json.find(
+                   "\"required_d2h_bytes_per_second\":60000000") !=
+                   std::string::npos,
+           "power budget includes beam scratch and F32 output");
+
+    rdma_dada::ObservationConfig stokes_source = power_source;
+    stokes_source.modules[1].kind = rdma_dada::ObservationModuleKind::kStokes;
+    rdma_dada::ResolvedObservationPlan stokes_plan;
+    error.clear();
+    Expect(rdma_dada::ResolveObservationPlan(
+               stokes_source, artifacts.plan.wire, &stokes_plan, &error) &&
+               rdma_dada::ComputeObservationIdentities(&stokes_plan, &error),
+           "resolve Stokes GPU budget geometry: " + error);
+    rdma_dada::GpuPipelineBudget stokes_budget =
+        rdma_dada::GpuPipelineBudget();
+    error.clear();
+    Expect(rdma_dada::ComputeGpuPipelineBudget(
+               stokes_plan, &stokes_budget, &error),
+           "compute Stokes GPU budget: " + error);
+    Expect(stokes_budget.device_scratch_bytes == 50331648U &&
+               stokes_budget.device_output_bytes == 50331648U &&
+               stokes_budget.device_weight_bytes == 192U &&
+               stokes_budget.planned_device_bytes == 142606528U &&
+               stokes_budget.recommended_free_device_bytes == 171127834U &&
+               stokes_budget.required_d2h_bytes_per_second == 120000000U,
+           "Stokes budget includes TFBS output and twenty-percent reserve");
+
+    rdma_dada::GpuPipelineBudget invalid_budget =
+        rdma_dada::GpuPipelineBudget();
+    error.clear();
+    Expect(!rdma_dada::ComputeGpuPipelineBudget(
+               artifacts.plan, &invalid_budget, &error) &&
+               error.find("requires a processing module chain") !=
+                   std::string::npos,
+           "GPU budget rejects a plan without processing modules");
+    rdma_dada::ResolvedObservationPlan overflow_plan = beam_plan;
+    overflow_plan.compute_block_bytes = UINT64_MAX;
+    overflow_plan.payload_bytes_per_second = 1U;
+    error.clear();
+    Expect(!rdma_dada::ComputeGpuPipelineBudget(
+               overflow_plan, &invalid_budget, &error) &&
+               error.find("exceeds uint64 range") != std::string::npos,
+           "GPU budget rejects arithmetic overflow");
+
 
     std::ostringstream processing_directory;
     processing_directory << "/tmp/rdma_dada_processing_artifacts_" << getpid();

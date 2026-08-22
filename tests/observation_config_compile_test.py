@@ -14,10 +14,13 @@ def run(argv):
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: observation_config_compile_test.py BINARY CONFIG")
+    if len(sys.argv) != 4:
+        raise SystemExit(
+            "usage: observation_config_compile_test.py BINARY CONFIG GPU_CONFIG"
+        )
     binary = pathlib.Path(sys.argv[1]).resolve()
     config = pathlib.Path(sys.argv[2]).resolve()
+    gpu_config = pathlib.Path(sys.argv[3]).resolve()
     root = pathlib.Path(tempfile.mkdtemp(prefix="rdma_dada_compile_"))
     try:
         preflight = run([str(binary), "--config", str(config),
@@ -26,6 +29,30 @@ def main():
         report = json.loads(preflight.stdout)
         assert report["valid"] is True
         assert not list(root.iterdir())
+
+        budget_override = run([
+            str(binary), "--config", str(gpu_config),
+            "--budget-payload-gbps", "30", "--preflight-only",
+        ])
+        assert budget_override.returncode == 0, budget_override.stderr
+        override_report = json.loads(budget_override.stdout)
+        assert override_report["valid"] is True
+        override_budget = override_report["gpu_pipeline_budget"]
+        assert override_budget["budget_target_payload_bits_per_second"] == 30_000_000_000
+        assert override_budget["rate_source"] == "PERFORMANCE_OVERRIDE"
+        assert override_budget["deadline_reserve_percent"] == 20
+        assert override_budget["required_rates_bytes_per_second"][
+            "host_device_transfer_bytes_per_block"
+        ] > 0
+
+        fractional_budget = run([
+            str(binary), "--config", str(gpu_config),
+            "--budget-payload-gbps", "0.1", "--preflight-only",
+        ])
+        assert fractional_budget.returncode == 0, fractional_budget.stderr
+        assert json.loads(fractional_budget.stdout)["gpu_pipeline_budget"][
+            "budget_target_payload_bits_per_second"
+        ] == 100_000_000
 
         output = root / "artifacts"
         written = run([str(binary), "--config", str(config),
@@ -53,6 +80,12 @@ def main():
         rejected = run([str(binary), "--config", str(invalid),
                         "--preflight-only"])
         assert rejected.returncode != 0
+
+        invalid_budget = run([
+            str(binary), "--config", str(config),
+            "--budget-payload-gbps", "0", "--preflight-only",
+        ])
+        assert invalid_budget.returncode != 0
 
         assert not list(root.glob(".artifacts.staging-*"))
     finally:

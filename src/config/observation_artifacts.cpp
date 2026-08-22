@@ -1,5 +1,6 @@
 #include "rdma_dada/config/observation_artifacts.h"
 
+#include "rdma_dada/config/gpu_pipeline_budget.h"
 #include "rdma_dada/config/observation_config.h"
 #include "rdma_dada/config/packet_format_config.h"
 #include "rdma_dada/config/pipeline_config.h"
@@ -310,7 +311,8 @@ std::string RingPlanJson(const ResolvedObservationPlan& plan) {
     return output.str();
 }
 
-std::string ValidationReportJson(const ResolvedObservationPlan& plan) {
+std::string ValidationReportJson(const ResolvedObservationPlan& plan,
+                                 const GpuPipelineBudget* gpu_budget) {
     std::ostringstream stage_headers;
     stage_headers << "[\"RAW\",\"UNPACKED\"";
     if (!plan.source.modules.empty()) {
@@ -336,6 +338,10 @@ std::string ValidationReportJson(const ResolvedObservationPlan& plan) {
            << "\"raw_record_bytes\":" << plan.raw_record_bytes << ','
            << "\"window_payload_bytes\":" << plan.window_payload_bytes
            << "},"
+           << (gpu_budget ?
+                   "\"gpu_pipeline_budget\":" +
+                       SerializeGpuPipelineBudget(*gpu_budget) + "," :
+                   std::string())
            << "\"geometry_id\":" << Quote(plan.geometry_id) << ','
            << "\"formulas\":{"
            << "\"compute_block_bytes\":"
@@ -463,6 +469,15 @@ bool PublishDirectoryNoReplace(const std::string& staging,
 bool BuildObservationArtifacts(const std::string& observation_path,
                                ObservationArtifacts* artifacts,
                                std::string* error) {
+    return BuildObservationArtifactsWithOptions(
+        observation_path, ObservationArtifactOptions(), artifacts, error);
+}
+
+bool BuildObservationArtifactsWithOptions(
+    const std::string& observation_path,
+    const ObservationArtifactOptions& options,
+    ObservationArtifacts* artifacts,
+    std::string* error) {
     if (!artifacts) return Fail("artifact output pointer is null", error);
     ObservationConfig observation;
     if (!LoadObservationConfig(observation_path, &observation, error)) {
@@ -477,11 +492,21 @@ bool BuildObservationArtifacts(const std::string& observation_path,
         !ComputeObservationIdentities(&plan, error)) {
         return false;
     }
-    return BuildObservationArtifactsFromResolvedPlan(plan, artifacts, error);
+    return BuildObservationArtifactsFromResolvedPlanWithOptions(
+        plan, options, artifacts, error);
 }
 
 bool BuildObservationArtifactsFromResolvedPlan(
     const ResolvedObservationPlan& plan,
+    ObservationArtifacts* artifacts,
+    std::string* error) {
+    return BuildObservationArtifactsFromResolvedPlanWithOptions(
+        plan, ObservationArtifactOptions(), artifacts, error);
+}
+
+bool BuildObservationArtifactsFromResolvedPlanWithOptions(
+    const ResolvedObservationPlan& plan,
+    const ObservationArtifactOptions& options,
     ObservationArtifacts* artifacts,
     std::string* error) {
     if (!artifacts) return Fail("artifact output pointer is null", error);
@@ -525,8 +550,21 @@ bool BuildObservationArtifactsFromResolvedPlan(
                                           error)) {
         return false;
     }
+    GpuPipelineBudget gpu_budget = GpuPipelineBudget();
+    const GpuPipelineBudget* gpu_budget_pointer = NULL;
+    if (!plan.source.modules.empty()) {
+        const bool budget_ready =
+            options.budget_target_payload_bits_per_second == 0U ?
+                ComputeGpuPipelineBudget(plan, &gpu_budget, error) :
+                ComputeGpuPipelineBudgetForPayloadRate(
+                    plan, options.budget_target_payload_bits_per_second,
+                    &gpu_budget, error);
+        if (!budget_ready) return false;
+        gpu_budget_pointer = &gpu_budget;
+    }
     result.ring_plan_json = RingPlanJson(plan);
-    result.validation_report_json = ValidationReportJson(plan);
+    result.validation_report_json = ValidationReportJson(
+        plan, gpu_budget_pointer);
     *artifacts = result;
     return true;
 }

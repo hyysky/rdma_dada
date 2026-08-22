@@ -1,4 +1,5 @@
 #include "rdma_dada/config/observation_artifacts.h"
+#include "rdma_dada/config/gpu_pipeline_budget.h"
 
 #include <iostream>
 #include <string>
@@ -7,6 +8,7 @@ namespace {
 
 void Usage() {
     std::cerr << "usage: observation_config_compile --config FILE "
+                 "[--budget-payload-gbps RATE] "
                  "(--preflight-only | --output-dir DIRECTORY)\n";
 }
 
@@ -15,6 +17,7 @@ void Usage() {
 int main(int argc, char** argv) {
     std::string config_path;
     std::string output_directory;
+    std::string budget_payload_gbps;
     bool preflight_only = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -24,6 +27,9 @@ int main(int argc, char** argv) {
             output_directory = argv[++index];
         } else if (argument == "--preflight-only") {
             preflight_only = true;
+        } else if (argument == "--budget-payload-gbps" &&
+                   index + 1 < argc) {
+            budget_payload_gbps = argv[++index];
         } else if (argument == "--help" || argument == "-h") {
             Usage();
             return 0;
@@ -38,9 +44,17 @@ int main(int argc, char** argv) {
     }
 
     rdma_dada::ObservationArtifacts artifacts;
+    rdma_dada::ObservationArtifactOptions options;
     std::string error;
-    if (!rdma_dada::BuildObservationArtifacts(config_path, &artifacts,
-                                               &error)) {
+    if (!budget_payload_gbps.empty() &&
+        !rdma_dada::ParsePayloadGigabitsPerSecond(
+            budget_payload_gbps,
+            &options.budget_target_payload_bits_per_second, &error)) {
+        std::cerr << "invalid GPU budget rate: " << error << '\n';
+        return 2;
+    }
+    if (!rdma_dada::BuildObservationArtifactsWithOptions(
+            config_path, options, &artifacts, &error)) {
         std::cerr << "observation preflight failed: " << error << '\n';
         return 1;
     }

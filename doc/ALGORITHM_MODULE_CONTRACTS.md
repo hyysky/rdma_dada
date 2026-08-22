@@ -680,6 +680,31 @@ output_block_bytes = output_T * output_frame_bytes
 `pipelinectl` 根据最终模块链计算每个 ring 的 data block size；`pipeline_worker` 在
 运行时再次校验，不能依赖未验证的 `dada_db -b` 参数。
 
+### 16.1 GPU 实时预算
+
+`observation_config_compile` 必须从同一份 Resolved Plan 生成
+`validation_report.json.gpu_pipeline_budget`。默认预算速率来自 Observation；性能测试可用
+`--budget-payload-gbps RATE` 注入目标 payload 速率，但报告必须同时保留 Observation 速率、
+预算速率和 `PERFORMANCE_OVERRIDE` 来源，不能把测试速率伪装成观测参数。
+
+第一版固定保留 20% block 时间余量：
+
+```text
+block_interval_ns = compute_block_bytes * 8e9 / budget_payload_bits_per_second
+service_deadline_ns = floor(block_interval_ns * 0.8)
+required_stage_bytes_per_second = ceil(stage_bytes_per_block * 1e9 / service_deadline_ns)
+```
+
+这里的 deadline 覆盖当前串行的 `H2D -> conversion -> beamform -> product/integration ->
+D2H -> stream synchronize` 整条链。各阶段吞吐是必要下限，不表示每个阶段都可独占完整
+deadline。由于 H2D 和 D2H 在同一 stream 顺序执行，报告还必须给出
+`compute_block_bytes + output_block_bytes` 的合计 host/device 传输量和最低合计速率。
+
+显存规划按 worker 实际同时持有的 buffer 计算：input、converted、module scratch、final
+output 和常驻 FPAB/CF32 weights。`planned_device_bytes` 为精确和，
+`recommended_free_device_bytes=ceil(planned_device_bytes*1.2)`。该数字不含 CUDA runtime、
+cuBLAS handle/workspace、context 和驱动保留显存，服务器预检必须另外验证这些开销。
+
 ## 17. 配置示例
 
 ```json
