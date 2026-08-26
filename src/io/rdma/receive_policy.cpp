@@ -74,6 +74,21 @@ DirectRawCompletionAction ClassifyDirectRawCompletion(
         : DirectRawCompletionAction::kZeroSlot;
 }
 
+bool ShouldCheckDirectRawDrainClock(
+    std::uint64_t empty_polls_since_check) {
+    return empty_polls_since_check >= kDirectRawDrainClockCheckEmptyPolls;
+}
+
+bool ShouldRepostDirectRawWr(bool stop_requested,
+                             bool drain_deadline_reached) {
+    return !stop_requested || !drain_deadline_reached;
+}
+
+bool DirectRawDrainDeadlineReached(std::uint64_t now_ns,
+                                   std::uint64_t deadline_ns) {
+    return now_ns >= deadline_ns;
+}
+
 DirectRawBlockProgress::DirectRawBlockProgress(std::size_t slot_count)
     : assigned_(slot_count, 0), completed_(slot_count, 0),
       assigned_count_(0), completed_count_(0) {}

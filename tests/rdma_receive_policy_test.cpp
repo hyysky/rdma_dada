@@ -150,6 +150,27 @@ void TestDirectRawWrongLengthPolicy() {
            "invalid WR identity remains fatal in direct raw mode");
 }
 
+void TestDirectRawDrainPolicy() {
+    namespace rdma = rdma_dada::io::rdma;
+    const std::uint64_t started_ns = UINT64_C(5000000000);
+    const std::uint64_t deadline_ns =
+        started_ns + rdma::kDirectRawDrainDurationNs;
+
+    Expect(rdma::kDirectRawDrainDurationNs == UINT64_C(1000000000),
+           "direct raw drain retains one second after stop");
+    Expect(!rdma::ShouldCheckDirectRawDrainClock(4095) &&
+               rdma::ShouldCheckDirectRawDrainClock(4096),
+           "direct raw drain checks the clock every 4096 empty polls");
+    Expect(rdma::ShouldRepostDirectRawWr(true, false),
+           "direct raw continues WR reposting while drain is active");
+    Expect(!rdma::ShouldRepostDirectRawWr(true, true),
+           "direct raw stops WR reposting after the drain deadline");
+    Expect(!rdma::DirectRawDrainDeadlineReached(
+               deadline_ns - 1U, deadline_ns) &&
+               rdma::DirectRawDrainDeadlineReached(deadline_ns, deadline_ns),
+           "direct raw drain exits on the monotonic one-second deadline");
+}
+
 void TestDirectRawBlockProgress() {
     namespace rdma = rdma_dada::io::rdma;
     rdma::DirectRawBlockProgress progress(4);
@@ -196,6 +217,7 @@ int main() {
     TestRawBlockTailAccounting();
     TestDirectRawConfigurationContract();
     TestDirectRawWrongLengthPolicy();
+    TestDirectRawDrainPolicy();
     TestDirectRawBlockProgress();
     TestDirectRawOutstandingBlockOrder();
     if (failures != 0) {

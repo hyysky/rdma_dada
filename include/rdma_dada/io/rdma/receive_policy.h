@@ -14,6 +14,8 @@ constexpr unsigned int kDefaultReceiveWrDepth = 1024;
 constexpr unsigned int kDirectRawNsge = 2;
 constexpr std::uint32_t kDirectRawHeaderBytes = 42;
 constexpr std::uint32_t kDirectRawMaxConsecutiveWrongLength = 16;
+constexpr std::uint64_t kDirectRawDrainDurationNs = UINT64_C(1000000000);
+constexpr std::uint64_t kDirectRawDrainClockCheckEmptyPolls = 4096;
 
 struct DestinationUdpFilter {
     std::uint8_t source_mac[6];
@@ -67,6 +69,12 @@ DirectRawCompletionAction ClassifyDirectRawCompletion(
     bool success, bool receive_opcode, bool valid_wr_id,
     std::uint32_t byte_len, std::uint32_t expected_byte_len,
     std::uint32_t* consecutive_wrong_length);
+
+bool ShouldCheckDirectRawDrainClock(std::uint64_t empty_polls_since_check);
+bool ShouldRepostDirectRawWr(bool stop_requested,
+                             bool drain_deadline_reached);
+bool DirectRawDrainDeadlineReached(std::uint64_t now_ns,
+                                   std::uint64_t deadline_ns);
 
 class DirectRawBlockProgress {
   public:

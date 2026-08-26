@@ -30,3 +30,8 @@ There is no packet-to-ring memcpy and no legacy copy/SPSC or multi-QP mode.
 错误长度包或任何 CQ/WR/repost 错误会终止 transfer。有限 transfer 只发布连续完成的
 完整 record 前缀，随后发送 PSRDADA EOD。正常无错误结束必须满足
 `accepted=published`。
+
+正常停止采用固定 1 秒 receiver drain：停止请求后继续轮询 CQ、发布 raw block 并
+重投递 WR，达到单调时钟 deadline 后才提交 partial tail 和 EOD。drain 只记录
+`drain_duration_ns`、`completions_after_stop` 和 `exit_reason` 三个汇总字段；不会在
+稳态每包路径增加时间戳或日志。

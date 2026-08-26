@@ -119,7 +119,10 @@ struct RoCEv2Dada::DirectReceiveState {
           full_polls(0), completions(0), reposted_wrs(0), repost_failures(0),
           repost_batches(0), posted_wrs(wr_depth), min_posted_wrs(wr_depth),
           poll_batch_high_watermark(0), completion_to_repost_ns_total(0),
-          completion_to_repost_ns_max(0), consecutive_wrong_length(0),
+          completion_to_repost_ns_max(0), drain_duration_ns(0),
+          completions_after_stop(0),
+          exit_reason(RoCEv2Dada::ReceiveExitReason::kNotStopped),
+          consecutive_wrong_length(0),
           targets(wr_depth) {}
 
     unsigned char *header_scratch;
@@ -142,6 +145,9 @@ struct RoCEv2Dada::DirectReceiveState {
     std::atomic<std::uint64_t> poll_batch_high_watermark;
     std::atomic<std::uint64_t> completion_to_repost_ns_total;
     std::atomic<std::uint64_t> completion_to_repost_ns_max;
+    std::atomic<std::uint64_t> drain_duration_ns;
+    std::atomic<std::uint64_t> completions_after_stop;
+    std::atomic<RoCEv2Dada::ReceiveExitReason> exit_reason;
     std::uint32_t consecutive_wrong_length;
 };
 
@@ -351,10 +357,19 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
     struct ibv_utils_res *resource =
         static_cast<struct ibv_utils_res *>(receiver->ibv_res);
     std::vector<std::uint64_t> repost_ids(receiver->param.poll_batch);
-    std::uint64_t stop_empty_polls = 0;
-    const std::uint64_t kStopEmptyPolls = 4096;
+    std::uint64_t drain_empty_polls = 0;
+    std::uint64_t drain_started_ns = 0;
+    std::uint64_t drain_deadline_ns = 0;
+    bool draining = false;
+    bool drain_deadline_reached = false;
 
     while (!state->failed.load()) {
+        if (receiver->stop_requested.load() && !draining) {
+            drain_started_ns = MonotonicRawNs();
+            drain_deadline_ns = drain_started_ns +
+                rdma_dada::io::rdma::kDirectRawDrainDurationNs;
+            draining = true;
+        }
         const int polled = ibv_poll_cq(resource->cq, resource->poll_n,
                                        resource->wc);
         state->poll_calls.fetch_add(1);
@@ -365,11 +380,24 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
         }
         if (polled == 0) {
             state->empty_polls.fetch_add(1);
-            if (receiver->stop_requested.load() &&
-                ++stop_empty_polls >= kStopEmptyPolls) break;
+            if (draining &&
+                rdma_dada::io::rdma::ShouldCheckDirectRawDrainClock(
+                    ++drain_empty_polls)) {
+                drain_empty_polls = 0;
+                const std::uint64_t now_ns = MonotonicRawNs();
+                if (rdma_dada::io::rdma::DirectRawDrainDeadlineReached(
+                        now_ns, drain_deadline_ns)) {
+                    state->drain_duration_ns.store(now_ns - drain_started_ns);
+                    state->exit_reason.store(ReceiveExitReason::kDrainDeadline);
+                    break;
+                }
+            }
             continue;
         }
-        stop_empty_polls = 0;
+        drain_empty_polls = 0;
+        if (draining)
+            state->completions_after_stop.fetch_add(
+                static_cast<std::uint64_t>(polled));
         state->completions.fetch_add(polled);
         if (polled == static_cast<int>(resource->poll_n))
             state->full_polls.fetch_add(1);
@@ -422,14 +450,26 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
                 receiver->accepted_receive_packets.fetch_add(1);
             }
             target.active = false;
-            if (!receiver->stop_requested.load())
-                repost_ids[repost_count++] = completion.wr_id;
+            repost_ids[repost_count++] = completion.wr_id;
         }
         if (state->failed.load()) break;
-        if (!receiver->PublishReadyDirectBlocks(
-                !receiver->stop_requested.load())) break;
 
-        if (repost_count != 0U) {
+        if (draining) {
+            const std::uint64_t now_ns = MonotonicRawNs();
+            drain_deadline_reached =
+                rdma_dada::io::rdma::DirectRawDrainDeadlineReached(
+                    now_ns, drain_deadline_ns);
+            if (drain_deadline_reached) {
+                state->drain_duration_ns.store(now_ns - drain_started_ns);
+                state->exit_reason.store(ReceiveExitReason::kDrainDeadline);
+            }
+        }
+        if (!receiver->PublishReadyDirectBlocks(!drain_deadline_reached))
+            break;
+
+        if (repost_count != 0U &&
+            rdma_dada::io::rdma::ShouldRepostDirectRawWr(
+                receiver->stop_requested.load(), drain_deadline_reached)) {
             for (std::size_t index = 0; index < repost_count; ++index) {
                 if (!receiver->AssignDirectSlot(repost_ids[index])) break;
             }
@@ -449,7 +489,10 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
             state->posted_wrs.fetch_add(repost_count);
             state->repost_batches.fetch_add(1);
         }
+        if (drain_deadline_reached) break;
     }
+    if (state->failed.load())
+        state->exit_reason.store(ReceiveExitReason::kError);
     if (!state->failed.load()) receiver->PublishDirectTail();
     return NULL;
 }
@@ -521,13 +564,20 @@ int RoCEv2Dada::Stop() {
            ", repost_batches=%" PRIu64 ", min_posted_wrs=%" PRIu64
            ", poll_batch_high_watermark=%" PRIu64
            ", completion_to_repost_ns_total=%" PRIu64
-           ", completion_to_repost_ns_max=%" PRIu64 "\n",
+           ", completion_to_repost_ns_max=%" PRIu64
+           ", drain_duration_ns=%" PRIu64
+           ", completions_after_stop=%" PRIu64 ", exit_reason=%s\n",
            stats.poll_calls, stats.empty_polls, stats.full_polls,
            stats.reposted_wrs, stats.repost_failures,
            stats.repost_batches, stats.min_posted_wrs,
            stats.poll_batch_high_watermark,
            stats.completion_to_repost_ns_total,
-           stats.completion_to_repost_ns_max);
+           stats.completion_to_repost_ns_max,
+           stats.drain_duration_ns, stats.completions_after_stop,
+           stats.exit_reason == ReceiveExitReason::kDrainDeadline
+               ? "DRAIN_DEADLINE"
+               : stats.exit_reason == ReceiveExitReason::kError
+                   ? "ERROR" : "NOT_STOPPED");
     fflush(stdout);
     return receive_state->failed.load() ? RDMA_ERROR : RDMA_OK;
 }
@@ -555,6 +605,10 @@ RoCEv2Dada::ReceiveStats RoCEv2Dada::GetReceiveStats() const {
             receive_state->completion_to_repost_ns_total.load();
         stats.completion_to_repost_ns_max =
             receive_state->completion_to_repost_ns_max.load();
+        stats.drain_duration_ns = receive_state->drain_duration_ns.load();
+        stats.completions_after_stop =
+            receive_state->completions_after_stop.load();
+        stats.exit_reason = receive_state->exit_reason.load();
     }
     return stats;
 }

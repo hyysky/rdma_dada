@@ -10,6 +10,12 @@ struct ibv_pd;
 // per-WR protocol-header scratch area and one directly owned PSRDADA slot.
 class RoCEv2Dada {
   public:
+    enum class ReceiveExitReason {
+        kNotStopped,
+        kDrainDeadline,
+        kError
+    };
+
     struct ReceiveStats {
         std::uint64_t accepted_packets;
         std::uint64_t wrong_length_packets;
@@ -28,6 +34,9 @@ class RoCEv2Dada {
         std::uint64_t poll_batch_high_watermark;
         std::uint64_t completion_to_repost_ns_total;
         std::uint64_t completion_to_repost_ns_max;
+        std::uint64_t drain_duration_ns;
+        std::uint64_t completions_after_stop;
+        ReceiveExitReason exit_reason;
     };
 
     struct DirectRawBlockLease {
