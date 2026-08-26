@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task 8C passing baseline profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "target_host",
+    "pipeline_stage",
+    "source_result",
+    "runtime",
+    "geometry"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "target_host": {"type": "string", "minLength": 1},
+    "pipeline_stage": {"enum": ["receive", "unpack", "gpu", "full"]},
+    "source_result": {"type": "string", "minLength": 1},
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "receiver_poll_cpu": {"type": "integer", "minimum": 0},
+        "worker_cpu_list": {"type": "string", "minLength": 1},
+        "gpu_worker_cpu": {"type": "integer", "minimum": 0},
+        "sink_cpu_list": {"type": "string", "minLength": 1},
+        "numa_node": {"type": "integer", "minimum": 0},
+        "receiver_poll_batch": {"type": "integer", "minimum": 1},
+        "receiver_wr_num": {"type": "integer", "minimum": 1},
+        "unpack_start_delay_seconds": {"type": "integer", "minimum": 0},
+        "missing_wait_ms": {"type": "number", "exclusiveMinimum": 0},
+        "station_skew_reserve_ms": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_payload_gbps", "duration_seconds"],
+      "properties": {
+        "target_payload_gbps": {"type": "number", "exclusiveMinimum": 0},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "raw_block_bytes": {"type": "integer", "minimum": 1},
+        "raw_ring_blocks": {"type": "integer", "minimum": 1},
+        "compute_block_bytes": {"type": "integer", "minimum": 1},
+        "compute_ring_blocks": {"type": "integer", "minimum": 1},
+        "output_block_bytes": {"type": "integer", "minimum": 1},
+        "output_ring_blocks": {"type": "integer", "minimum": 1},
+        "window_blocks": {"type": "integer", "minimum": 1},
+        "reorder_horizon_groups": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

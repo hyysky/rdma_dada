@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyysky.github.io/rdma_dada/test-result-catalog.schema.json",
+  "title": "RDMA DADA compact test result catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_utc", "suite_count", "suites"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_utc": {"type": "string", "format": "date-time"},
+    "suite_count": {"type": "integer", "minimum": 0},
+    "suites": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/suite"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ring": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["block_bytes", "blocks"],
+      "properties": {
+        "block_bytes": {"type": "integer", "minimum": 1},
+        "blocks": {"type": "integer", "minimum": 1}
+      }
+    },
+    "failure": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["run_id", "stage", "classification", "exit_code", "message"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "stage": {"type": "string", "minLength": 1},
+        "classification": {"type": "string", "minLength": 1},
+        "exit_code": {"type": ["integer", "null"]},
+        "message": {"type": "string"}
+      }
+    },
+    "suite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suite_id", "test_topology", "modules", "started_utc",
+        "target_payload_gbps", "actual_payload_gbps", "duration_seconds",
+        "warmup_count", "measured_count", "test_result", "cleanup_result",
+        "first_failure", "identity", "configuration", "result_path",
+        "summary_sha256", "suite_manifest_sha256"
+      ],
+      "properties": {
+        "suite_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "test_topology": {"enum": ["receive", "unpack", "gpu", "full"]},
+        "modules": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "started_utc": {"type": "string", "format": "date-time"},
+        "target_payload_gbps": {"type": "number", "exclusiveMinimum": 0},
+        "actual_payload_gbps": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["median", "minimum", "maximum"],
+          "properties": {
+            "median": {"type": "number", "minimum": 0},
+            "minimum": {"type": "number", "minimum": 0},
+            "maximum": {"type": "number", "minimum": 0}
+          }
+        },
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "warmup_count": {"type": "integer", "minimum": 0},
+        "measured_count": {"type": "integer", "minimum": 0},
+        "test_result": {
+          "enum": [
+            "PASS", "PRODUCT_FAIL", "PERFORMANCE_FAIL", "HARNESS_FAIL",
+            "ENV_BLOCKED", "SYNC_FAIL", "BUILD_FAIL", "BLOCKED",
+            "INCOMPLETE", "STOPPED"
+          ]
+        },
+        "cleanup_result": {"enum": ["PASS", "FAIL", "NOT_APPLICABLE"]},
+        "first_failure": {"$ref": "#/$defs/failure"},
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_manifest_sha256", "config_id", "geometry_id",
+            "baseline_profile_id", "baseline_profile_sha256", "binary_sha256"
+          ],
+          "properties": {
+            "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "config_id": {"$ref": "#/$defs/sha256"},
+            "geometry_id": {"$ref": "#/$defs/sha256"},
+            "baseline_profile_id": {
+              "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+            },
+            "baseline_profile_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+            "binary_sha256": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        "configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receiver_poll_cpu", "worker_cpu_list", "gpu_worker_cpu",
+            "sink_cpu_list", "numa_node", "receiver_poll_batch",
+            "receiver_wr_num", "rings", "window_groups",
+            "reorder_horizon_groups", "unpack_start_delay_seconds"
+          ],
+          "properties": {
+            "receiver_poll_cpu": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
+            "worker_cpu_list": {"type": ["string", "null"]},
+            "gpu_worker_cpu": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
+            "sink_cpu_list": {"type": ["string", "null"]},
+            "numa_node": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
+            "receiver_poll_batch": {
+              "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]
+            },
+            "receiver_wr_num": {
+              "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]
+            },
+            "rings": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["raw", "compute", "output"],
+              "properties": {
+                "raw": {"$ref": "#/$defs/ring"},
+                "compute": {"$ref": "#/$defs/ring"},
+                "output": {"$ref": "#/$defs/ring"}
+              }
+            },
+            "window_groups": {
+              "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]
+            },
+            "reorder_horizon_groups": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
+            "unpack_start_delay_seconds": {
+              "anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]
+            }
+          }
+        },
+        "result_path": {"type": "string", "pattern": "^suites/[^/]+$"},
+        "summary_sha256": {"$ref": "#/$defs/sha256"},
+        "suite_manifest_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

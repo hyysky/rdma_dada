@@ -63,31 +63,174 @@ Additional repetitions may be required for timing-sensitive or intermittent
 failures. Reports include every run; do not discard failed runs or select only
 the best result.
 
-## Required run artifacts
+## Required result artifacts
 
-Each run directory contains at least:
+The controller exposes exactly four formal boundaries:
+
+| Stage | Data path |
+| --- | --- |
+| `receive` | UDP senders → `rdma2dada` → raw ring consumer |
+| `unpack` | UDP senders → `rdma2dada` → raw ring → `vdif_unpack_worker` → compute ring consumer |
+| `gpu` | `dada_junkdb` → compute ring → `pipeline_worker` → output ring consumer |
+| `full` | UDP senders → `rdma2dada` → unpack → compute ring → GPU worker → output ring consumer |
+
+`unpack` is intentionally not a synthetic stand-alone input mode. GPU-only
+creates no raw ring, network receiver or sender and requires no `CAP_NET_RAW`.
+The configurable target always means aggregate payload rate at the selected
+boundary.
+
+For GPU-only pressure, the producer works in whole compute blocks per whole
+second. For any positive configured target rate, not only 30 Gbps, the plan is:
+
+```text
+target_bytes_per_second = target_payload_bits_per_second / 8
+blocks_per_second = ceil(target_bytes_per_second / compute_block_bytes)
+actual_bytes_per_second = blocks_per_second * compute_block_bytes
+total_blocks = blocks_per_second * duration_seconds
+```
+
+The result records target rate, block-aligned configured injection rate, and
+worker-measured input rate from processed bytes / transfer elapsed time.
+Because of upward rounding, the configured injection rate is never lower than
+the target. This tests
+sustained block pressure and backpressure; it does not claim smooth packet
+pacing, so `full` remains the final astronomical data-flow acceptance.
+
+The next production-geometry GPU pressure profile uses approximately
+`A=500`, configurable `F` (initial target `F=4`), `P=1`, and `B=350` at about
+30 Gbps compute-ring payload. It must use matching ATFP geometry and FPAB
+weights, so the CUDA conversion, GEMM shape, output expansion, transfers and
+device buffers are representative even though `dada_junkdb` supplies synthetic
+bytes. The preferred 30 Gbps fixture may use `A=469,F=4`; `A=500,F=4` is a
+separate approximately 32 Gbps pressure point.
+
+This production-geometry GPU pressure is not a 500-Station network acceptance.
+The current network sender remains a one-Station-per-process fixture and the
+current controller network topology uses two Station processes. It may still
+validate receive/unpack payload throughput, but it must not be combined with a
+different `A` in the GPU header or described as an end-to-end 500-Station run.
+A final 500-Station `full` result requires either a multi-Station sender or an
+equivalent valid raw-VDIF generator, followed by the normal full-stage
+warm-up-plus-three-measured gate.
 
 Rate-point result directories use
 `<pipeline-stage>-<aggregate-rate>Gbps-<duration>s-<UTC timestamp>` so rate and
 time are visible without opening the manifest.
 
-- `manifest.json`: Git commit, source manifest, binary origin, host names,
-  toolchain versions, configuration hashes, command arguments and run ID;
-- `state.json`: current orchestration phase and owned resource identifiers;
-- `result.json`: immutable test outcome, failure classification, counters,
-  rates and acceptance checks;
-- separate stdout/stderr logs for controller, receiver, worker, consumer and
-  every sender;
-- cleanup evidence showing the disposition of every PID, ring key, capability
-  and temporary path owned by the run.
+JSON is the machine-readable interface used by reporting tasks. A suite keeps
+immutable configuration once and stores one JSON result plus one compact raw
+evidence log per repetition:
+
+```text
+observation.json
+resolved_observation.json
+preflight.json
+summary.json
+MANIFEST.sha256
+runs/
+  warmup-01.json
+  warmup-01.evidence.log
+  measured-01.json
+  measured-01.evidence.log
+  measured-02.json
+  measured-02.evidence.log
+  measured-03.json
+  measured-03.evidence.log
+```
+
+Each run JSON is authoritative and includes the effective process ledger,
+state timeline, structured counters, result and cleanup. Every process entry
+records `host`, `role`, complete `argv`, allowlisted `env`, `cpu_affinity`,
+`numa_node`, `thread_mapping`, `binary_sha256`, `config_sha256`, `pid`,
+`started_utc`, `ended_utc` and `returncode`. Ring
+geometry is part of `resolved_observation.json`; it is not duplicated as a
+top-level result file.
+
+Each `*.evidence.log` contains only unmodified final summary, EOD, warning,
+error and resource cleanup lines, prefixed with their source process. It is
+proof for auditing the structured JSON, not an alternate reporting interface.
+The run JSON records its evidence filename and SHA256. `MANIFEST.sha256` covers
+every retained suite artifact.
+
+### Local catalog and reporting handoff
+
+Compact remote suites are imported into the local, Git-ignored
+`test-results/suites/<suite-id>/` tree with `scripts/task8c_catalog.py`. Import
+must verify the remote suite manifest, record `source_host`, remote suite root
+and the development source-manifest SHA in `origin.json`, and atomically publish
+the immutable suite. `catalog.json` and `catalog.csv` are deterministic derived
+views and are never edited as evidence.
+
+Reporting tasks query by suite ID, topology, target rate, result, cleanup
+result, date or passing-profile identity. They read only the selected suite's
+`summary.json`, `preflight.json` and `runs/*.json`; `*.evidence.log` is opened
+only to audit a cited raw line or diagnose a failure. The tracked
+`docs/results/accepted-results.json` contains only suites explicitly promoted
+with user approval. Promotion records evidence selection, not necessarily a
+product PASS.
+
+After remote cleanup, the testing task attempts local import and then sends its
+complete result to the development task and a bounded second notification to
+`总结成文`, even when import fails. Import and both deliveries are independent
+states:
+
+```text
+CATALOG_IMPORT_RESULT=<PASS|FAIL>
+RESULT_NOTIFICATION=<PASS|FAIL>
+RESULT_CATALOG_NOTIFICATION=<PASS|FAIL>
+SUITE_ID=<suite-id>
+TEST_TOPOLOGY=<receive|unpack|gpu|full>
+TEST_RESULT=<result>
+CLEANUP_RESULT=<result>
+CATALOG_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/catalog.json
+LOCAL_SUITE_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/suites/<suite-id>
+```
+
+Remote test result, cleanup result, `CATALOG_IMPORT_RESULT`, development
+`RESULT_NOTIFICATION` and reporting `RESULT_CATALOG_NOTIFICATION` are
+independent states. A catalog or notification
+failure never rewrites the underlying test or cleanup result.
+
+On PASS, remove copied bundles, bootstrap artifacts, helper scripts, PID,
+ready/exit files, duplicate headers/configs, raw data and full progress logs
+after the JSON and evidence log are durable. On failure add only:
+
+```text
+debug/<run-id>/failed-command.json
+debug/<run-id>/failed-process.log
+debug/<run-id>/resource-snapshot.json
+```
+
+The debug files preserve the first failed command, its complete captured
+stdout/stderr and relevant cleanup/statistics. They do not retain unrelated
+stages. Preflight belongs to the suite as `preflight.json`; a formal suite does
+not create a sibling preflight result directory.
+
+## Versioned passing profiles
+
+The latest accepted host/topology configuration is stored under
+`config/testing/profiles/` and is the default comparison baseline for later
+tests of that boundary. A profile includes CPU/NUMA placement, coordinator,
+parser and writer roles, `gpu_worker_cpu`, sink CPU, queue settings,
+ring/window geometry and preparation policy. GPU/full profiles are invalid
+without an explicit GPU-worker CPU. Rebuilding binaries updates recorded
+binary identities but does not
+reset the runtime profile to unpinned or single-thread defaults.
+
+Every run records the profile path and SHA256. Before resource creation the
+controller compares effective parameters with the profile. An exact match
+continues as a baseline run. Any difference requires an explicit experiment
+name and is written as a field-by-field diff in `preflight.json`; an unnamed
+drift is `HARNESS_FAIL`.
 
 Git is managed only in the local development worktree. Remote test hosts do not
 need a Git executable and test controllers must not invoke Git there. The
 development task supplies source SHA256 values; remote manifests record and
 compare those values together with generated configuration and binary SHA256.
 
-`result.json` is written before cleanup and augmented with cleanup status; the
-test outcome is never replaced by a final `CLEANED` state. Python controllers
+The in-progress run result is written before cleanup, augmented with cleanup
+status, then compacted into `runs/<run-id>.json`; the test outcome is never
+replaced by a final `CLEANED` state. Python controllers
 run unbuffered or explicitly flush logs, and unexpected exceptions retain the
 traceback and the first failed command's argv, exit code, stdout and stderr.
 
@@ -124,7 +267,7 @@ controller must:
 6. assign unique remote directories, PID files and ring keys or explicitly
    validate exclusive ownership;
 7. use `finally`/trap cleanup scoped to recorded resources, never broad `pkill`;
-8. retain the original failure after cleanup and always write `result.json`;
+8. retain the original failure after cleanup in the compact run JSON;
 9. support `--dry-run` and automated self-tests, including real entry routing,
    early sender failure, expired start-time regeneration, resume and cleanup;
 10. fail closed when counts, headers, EOD, logs or result artifacts are missing.
@@ -279,7 +422,7 @@ For every physical-wire rate run, capture receiver NIC counters immediately
 before the receiver-side processes start and immediately after both senders
 finish. Resolve the Linux netdev from the configured RDMA device through
 sysfs, and preserve both `/sys/class/net/<netdev>/statistics` and
-`ethtool -S <netdev>` snapshots plus their run-scoped deltas in `result.json`.
+`ethtool -S <netdev>` snapshots plus their run-scoped deltas in the run JSON.
 Counter snapshots are required evidence: a missing tool, ambiguous RDMA-to-
 netdev mapping, empty snapshot, interface change, or counter reset must be
 reported explicitly and must not be interpreted as zero packet loss.
@@ -307,6 +450,15 @@ that plan. It must not generate runtime `pipeline.json`, `packet.json` or
 `worker.json` geometry files. Run `--preflight-only` before `--execute`; the
 preflight follows the same compiler, synchronization, binary and endpoint gate
 but creates no ring, capability or data process.
+
+For performance runs the controller must pass its aggregate payload target to
+the compiler through `--budget-payload-gbps`. The resulting validation report
+must retain both the Observation-derived payload rate and the overridden test
+rate with `rate_source=PERFORMANCE_OVERRIDE`. Before creating rings, preserve
+and validate the 20% service deadline, per-stage rates, combined sequential
+H2D+D2H bytes/rate, planned VRAM, recommended free VRAM and the explicit
+runtime/workspace exclusion. An isolated kernel rate or available VRAM alone
+does not satisfy this full-chain feasibility gate.
 Both receiver-side and sender-side Release build directories are explicit
 formal-run arguments. The controller must not silently select `build-linux`
 for either `rdma2dada`/`vdif_unpack_worker` or `fpga_sender_sim`.
@@ -328,15 +480,38 @@ a harness failure and provides no product evidence.
 
 The direct receive path fixes one destination-only flow, one QP/CQ/thread,
 NSGE=2, a 42-byte header scratch SGE and two outstanding PSRDADA blocks. Its
-tunable defaults are `--poll-batch 32 --recv-wr-num 1024`. Explicit qths1
-Node-1 placement uses `--poll-cpu 13`, worker CPU 14, sink CPU 15 and NUMA node
-1; these values belong to the versioned runner invocation and are not
-hard-coded product defaults.
+tunable defaults are `--poll-batch 32 --recv-wr-num 1024`. The current qths1
+Node-1 unpack profile uses receiver poll CPU 13, coordinator 14, parser workers
+15–18, compute writer 19 and sink 20. These values belong to the versioned
+runner invocation and are not hard-coded product defaults. Receive-only or
+full-pipeline profiles may use a different non-overlapping map, but must record
+and verify the effective affinity.
 
 Failure-time diagnostic collection and resource cleanup are reported
 separately. A missing artifact that was never expected to exist after an early
 worker failure belongs in `diagnostic_errors`; it does not turn an otherwise
 verified process/ring/capability cleanup into `CLEANUP_RESULT=FAIL`.
+
+Generated bundle validation must follow the selected pipeline topology. A
+GPU-only run does not create receiver, NIC-capture or sender artifacts, so its
+configuration gate must neither hash nor transfer those files. Validate only
+the files and processes declared by `PipelineTopology`; an unconditional check
+for an artifact absent from that topology is `HARNESS_FAIL` and requires a
+`prepare_configs` regression test before the formal run is retried.
+Ring-key resolution follows the same rule: resolve only the keys named by the
+selected topology. Building an eager raw/compute/output map is invalid because
+receive-only artifacts intentionally have no output ring.
+If a `dada_db` owner exits during prepare, report the affected ring and append
+the tail of its ring log before returning the failure. Do not register or
+destroy that ring as controller-owned until prepare has confirmed the owner is
+alive; diagnostic visibility must not weaken resource-ownership safety.
+
+Do not diagnose a run from a transient state snapshot while the controller is
+still active. The compact run JSON must retain the complete state timeline,
+launcher argv/PID/PGID and sender process ledger with host, Station, SSH argv,
+PID, timestamps, exit code and combined output. SSH exit code 255 is a harness
+transport failure; ordinary non-zero remote program exits remain product
+failures. Persist this evidence before terminating peer Stations and cleanup.
 
 `dada_db -p` is not a read-only ring probe: it creates persistent DADA data and
 header blocks. Never use it during Phase 0 or diagnostics. Inspect existing IPC

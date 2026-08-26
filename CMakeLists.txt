@@ -514,6 +514,22 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
         add_test(
+            NAME task8c_profiles_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_profiles_test.py)
+        add_test(
+            NAME task8c_artifacts_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_artifacts_test.py)
+        add_test(
+            NAME task8c_catalog_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_catalog_test.py)
+        add_test(
+            NAME generate_source_manifest_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_source_manifest_test.py)
+        add_test(
             NAME atfp_throughput_campaign_test
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/atfp_throughput_campaign_test.py)

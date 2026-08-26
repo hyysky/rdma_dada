@@ -87,3 +87,6 @@ venv/
 /.claude/
 /agent/
 /skills-lock.json
+
+# Imported compact test evidence and generated local catalogs
+/test-results/
