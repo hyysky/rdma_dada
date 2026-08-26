@@ -647,6 +647,69 @@ class Task8cRatePointTest(unittest.TestCase):
             rendered = json.loads((root / "run" / "observation.json").read_text())
             self.assertEqual(rendered["blocks"]["window_blocks"], 17)
 
+    def test_compile_unpack_plan_removes_gpu_processing_before_compiler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            template = root / "observation.template.json"
+            template.write_text(json.dumps({
+                "observation": {
+                    "observation_id": "fixture",
+                    "station_ids": [101, 102],
+                },
+                "wire": {"profile": "/tmp/wire.json"},
+                "blocks": {"window_blocks": 4},
+                "processing": {
+                    "run_once": True,
+                    "modules": [{
+                        "type": "beamform",
+                        "weights_file": "/tmp/weights.npy",
+                    }],
+                },
+            }))
+            bootstrap = dataclasses.replace(
+                make_plan(
+                    aggregate_gbps=0.1,
+                    duration_seconds=10.0,
+                    compute_consumer="dbnull",
+                    pipeline_stage="unpack",
+                ),
+                records_per_block=12800,
+            )
+            final = dataclasses.replace(
+                bootstrap,
+                group_count=MODULE._group_count_for_request(
+                    MODULE.RateRequest(
+                        0.1,
+                        10.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                    ),
+                    bootstrap.nant,
+                    bootstrap.record_bytes,
+                ),
+            )
+            with mock.patch.object(MODULE, "_run_observation_compiler"), \
+                    mock.patch.object(
+                        MODULE.RatePlan,
+                        "from_artifact_directory",
+                        side_effect=[bootstrap, final],
+                    ):
+                MODULE.compile_rate_plan(
+                    MODULE.RateRequest(
+                        0.1,
+                        10.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                    ),
+                    template,
+                    pathlib.Path("/tmp/compiler"),
+                    root / "run",
+                    compiler_executor=object(),
+                )
+
+            rendered = json.loads((root / "run" / "observation.json").read_text())
+            self.assertEqual(rendered["processing"]["modules"], [])
+
     def test_dry_run_accepts_missing_wait_and_station_skew_times(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             return_code = MODULE.main([

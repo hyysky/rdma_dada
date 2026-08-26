@@ -632,11 +632,10 @@ def compile_rate_plan(
                     f"station_id {request.station_id} is absent from observation"
                 )
             observation["observation"]["station_ids"] = [request.station_id]
-        # Receive-only plans never consume processing modules.  Strip them
-        # before compiler validation so a single-Station receive plan does not
-        # spuriously fail on beamform weight geometry intended for the full
-        # multi-Station pipeline.
-        if request.pipeline_stage == "receive":
+        # Receive and unpack plans never consume GPU processing modules.  Strip
+        # them before compiler validation so stage artifacts describe only the
+        # rings and contracts that the selected topology actually owns.
+        if request.pipeline_stage in ("receive", "unpack"):
             observation["processing"]["modules"] = []
         observation["processing"]["run_once"] = True
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
