@@ -1527,6 +1527,37 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertTrue(50000 <= first[1] < 60000)
         self.assertNotEqual(first[0], first[1])
 
+    def test_sender_source_ports_are_fixed_across_suite_repetitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            packet_dir = root / "config" / "packet_formats"
+            packet_dir.mkdir(parents=True)
+            (packet_dir / "frontend.example-v1.json").write_text(
+                json.dumps({"schema_version": 1, "format_id": "project-vdif-v1"})
+            )
+            plan = make_plan(1.0, 10.0)
+            source = plan.source
+            source["observation"]["observation_id"] = "fixed-suite"
+            resolved_plan = dict(plan.resolved_plan)
+            resolved_plan["source_json"] = json.dumps(source)
+            plan = dataclasses.replace(plan, resolved_plan=resolved_plan)
+
+            ports = []
+            for run_name in ("warmup-01", "measured-01", "measured-02"):
+                run_dir = root / "fixed-suite" / run_name
+                run_dir.mkdir(parents=True)
+                backend = MODULE.SshBackend(
+                    transport=RecordingTransport(),
+                    project_root=root,
+                    known_hosts=root / f"known-hosts-{run_name}",
+                )
+                backend.local_run_dir = run_dir
+                backend.remote_run_dir = f"/tmp/task8c-fixed-suite-{run_name}"
+                backend._write_bundle(plan, "2030-01-01-00:03:00")
+                ports.append(tuple(spec.source_port for spec in backend._sender_specs))
+
+        self.assertEqual(ports, [ports[0], ports[0], ports[0]])
+
     def test_qths_bundle_uses_exact_pid_files_and_no_wildcard_kill(self):
         plan = make_plan(1.0, 10.0)
         bundle = MODULE.build_qths_bundle(
@@ -2770,6 +2801,21 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(len(summary["runs"]), 1)
         self.assertEqual(summary["runs"][0]["role"], "warmup")
         self.assertEqual(summary["runs"][0]["CLEANUP_RESULT"], "PASS")
+
+    def test_repeated_runs_share_the_suite_observation_identity(self):
+        suite = pathlib.Path("/results/full-30Gbps-30s")
+        self.assertEqual(
+            MODULE.observation_id_for_run_directory(suite / "warmup-01"),
+            "full-30Gbps-30s",
+        )
+        self.assertEqual(
+            MODULE.observation_id_for_run_directory(suite / "measured-03"),
+            "full-30Gbps-30s",
+        )
+        self.assertEqual(
+            MODULE.observation_id_for_run_directory(suite / "diagnostic"),
+            "diagnostic",
+        )
 
     def test_acceptance_sequence_fails_when_any_run_cleanup_fails(self):
         class CleanupFailedBackend(FakeBackend):

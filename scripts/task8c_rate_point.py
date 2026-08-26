@@ -624,7 +624,9 @@ def compile_rate_plan(
                     module["weights_file"] = str(
                         (template_path.parent / weight).resolve()
                     )
-        observation["observation"]["observation_id"] = root.name
+        observation["observation"]["observation_id"] = (
+            observation_id_for_run_directory(root)
+        )
         if request.station_id is not None:
             configured_stations = observation["observation"]["station_ids"]
             if request.station_id not in configured_stations:
@@ -732,12 +734,28 @@ def compile_rate_plan(
     )
 
 
+def observation_id_for_run_directory(run_directory: pathlib.Path) -> str:
+    """Use one observation identity across warm-up/measured repetitions."""
+    path = pathlib.Path(run_directory)
+    if re.fullmatch(r"(?:warmup|measured)-[0-9]+", path.name):
+        return path.parent.name
+    return path.name
+
+
 def derive_sender_source_ports(run_identity: str) -> tuple[int, int]:
     if not run_identity:
         raise ValueError("run identity must not be empty")
     digest = hashlib.sha256(run_identity.encode("utf-8")).digest()
     offset = int.from_bytes(digest[:2], byteorder="big") % 10000
     return 40000 + offset, 50000 + offset
+
+
+def sender_source_identity(plan: RatePlan, run_identity: str) -> str:
+    """Keep sender endpoints stable for every repetition of one suite."""
+    observation_id = plan.source.get("observation", {}).get("observation_id")
+    if isinstance(observation_id, str) and observation_id:
+        return observation_id
+    return run_identity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1571,7 +1589,9 @@ class SshBackend:
         self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
         if self.known_hosts.exists():
             self.known_hosts.unlink()
-        self._sender_specs = sender_specs_for_plan(plan, identity)
+        self._sender_specs = sender_specs_for_plan(
+            plan, sender_source_identity(plan, identity)
+        )
         for host in ("qths1", *(spec.host for spec in self._sender_specs)):
             self._bootstrap_host(host)
         start = self._future_start_utc("PREPARE")
@@ -1586,7 +1606,10 @@ class SshBackend:
         qths_root = bundle_root / "qths"
         qths_root.mkdir(parents=True, exist_ok=True)
         try:
-            self._sender_specs = sender_specs_for_plan(plan, self.remote_run_dir)
+            self._sender_specs = sender_specs_for_plan(
+                plan,
+                sender_source_identity(plan, self.remote_run_dir),
+            )
         except ValueError as error:
             raise StageError(
                 "CONFIG_READY", ["validate", "station_ids"], 1,
