@@ -1,120 +1,144 @@
 # 项目模块状态
 
-更新日期：2026-08-12
-当前已验收基线：`872e734`（Observation/Resolved Plan、ATFP 转换和统一 GPU worker）
+更新日期：2026-08-27
+当前代码基线：`b3f8d64` 之后的未提交开发工作树（直接 raw-ring 接收、并行 ATFP unpack、统一 Observation/Resolved Plan 与 GPU worker）
 
-本文是项目当前实现状态的汇总入口。详细数据契约仍以 `doc/`、`config/` 和各模块
-README 为准；历史设计和执行记录保存在 `docs/superpowers/`，不作为当前状态判断依据。
+本文是项目当前实现、验收边界和后续顺序的统一入口。数据契约以 `doc/`、`config/`
+和各模块 README 为准；历史设计与执行记录保存在 `docs/superpowers/`。
 
 ## 状态口径
 
 | 状态 | 含义 |
 | --- | --- |
-| 已验收 | 功能、数值或接口已在目标 Linux/GPU 服务器按对应验收范围通过 |
-| 性能验收中 | 功能正确，但持续实时数据流吞吐和运行余量尚未确认 |
-| 已实现，待整链验收 | 模块级测试通过，尚未在目标进程/ring 拓扑中完成最终验收 |
-| 暂缓 | 已有实现或修改，但当前阶段不继续开发或不纳入提交 |
-| 待开发 | 只有目录、README、设计或计划，尚无可运行产品实现 |
+| 已验收 | 对应范围已在目标 Linux/RTX 3090 服务器通过功能、数值或接口验收 |
+| 性能验收中 | 功能正确，但持续吞吐、重复性或运行余量尚未达到正式门禁 |
+| 已实现，待整链验收 | 模块级测试通过，尚未在目标进程/ring 拓扑完成最终验收 |
+| 暂缓 | 已有实现，但当前阶段不继续优化 |
+| 待开发 | 只有职责、设计或目录，尚无完整产品实现 |
 
-“已验收”不自动代表满足实时观测速率。实时能力必须单独证明持续吞吐、ring 占用、
-背压、丢包、CPU/NUMA/GPU 利用率和运行余量。
+“已验收”不等于满足实时观测速率。实时能力还必须证明持续吞吐、ring 占用、背压、
+丢包、CPU/NUMA/GPU 利用率和安全余量。
 
-## 当前端到端数据流
+## 当前数据流与进程边界
 
 ```text
 多 Station UDP/Project VDIF
-  -> rdma2dada
-  -> raw PSRDADA ring（32-byte header + TFP payload）
-  -> vdif_unpack_worker
-  -> compute PSRDADA ring（payload-only ATFP/CI8）
+  -> rdma2dada（1 QP/CQ/线程，NSGE=2，直接写 raw-ring record slot）
+  -> raw PSRDADA ring（32-byte VDIF header + TFP payload）
+  -> vdif_unpack_worker（协调线程 + parser worker pool + 单 writer）
+  -> compute PSRDADA ring（payload-only、block-scoped ATFP/CI8）
   -> pipeline_worker
        H2D -> ComplexConvert(ATFP/CI8 -> TFPA/CF32)
        -> Beamform -> [Power | Stokes] -> [TimeIntegrate] -> D2H
   -> output PSRDADA ring
-  -> dada_dbnull / dada_dbdisk（测试或落盘）
+  -> dada_dbnull / dada_dbdisk
   -> dada2rdma（待开发）
 ```
 
-当前固定使用一个 compute ring 和一个 output ring。GPU 算法模块在同一
-`pipeline_worker` 进程内组合，中间 GPU buffer 不设置 PSRDADA ring 边界。
+当前固定为一个 compute ring 和一个 output ring。GPU 算法在同一个 `pipeline_worker`
+进程中组合，中间 GPU buffer 不设置 PSRDADA ring 边界。
 
-## 配置、数据契约和基础设施
+## 配置与数据契约
 
-| 组件 | 当前状态 | 已具备能力 | 未完成事项 |
+| 组件 | 状态 | 已完成 | 后续 |
 | --- | --- | --- | --- |
-| Observation JSON | 已验收 | 单一用户配置入口；显式 conversion scale；ring、Station、packet、算法链和积分参数 | 后续按观测需求扩展更多输出格式和转换模式 |
-| Resolved Observation Plan | 已验收 | 严格解析、checked geometry、CONFIG_ID/GEOMETRY_ID、单一跨进程运行契约 | 与未来 `pipelinectl` 的完整生命周期编排集成 |
-| Observation compiler | 已验收 | 生成 resolved plan、ring plan、validation report、RAW/UNPACKED/CONVERTED/BEAMFORMED/output 4096-byte headers 和 SHA256 manifest | 无当前阻断项 |
-| Project VDIF v1 | 已验收 | 固定 32-byte/8-word header；Station ID、首通道、NCHAN、NPOL；TFP/IQ/TWOS_COMPLEMENT payload | 实际 FPGA 到位后的兼容性回归 |
-| DADA header codec | 已验收 | transfer header 传播、阶段 header 编译、标准 `HDR_SIZE=4096` 互操作 | 新增模块时补充对应 header transform |
-| PSRDADA ring adapter | 已验收于现有入口 | header/data block、EOD、capacity 和 reader/writer 生命周期 | 持续观测和异常恢复需随整链继续验证 |
+| Observation JSON | 已验收 | 单一用户配置入口；显式 conversion scale；Station、packet、ring、算法链和积分参数 | 按观测需求扩展更多输入/输出格式 |
+| Resolved Observation Plan | 已验收 | 严格解析、checked geometry、CONFIG_ID/GEOMETRY_ID、跨进程统一契约 | 接入未来 `pipelinectl` 生命周期编排 |
+| Observation compiler | 已验收 | 生成 resolved/ring plan、validation report、各 stage 的 4096-byte DADA header 和 SHA256 manifest | 新 stage 随契约扩展 |
+| Project VDIF v1 | 已验收 | 固定 32-byte header；Station ID、首通道、NCHAN、NPOL；TFP/IQ/TWOS_COMPLEMENT payload | FPGA 到位后做 wire 兼容性回归 |
+| DADA header/ring adapter | 已验收于现有入口 | header 传播、HDR_SIZE 互操作、block/EOD/capacity 生命周期 | 长时间连续观测和异常恢复验收 |
 
 ## 应用状态
 
-| 应用 | 当前状态 | 已完成 | 下一步 |
+| 应用 | 状态 | 当前能力 | 下一步 |
 | --- | --- | --- | --- |
-| `fpga_sender_sim` | 已验收 | 多服务器分别模拟 Station；Project VDIF；source port；`sendmmsg`；定速发送和错误注入基础能力 | 配合 ATFP 整链完成目标 payload 速率阶梯和低错误率测试 |
-| `rdma2dada` | 已验收，整链性能待确认 | 只匹配接收端 MAC/IP/port；CQ 校验/repost；partial raw block；accepted=published/EOD；Resolved Plan 入口；在 unpack-only 链中已单次精确闭合 10 Gbps | 单独测定 receiver 的最高稳定速率；补充发布等待和 CQ 服务率，定位 15 Gbps deficit |
-| `vdif_unpack_worker` | 性能验收中 | 独立 raw→compute 进程；Station→A；时间对齐；缺失补零；payload-only block-scoped ATFP；partial/EOD；严格 plan/header/capacity 门禁；单次 10 Gbps/30 s 精确闭合 | 对 10 Gbps 执行 warm-up+3 正式重复验收；继续区分 15 Gbps receiver deficit 与 unpack 间接背压 |
-| `pipeline_worker` | 已验收，整链性能待确认 | 单 compute ring→单 output ring；Resolved Plan；H2D→转换→Beamform→Power/Stokes→积分→D2H；header/EOD/capacity 门禁 | 完成与 ingest/unpack 同时运行的吞吐、占用和跨 block overlap 评估 |
-| `dada2rdma` | 待开发 | 已有目录和职责说明 | 定义 processed data packetization、header 更新、UDP/RDMA 输出和验收方式 |
-| `pipelinectl` | 待开发 | 已有职责边界：不包含算法 | 实现配置编译、拓扑/reader count 校验、ring 创建、进程启动顺序、健康监控、停止和定向清理 |
+| `fpga_sender_sim` | 已验收 | 多服务器模拟 Station；Project VDIF；source port；`sendmmsg`；定速及错误注入 | 用于重复速率和异常观测验收 |
+| `rdma2dada` | 阶段性能按满足 | destination-only flow；1 QP/CQ/线程；NSGE=2 直接写 raw ring；用户决定暂以 30 Gbps payload 进入下一阶段 | 正式 warm-up+3 与少量 admission deficit 复核延期，不删除原始证据 |
+| `vdif_unpack_worker` | 阶段性能按满足 | coordinator + 固定 parser worker pool + 单 compute writer；有界队列和 window lease/ACK；Station→A、补零、partial/EOD；用户决定暂以 30 Gbps payload 进入下一阶段 | 正式重复门禁延期；完整 GPU 链不得复用 unpack-only 结论 |
+| `pipeline_worker` | 功能及低速整链已验收，整链性能待确认 | 单 compute ring→单 output ring；Resolved Plan；H2D→转换→Beamform→Power/Stokes→可选积分→D2H；编译期 GPU budget | 按预算执行完整数据流持续速率验收 |
+| 分阶段测试控制器 | 分区 NUMA 开发完成，服务器待验收 | 同一 resolved plan 下支持 `receive`、`unpack`、`gpu`、`full`；`ingress_numa_node` 控制 raw ring/receiver，`processing_numa_node` 控制 unpack、compute/output ring、GPU worker 和 sink；保留单 `numa_node` 兼容路径 | 在 qths1 对当前全 NUMA1 基线与 ingress=1/processing=0 做严格匹配比较 |
+| 测试结果 Catalog | 已完成服务器验收 | 原子导入 compact suite；确定性 JSON/CSV；按拓扑/速率/结果/日期/profile 查询；显式证据提升；测试任务只回传开发任务 | 开发任务维护汇总表；“总结成文”在更新论文时按需查询 |
+| `dada2rdma` | 待开发 | 已定义职责边界 | 完成整链验收后设计 processed packetization 与发送路径 |
+| `pipelinectl` | 待开发 | 已定义为配置编译、ring/进程生命周期和监控入口，不包含算法 | registry 与整链契约稳定后实现 |
 
-`dada_dbdisk` 和 `dada_dbnull` 是外部 PSRDADA consumer，不属于本项目算法模块。
-性能测试默认使用 `dada_dbnull -s -z`，只有需要检查落盘内容时使用 `dada_dbdisk`。
+`dada_dbnull -s -z` 用于性能 drain；只有需要检查 `.dada` 内容时才使用
+`dada_dbdisk`。二者是外部 PSRDADA consumer，不属于项目算法模块。
 
 ## 算法模块状态
 
-| 模块 | 输入 → 输出 | 当前状态 | 备注 |
+| 模块 | 输入 → 输出 | 状态 | 备注 |
 | --- | --- | --- | --- |
-| `vdif_unpack` | raw Project VDIF/TFP → payload-only ATFP/CI8 | 功能已验收，性能验收中 | CPU 进程模块；当前重点是避免小粒度复制并验证持续吞吐 |
-| `host_to_device` | host bytes → device bytes | 已验收 | 异步 CUDA copy，不拥有 buffer；由 worker stream 调用 |
-| `complex_convert` | ATFP CI8/CI16 → TFPA CF32 | 已验收 | CPU reference + CUDA fused transpose/convert/scale；第一版 worker 输入为 CI8 |
-| `beamform` | TFPA CF32 + FPAB complex weights → TFPB CF32 | 已验收 | CPU reference；CUDA FP32/TF32；NPY 权重；A→B |
+| `vdif_unpack` | raw VDIF/TFP → payload-only ATFP/CI8 | 功能已验收，性能验收中 | CPU 并行解析、单 writer 保序发布 |
+| `host_to_device` | host bytes → device bytes | 已验收 | 异步 CUDA copy，由 worker stream 调用 |
+| `complex_convert` | ATFP CI8/CI16 → TFPA CF32 | 已验收 | CUDA fused transpose/convert/scale；worker 第一版输入 CI8 |
+| `beamform` | TFPA CF32 + FPAB weights → TFPB CF32 | 已验收 | CPU oracle；CUDA FP32/TF32；NPY 权重；A→B |
 | `power` | TFPB CF32 → TFPB F32 | 已验收 | 实部平方加虚部平方；CPU/CUDA |
-| `stokes` | TFPB CF32, P=2 → TFBS F32 | 已验收 | `AA, BB, AB_REAL, AB_IMAG`；CPU/CUDA |
-| `time_integrate` | TFPB/TFBS F32 → 缩短 T 的同布局 F32 | 已验收；优化暂缓 | SUM/MEAN；单 block 输入/输出；已有 CPU/CUDA 实现。当前未提交的 benchmark/优化不纳入基线 |
-| `device_to_host` | device bytes → host bytes | 已验收 | 异步 CUDA copy，不拥有 buffer；由 worker stream 调用 |
-| 通用 module registry | 配置模块列表 → 兼容链 | 待开发 | 指 GPU/CPU 算法模块的注册、构造、顺序和契约检查；当前 worker 使用固定合法链 |
+| `stokes` | TFPB CF32, P=2 → TFBS F32 | 已验收 | AA、BB、AB_REAL、AB_IMAG；CPU/CUDA |
+| `time_integrate` | TFPB/TFBS F32 → 缩短 T 的 F32 | 已验收；优化暂缓 | SUM/MEAN；block-local；性能优化待整链证据驱动 |
+| `device_to_host` | device bytes → host bytes | 已验收 | 异步 CUDA copy，由 worker stream 调用 |
+| 通用 module registry | 配置模块列表 → 兼容链 | 待开发 | 当前 worker 使用固定合法链；registry 在整链基线后开发 |
 
-算法模块的“已验收”主要指 reference/CUDA 数值、边界和 worker 组合测试通过；除当前
-ATFP campaign 外，尚未为每个模块给出整链目标速率下的独立 service-time 预算。
-
-## 测试和性能状态
+## 测试与性能边界
 
 | 验收范围 | 状态 | 结论 |
 | --- | --- | --- |
-| macOS portable 配置、header、CPU reference | 已通过 | 用于开发回归，不替代服务器验收 |
-| RTX 3090 CUDA 单模块 correctness | 已通过 | H2D/D2H、ComplexConvert、Beamform、Power、Stokes、TimeIntegrate |
-| GPU worker 数值组合 | 已通过 | Beamform-only、Beamform+Power、Beamform+Stokes，以及 Power/Stokes 后积分 |
-| Resolved Plan + PSRDADA + CUDA worker integration | 已通过 | 三次 clean repetition；动态 ring key；header/geometry/EOD/cleanup 门禁 |
-| ATFP unpack 功能与 ring integration | 已通过 | full/partial/双 transfer、零填充、ATFP 字节、header/EOD |
-| 旧 TFPA unpack 速率路径 | 不满足需求，已停止 | Release 版本 1 Gbps 通过、2 Gbps 首点失败；该结论促成 ATFP 重设计 |
-| 新 ATFP unpack-only 速率测试 | 性能验收中 | 10 Gbps/30 s 单次精确闭合：sender、receiver、unpack 计数一致且错误为 0；不含 GPU worker，且尚未完成 warm-up+3 |
-| 新 ATFP 15 Gbps 诊断 | 未通过 | sender 完整发送，receiver/published 少 254,672 包（约 1.87%）；unpack 完整处理 receiver 交付的全部包，无 window pressure；当前不能归因 unpack 算力 |
-| 新 ATFP 完整 GPU pipeline 速率阶梯 | 待执行 | 需覆盖 output ring、H2D、GPU 算法和 D2H；完成前不声明整条 pipeline 的实时能力 |
-| 低错误率测试 | 待执行 | 目标错误率 0.001%–0.1%，在极限稳定速率附近验证统计与连续运行行为 |
-| 长时间连续观测 | 待执行 | 验证多 transfer、Station 参与、EOD/重启策略、ring 稳态和无资源泄漏 |
+| macOS portable 与 CPU reference | 已通过 | 开发回归，不替代服务器验收 |
+| RTX 3090 CUDA 单模块与组合数值 | 已通过 | Convert、Beamform、Power、Stokes、TimeIntegrate、H2D/D2H |
+| Resolved Plan + PSRDADA + CUDA worker integration | 已通过 | 三次 clean repetition；header/geometry/EOD/cleanup 通过 |
+| ATFP unpack 功能与 ring integration | 已通过 | full/partial/连续 transfer、补零、ATFP bytes、header/EOD |
+| 旧串行/TFPA 路径 | 已淘汰 | 实时性不足，已由 ATFP + 并行 unpack + direct receive 替代 |
+| 30 Gbps unpack-only，30/60 s | 单次探索通过 | sender、receiver、unpack、dbnull 在成功 run 中精确闭合；不含 GPU worker |
+| 30 Gbps 重复性能门禁 | 延期 | 两个 repeat suite 分别出现 251/700 包的 receiver/NIC admission 缺口；用户决定当前阶段按满足推进，但未将其升级为正式稳定速率 |
+| Receiver 停止排空 | 本地开发完成，服务器待验收 | 由 4096 次空 CQ 轮询改为固定 1 秒 drain；期间继续处理 completion、发布 raw block 和重投递 WR，仅保留三个退出汇总指标 |
+| 35 Gbps unpack-only，60 s | 未通过 | receiver 接收量约为计划的一半；尚未证明 unpack 是首个饱和阶段 |
+| 完整 GPU pipeline 预算 | 已通过服务器验收 | 编译器报告双速率来源、20% deadline、逐级/合计传输和显存；RTX 3090 Release/CUDA 回归 3/3，30 Gbps 当前 deadline 11.184810 ms；不代表实时速率通过 |
+| GPU-only 正确性 | 旧单-block 路径已通过；新压力路径待验收 | 旧证据覆盖 compute ring→CUDA worker→output ring→dbnull 生命周期；新 `dada_junkdb` 路径按任意目标速率向上取整为整 block/秒，并要求逐 block 输入/输出计数闭合 |
+| GPU-only 持续压力 | 本地开发完成，服务器待验收 | `dada_junkdb`→compute ring→GPU worker→output ring→dbnull；保存实际注入速率、worker service/output wait、CUDA H2D/算法/D2H 和进程账本。HF 恢复后按 passing profile 做 warm-up+3；未验收前无稳定速率结论 |
+| 生产几何 GPU 压力 | 配置/验收规划中 | sender 暂不扩展；GPU-only 使用 `A≈500,F=4,P=1,B≈350` 的 ATFP header、block 和 FPAB 权重，约 30 Gbps 基线另测 `A=500` 的 32 Gbps 点。该测试先证明单 GPU 的真实矩阵、传输和显存能力，不宣称 500-Station 网络整链通过 |
+| 低速完整 GPU pipeline | 已通过服务器验收 | 0.1 Gbps，1 warm-up + 3 measured；双 Station sender、receiver、unpack、GPU、output header/EOD 和 cleanup 每轮精确闭合 |
+| 500-Station 完整 GPU pipeline | 待输入能力 | 必须由多 Station sender 或合法 raw-VDIF generator 提供约 500 个 Station，覆盖 Station-ID→A、unpack、GPU 和 output；不能用双 Station 结果替代 |
+| 低错误率/长时间连续观测 | 待执行 | 错误率目标 0.001%–0.1%；还需 Station 失败、资源恢复和稳态验证 |
+| 论文第3章模块证据闭环 | 规划完成，待执行 | 已审计可复用测试和缺口；需模块 suite 三次 clean、receive/unpack 正式基线、unpack 指标补齐及 1/2/4 worker 匹配比较。HF 恢复前不运行远程测试 |
 
-## 后续开发顺序
+因此当前最准确的表述是：**30 Gbps 是 receive/unpack 阶段用于后续开发的临时 payload
+基线，并有 unpack-only 单次精确闭合证据；正式可重复门禁已延期，不等同于完整 GPU
+pipeline 的稳定速率。**
+详细证据与边界见 [`VDIF_UNPACK_STATUS.md`](VDIF_UNPACK_STATUS.md)。
 
-1. 对 10 Gbps unpack-only 点执行 warm-up+3 重复验收，并用 receiver/CQ/worker
-   service-time 证据定位 15 Gbps 的首个饱和阶段。
-2. 将速率测试扩展到包含 output ring 和 GPU worker 的完整 pipeline，确定最高稳定
-   payload 速率和安全余量。
-3. 若性能门禁通过，提交并推送当前 unpack/controller 改动；若未通过，先针对证据中的
-   饱和阶段优化并重复验收。
-4. 开发通用 module registry，使算法组合从固定分支迁移为受契约约束的配置组合。
-5. 开发 `pipelinectl`，统一管理 artifact、ring、进程、监控、失败中止和清理。
-6. 运行完整持续观测数据流验收，包括正确包、低错误率、Station 启动失败和长时间运行。
-7. 开发 `dada2rdma` 及后续输出链路。
+## 下一阶段顺序
 
-## 当前明确限制
+1. 生成并校验 `A≈500,F=4,P=1,B≈350` Observation、block geometry 和 FPAB 权重。
+2. 先比较全 NUMA1 与 ingress=1/processing=0，确认 compute ring 本地化对 H2D 和 unpack 的净收益。
+3. NUMA 对照通过后，再根据 H2D/GPU/D2H/output-wait 证据实现并比较多 stream/inflight block 模式。
+4. GPU 可行后再决定开发多 Station sender，或先用合法 raw-VDIF generator 验证 unpack+GPU。
+5. 具备约 500 Station 输入后执行 `full` 重复门禁；随后开发 registry、`pipelinectl` 和 `dada2rdma`。
+6. 在正式发布 ingest/unpack 性能结论前，恢复延期的 30 Gbps receive/unpack 重复门禁。
 
-- 当前 GPU worker 每个 transfer 使用一条 non-blocking stream，但在提交每个 output block
-  前同步；尚无双 buffer/event 的跨 block H2D/计算/D2H overlap。
-- 当前 worker 只接受 block-scoped `ATFP/CI8` 输入，输出格式第一版由产品自动确定：
-  Beamformed 为 CF32，Power/Stokes/Integration 为 F32。
-- Power 与 Stokes 为互斥分支；Stokes 只允许 `NPOL=2`；Beamformed 不直接积分。
-- ring 增大只能吸收突发，不能替代稳态处理速率不足的修复。
+具体可执行任务见
+[`docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md`](superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md)。
+论文第3章模块级证据与优化比较使用独立计划
+[`docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md`](superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md)；
+该计划不把第4章完整链路、多 GPU/多节点或端到端 headroom 纳入第3章门禁。
+
+## 当前限制
+
+- 30 Gbps 证据只覆盖 `rdma2dada -> raw ring -> vdif_unpack_worker -> compute ring -> dbnull`。
+- 当前 sender/controller 网络 fixture 只覆盖两个 Station；它能测试 aggregate payload 吞吐，
+  不能验证约 500 个 Station 的 A 轴映射。GPU-only 可使用 A≈500 的合成 compute blocks，
+  但这不是同一条完整链。
+- GPU worker 每个 transfer 使用一条 non-blocking stream，但提交 output block 前仍同步；
+  尚无跨 block 双 buffer/event overlap。
+- 控制器已能把 NIC/raw/receiver 留在 NUMA1，并从 unpack 开始将 compute/output/GPU 路径
+  放到 NUMA0；该能力尚需服务器 A/B 验收，不能提前声称 H2D 已改善。
+- 当前 30 Gbps 小几何链为 Beamform → Power → Integrate(K=128, MEAN)：compute/output
+  block 为 52,428,800/819,200 B，输入 `T=6,553,600` 可被 128 整除，输出 `T=51,200`；
+  到达间隔 13.981013 ms，20% 余量后的整链 deadline 为 11.184810 ms；H2D+D2H 合计
+  53,248,000 B/block，最低合计速率 4,760,742,472 B/s。1 Gbps full-chain 已精确闭合；
+  30 Gbps 单次诊断平均 service 为 16.243 ms，其中 H2D/算法/D2H 为
+  12.077/3.873/0.260 ms，output wait 可忽略。输出压缩有效，但当前单 stream 路径未达到
+  30 Gbps 稳态要求；同时 receiver 仅发布计划包数的约 19.12%，完整链路性能未通过。
+- worker 只接受 block-scoped `ATFP/CI8`；第一版输出格式自动确定：Beamformed 为 CF32，
+  Power/Stokes/Integration 为 F32。
+- Power 与 Stokes 互斥；Stokes 只允许 `NPOL=2`；Beamformed 不直接积分。
+- 增大 ring 只能吸收突发，不能修复稳态服务率不足。
 - `DumpToDada()` 是旧实现，不作为 pipeline sink。

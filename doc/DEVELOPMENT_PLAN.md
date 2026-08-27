@@ -1,167 +1,197 @@
 # Pipeline development plan
 
-本文档记录 `pipeline-architecture` 阶段之后的实施顺序和验收标准。后续开发按里程碑
-推进；除非观测需求发生变化，不跨过当前里程碑直接进入后续性能优化。
+更新日期：2026-08-27
 
-算法的轴顺序、数值定义和 header 字段仍以
-[`ALGORITHM_MODULE_CONTRACTS.md`](ALGORITHM_MODULE_CONTRACTS.md) 为准；本文件负责
-记录开发顺序和质量门禁。
+本文记录当前里程碑、进入条件和开发顺序。模块轴、数值及 header 契约以
+[`ALGORITHM_MODULE_CONTRACTS.md`](ALGORITHM_MODULE_CONTRACTS.md) 为准；实时性能要求和
+服务器验收规则以 [`../docs/agents/testing.md`](../docs/agents/testing.md) 为准。
 
 ## 当前基线
 
-截至当前分支，已经具备：
+已经实现并完成对应服务器功能/数值验收：
 
-- JSON 配置、DADA ASCII header、block view 和模块接口；
-- Beamform、Power、Stokes 的 CPU reference backend；
-- Beamform、Power、Stokes 的 CUDA backend 源码；
-- Complex Convert 的 CI8/CI16 CPU reference 和异步 CUDA backend；
-- Time Integration 的 CPU reference 和 CUDA backend 源码，支持 SUM/MEAN、TFPB/TFBS；
-- 无 buffer 所有权的 H2D/D2H CUDA 传输模块；
-- 双 host ring `pipeline_worker`，支持 Beamform、Beamform→Power、
-  Beamform→Stokes 三条固定链，并可在 Power/Stokes 后追加积分；
-- macOS portable CTest，以及 CUDA 算法和 H2D→D2H round-trip 测试源码。
+- Observation JSON、Resolved Observation Plan、artifact compiler 和 stage DADA headers；
+- 固定 32-byte Project VDIF v1 与 Station→A/TFP wire contract；
+- NSGE=2 直接写 raw ring 的 `rdma2dada`；
+- coordinator + parser worker pool + sole writer 的并行 ATFP unpack；
+- fused ATFP/CI8→TFPA/CF32 conversion 与显式 scale；
+- H2D/D2H、Beamform、Power、Stokes、Time Integration 的 CPU/CUDA 实现；
+- 单 compute ring→单 output ring 的 Resolved-Plan-driven `pipeline_worker`；
+- module/CUDA 数值、PSRDADA 生命周期、header/geometry/EOD 的重复集成测试。
+- 四阶段版本化控制器，以及 GPU-only 3/3 与 0.1 Gbps full-stage
+  1 warm-up + 3 measured 的服务器正确性验收。
 
-Beamform FP32/TF32、Power、Stokes、Time Integration、Complex Convert 和 H2D/D2H
-的独立 CUDA correctness test 已在目标服务器通过。完整的
-H2D→Beamform→Power→TimeIntegrate→D2H CUDA worker 组合链也已通过。PSRDADA 双 ring、
-RDMA 数据面和性能仍需要在目标 Linux/RTX 3090 服务器验证。
+性能边界仍不完整：用户决定 receive/unpack 暂以 30 Gbps payload 按满足推进；这有
+unpack-only 单次精确闭合证据，但重复门禁仍有少量 receiver/NIC admission deficit。
+完整 GPU pipeline 尚未运行速率验收。
 
-## 每个模块的输入输出门禁
+## 所有模块的输入输出门禁
 
-任何新模块或已有模块修改，在合入前必须同时满足以下条件。不能只验证 kernel 数值而
-忽略 header 或 block 几何。
+任何新模块或行为修改必须同时满足：
 
-1. **输入契约明确**：列出 `DATA_STAGE`、`ORDER`、`SAMPLE_FORMAT`、`MEMORY`、维度字段、
-   必填观测字段和允许的 backend。
-2. **输出契约明确**：列出修改、保留和删除的 header 字段，不能无说明地丢弃未知观测
-   metadata。
-3. **轴和 shape 明确**：使用 `T/F/P/A/B/S` 记号给出输入、输出 shape 和线性 order；
-   模块必须检查相邻模块是否兼容。
-4. **数值表示明确**：给出 component/sample 位宽、实数或复数、量化 scale、累计精度和
-   输出 dtype，不能从指针类型隐式推断。
-5. **几何公式唯一**：定义 input/output frame bytes、`RESOLUTION`、block bytes 和中间
-   buffer bytes；所有乘法检查溢出，所有缩放检查整除。
-6. **时间和速率一致**：修改采样数或积分长度时，同步更新 `TSAMP`、
-   `BYTES_PER_SECOND`、`TRANSFER_SIZE`、`FILE_SIZE` 和 `OBS_OFFSET`；无法精确表示时
-   拒绝配置。
-7. **一 block 输入一 block 输出**：第一版模块不得静默丢弃、补齐或缓存跨 block 尾部；
-   输出大小变化必须能在处理前由 header 和配置计算。
-8. **配置/header 交叉校验**：header 表示上游实际数据，JSON 表示本进程配置；同一参数
-   同时出现时必须一致，否则在发布 output header 前终止 transfer。
-9. **独立数值 oracle**：先提供小尺寸 CPU reference 或手算结果，再验证 CUDA；不能只用
-   同一实现生成 expected data。
-10. **错误路径有测试**：至少覆盖缺字段、错误 order/dtype/shape、block 不整除、容量不足、
-    backend/device/stream 不匹配和溢出。
+1. 明确输入和输出的 `DATA_STAGE`、`ORDER`、`SAMPLE_FORMAT`、`MEMORY`、shape 和 backend；
+2. 明确保留、修改和删除的 header 字段，不无说明地丢失 observation metadata；
+3. 给出唯一 checked geometry：frame/block/ring/intermediate bytes，拒绝溢出或不整除；
+4. 给出数值类型、scale、累计精度、误差和独立 CPU/手算 oracle；
+5. 配置与 header 重复字段必须一致，否则在创建资源或发布 output header 前失败；
+6. 覆盖错误 order/dtype/shape、容量不足、非法顺序、partial/EOD 和资源清理；
+7. 记录目标 payload rate、packet rate、block deadline、运行时长和安全余量；
+8. 在真实进程/ring 边界测量 service time、占用、等待和首个饱和阶段；isolated kernel
+   correctness 或增大 ring 不能替代实时验收。
 
-## 配置参数扩展规则
+新增 JSON 参数时，必须同步 schema/parser、example/compiler、resolved plan、header
+transform、检查工具和边界测试；可推导值不重复配置。
 
-后续可以按观测需求增加 JSON 参数，但必须完成以下同步修改：
+## Milestone 1：ingest/unpack 稳态门禁（阶段性延期）
 
-1. 确认参数属于 input header、worker JSON，还是可由二者推导；可推导值不重复配置。
-2. 在配置结构体、严格 JSON parser、示例 JSON 和配置检查工具中同时加入。
-3. 定义单位、范围、默认策略、是否允许运行中改变，以及改变后影响的 header 字段和
-   block 几何。
-4. 添加合法值、缺失值、边界值、错误类型、未知字段和溢出测试。
-5. 如果改变现有字段语义或必填性，提升 `schema_version`；只增加明确可选且有兼容默认值
-   的字段时才保持当前版本。
-6. 更新模块契约、应用 README 和服务器运行示例，避免代码、配置与文档出现三套定义。
+目标：把直接接收与并行 unpack 从单次探索结果提升为可重复的 30 Gbps 稳态证据。
 
-## Milestone 1：目标服务器基线验证
+- receive-only：30 Gbps，1 warm-up + 3 measured，每次 60 s；
+- unpack-only：相同重复方式和持续时间；
+- 记录 NIC delta、CQ/poll/repost、accepted/published、ring occupancy、线程 affinity、
+  parse/copy/writer service time 和完整计数闭合；
+- 若 receive-only 失败，先处理 receiver/NIC admission；不通过增加 unpack window 掩盖；
+- 若 receive-only 通过而 unpack-only 失败，才根据 worker/writer service time 优化 unpack。
 
-目标：在开发新算法前，确认当前 CUDA、PSRDADA 和 RDMA 基线可靠。
+完成标准：每次 measured 都精确闭合、clean EOD/cleanup，无持续 ring full，且所有
+machine-readable artifacts 可由版本化 runner 重现。
 
-- 使用 CUDA 12.8、RTX 3090（compute capability 8.6）编译全部 CUDA targets；
-- 运行 Beamform FP32/TF32、Power、Stokes、H2D→D2H 测试；
-- 比较 CUDA 和 CPU reference 的数值与允许误差；
-- 创建两个测试 ring，分别验证 CPU 和 CUDA `pipeline_worker`；
-- 检查 input/output header、block size、sequence、EOD 和多 transfer 生命周期；
-- 验证 `rdma2dada` 的 CQ completion、flow steering、丢包/error 和持续运行；
-- 记录吞吐、单 block 延迟、显存占用和 host copy 开销。
+2026-08-20 决策：为推进整链开发，当前暂按 30 Gbps receive/unpack 满足处理；上述正式
+完成标准没有降低，后续发布稳定速率结论前仍需补做。
 
-完成标准：CUDA CTest 全部通过，双 ring worker 能稳定处理已知数据，RDMA ingest 没有
-未处理 CQ 错误或 block 生命周期错误。
+## 论文第3章模块验证闭环（待执行）
 
-## Milestone 2：VDIF 解包和整数复数转换
+论文第3章只覆盖模块级功能、数值、性能和匹配优化比较；完整
+`rdma2dada -> unpack -> GPU worker -> output` 持续性能、多 GPU/多节点扩展和端到端
+headroom 属于第4章，不作为第3章门禁。
 
-目标：将当前 worker 的输入边界从 `CONVERTED/TFPA/CF32` 前移到 raw packet ring。
+第3章待完成事项：
 
-状态：CI8/CI16 的 CPU reference、CUDA backend、header/frame 几何和独立测试已完成；
-独立 packet-format v1 JSON Schema、严格 C++ parser/validator、示例 profile 和 inspect
-工具已完成。Project VDIF v1 已固定为 32-byte/8-word little-endian header、TFP
-Two's-Complement IQ payload，并定义 Station ID→A 映射。binary decoder、丢包策略、
-packet-group 状态机、TFPA scatter、PSRDADA unpack worker 和低速双 Station 真实
-RDMA→unpack 基线已经完成。高速 UDP sender 正在增加显式 source port、等速 pacing、
-buffer 复用和 Linux `sendmmsg()`；CI8→CF32 的 worker 前段串联仍待实现。
+1. 将配置/VDIF、receive、parallel unpack 和 GPU 算法/传输测试收口为三次连续 clean、
+   带 SHA256 身份和紧凑 JSON 的模块 suite；
+2. HF 恢复后先只读审计历史结果根目录，可验证则复用，缺失身份、重复次数或 manifest
+   时按当前契约重跑，不从对话摘要重造证据；
+3. 补充 unpack parse/copy/raw-block critical-path service time、进程 CPU/NUMA、ring pressure、
+   writer wait/HWM 等结构化指标；
+4. 先完成 receive admission 正式门禁，再执行 unpack 的 warm-up + 3 measured；30 Gbps
+   若不能重复通过，则保留为未通过探索点，并建立一个较低的可重复正式基线；
+5. 在同一正式基线下仅改变 parse/copy worker 数量，比较 1/2/4 workers。该结果只称为
+   worker-count scaling，不冒充 serial/reference speedup；
+6. 论文总结只读取 suite 的 `preflight.json`、`summary.json` 和 `runs/*.json`，每个结论
+   绑定精确路径；`evidence.log` 仅作原始行审计，失败才查看 `debug/`。
 
-- 使用 FPGA binary golden records 验证已固化的 header 和 payload contract；
-- 实现 32-byte Project VDIF header 校验、序号检查、Station-ID 聚合、去头和 TFPA 重排；
-- 定义丢包、乱序、重复包和跨 block 包组处理规则；
-- 实现 `CI8/CI16/... → CF32` CUDA conversion，scale 从配置加载；
-- 验证 `F×A×P×T`、UDP payload 和所有阵元分组关系；
-- 为每种支持位宽提供 CPU oracle、CUDA 数值测试和 header transform 测试。
+Stokes 的论文与工程门禁固定为 `AA`、`BB`、`AB_REAL`、`AB_IMAG` 四个相关产物；当前
+不实现、不测试也不讨论 I/Q/U/V 的物理输出或推导。
 
-完成标准：raw 测试记录经过解包和转换后，与独立构造的 TFPA/CF32 expected block 完全
-一致或满足定义的数值误差。
+详细执行计划见
+[`../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md`](../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md)。
+HF 恢复前不启动或安排任何远程测试。
 
-## Milestone 3：时间积分模块
+## Milestone 2：完整 GPU pipeline 验收（当前）
 
-目标：在 Power 或 Stokes 之后提供独立、可配置的 block-local integration。
+目标：验证真实边界 `UDP -> raw -> unpack -> compute -> GPU worker -> output -> dbnull`。
 
-状态：CPU reference、CUDA kernel、schema v2、worker 串联、header/block 几何和便携
-测试已完成，独立 CUDA integration test 已通过；完整 CUDA worker 组合链及真实双 ring
-生命周期仍待目标服务器验证。
+执行前先从 Resolved Plan 计算：
 
-- 支持 `sum` 和 `mean`；
-- 定义 `INTEGRATION_LENGTH`、累计 dtype 和溢出策略；
-- 输入一个 block，输出一个缩短 T 维的 block；
-- 要求 input T 可被 integration length 整除；
-- 正确更新 `TSAMP`、`BYTES_PER_SECOND`、`RESOLUTION`、block/file/offset 字段；
-- 实现 CPU reference、CUDA backend 和边界测试。
+- 每秒 raw/compute/output bytes 和 packet rate；
+- raw/compute/output block arrival deadline；
+- ATFP→CF32 扩张、beam count、Power/Stokes 和积分对输出几何的影响；
+- 每 block H2D/kernel/D2H 预算、显存峰值和必要安全余量。
 
-完成标准：Power 和 Stokes 两条链均可追加积分，数值、shape、header 和输出 ring block
-大小全部由测试覆盖。
+预算编译已实现：默认使用 Observation 速率，性能 runner 显式覆盖目标 payload 速率并
+保留双速率来源；第一版使用 20% deadline/显存余量。现有小几何 30 Gbps 使用
+Beamform → Power → Integrate(K=128, MEAN)，整链 deadline 为 11.184810 ms；每 block 的
+时间采样由 6,553,600 降到 51,200，最终 output block 为 819,200 B，计划/建议空闲显存为
+577,536,064/693,043,277 B。RTX 3090 fresh Release 构建、预算字段和相关 CUDA 回归已
+通过；1 Gbps full-chain 精确闭合。30 Gbps 单次诊断的平均 service/H2D/算法/D2H 为
+16.243/12.077/3.873/0.260 ms，超过 13.981 ms 到达间隔，因此下一步应优先解决 H2D 与
+逐 block 同步，再评估多 stream/inflight block。小几何主要用于数据流验证，不能代表目标
+Beamform 矩阵的 CUDA 核心利用率。
 
-## Milestone 4：配置驱动的通用模块链
+第一步 NUMA 优化已完成控制器开发：`ingress_numa_node` 绑定 raw ring 和
+`rdma2dada`，`processing_numa_node` 绑定 unpack、compute/output ring、GPU worker 和 sink。
+目标服务器实验固定为 ingress=1、processing=0；旧 `numa_node` 继续作为同节点兼容参数，
+禁止与分区参数混用。服务器验收必须与全 NUMA1 基线保持其余速率、几何、线程和二进制
+身份一致，分别比较 receiver/unpack 闭合、H2D、算法、D2H、总 service 和清理结果。
 
-目标：用模块 registry 替换当前三条硬编码链，同时保留观测流程约束。
+当前先拆分验证范围：
 
-- JSON 使用有序模块数组；
-- Module factory 创建模块并逐级调用 `ConfigureHeader()`；
-- 自动检查相邻模块的 stage/order/dtype/memory/shape；
-- 在处理前计算所有中间和最终 buffer 尺寸；
-- 固定前段顺序为 unpack/reorder→convert→beamform；
-- Power 和 Stokes 继续作为互斥分支；Integration 只允许出现在合法产品之后；
-- 对非法顺序给出包含模块名和不兼容字段的错误信息。
+1. 网络侧保持现有双 Station sender，继续承担 `receive`/`unpack` 的约 30 Gbps payload
+   吞吐验证；不把两个 Station 解释为约 500 个阵元。
+2. GPU 侧使用 `dada_junkdb -> compute ring -> pipeline_worker -> output ring -> dbnull`，
+   采用接近生产的 `A≈500,F=4,P=1,B≈350` ATFP/FPAB 几何。`A=469,F=4` 约为
+   30.016 Gbps，`A=500,F=4` 为 32 Gbps 压力点。
+3. GPU-only 必须使用匹配权重和真实输出几何，记录 H2D、转换、Beamform、可选产品、D2H、
+   output wait、显存和逐 block 闭合；合成填充值只影响科学数值，不降低计算/传输负载。
+4. 该结果称为“生产几何 GPU 压力”，不是“500-Station 完整链验收”。后者仍需多 Station
+   sender 或合法 raw-VDIF 生成器，把 Station-ID→A、时间对齐、unpack 和 GPU 放入同一链。
 
-完成标准：配置文件可以表达当前合法链，错误链在创建 ring 或发布 output header 前被拒绝。
+0.1 Gbps full-stage 已完成 1 warm-up + 3 measured，每轮双 Station、receiver、unpack、GPU、
+output header/EOD 和 cleanup 精确闭合。下一门禁先完成上述生产几何 GPU-only 阶梯，再依据
+证据决定 multi-stream；完整链目标速率在具备 500-Station 输入能力后补做。
 
-## Milestone 5：完整运行编排
+随后：
 
-目标：从一个配置文件启动和管理 ingest、worker、可选 disk sink 及所有 rings。
+1. 对生产几何 GPU-only 做小速率 known-data/geometry correctness 连续三次；
+2. 以 dbnull drain output ring，执行 1/5/10/.../30/32 Gbps 的 warm-up+3 阶梯；
+3. 先完成全 NUMA1 与 ingress=1/processing=0 的匹配比较，再比较单 stream 和后续
+   `inflight_blocks` 模式，按 H2D/GPU/D2H/output-wait 证据定位瓶颈；
+4. 多 Station 输入就绪后，重复 `full` 阶段并核对全部 Station、block、header 和 EOD；
+5. 只有 `full` 的全部 measured 通过，才能称该 rate 为完整 pipeline 稳定速率。
 
-- 扩展 demo 以创建正确 block size 和 reader count 的多个 ring；
-- 按拓扑启动 `rdma2dada`、一个或多个 worker 和 `dada_dbdisk`；
-- 实现可靠的 signal、EOD、错误传播和清理；
-- 开发 `pipelinectl` 的配置检查、启动和状态功能；
-- 添加 synthetic input 的端到端集成测试。
+完成标准：给出最高可重复 payload 速率、每级 service-time 预算和明确运行 headroom。
 
-完成标准：单条命令可以运行 NIC/raw ring→处理 ring→disk 的完整观测链，任一进程失败
-时不会遗留错误 reader count 或锁住的 ring。
+## Milestone 3：通用 module registry
 
-## Milestone 6：输出传输和性能优化
+目标：以 registry/factory 替换当前固定合法链，但不放宽观测约束。
 
-在正确性与端到端生命周期稳定之后再进行：
+- 配置表达有序算法列表；
+- factory 构造模块并逐级调用 header/geometry contract；
+- 自动检查 stage/order/dtype/memory/shape；
+- 前缀固定为 convert→beamform；Power/Stokes 互斥；Integration 仅跟合法实数产品；
+- 在创建 output ring 前计算全部中间和最终 buffer；
+- 非法链报告模块名和不兼容字段。
 
-- 实现 `dada2rdma` 重新打包和网络发送；
-- 使用 pinned bounce buffer 或谨慎评估 `cudaHostRegister()` PSRDADA block；
-- 引入双 buffer、CUDA events 和多 stream，实现跨 block H2D/compute/D2H overlap；
-- 评估 RDMA 直接写 ring、CUDA ring process boundary 和 GPUDirect 路径；
-- 添加长时间稳定性、吞吐、延迟和背压基准。
+完成标准：当前所有合法链由 registry 表达，错误链在资源创建前拒绝，并重复完整 GPU
+correctness 回归。
 
-完成标准：优化前后使用相同的输入输出正确性测试，并用服务器基准证明优化收益；不能以
-改变数据契约或跳过生命周期检查换取吞吐。
+## Milestone 4：pipelinectl
 
-## 执行记录
+目标：用一个用户入口管理 artifact、ring 和进程生命周期；`pipelinectl` 不执行算法。
 
-每个 milestone 开始时，在 GitHub Issue 中记录目标、服务器配置和验收命令；完成后记录
-测试输出、性能数据、发现的问题及对应 commit。未通过的验收项不能标记为完成。
+- 编译 Observation JSON 并核验 manifest；
+- 校验 ring keys、block geometry、reader count 和进程拓扑；
+- 按 consumer→worker→receiver 顺序启动并等待 readiness；
+- 监控 Station、receiver、worker、sink 和 EOD；任一 mandatory Station/进程失败则停止整链；
+- 提供 start/status/stop、定向 PID/key 清理和 machine-readable observation ledger；
+- 不通过模糊进程名 kill，不接管 Git 或远端部署。
+
+完成标准：单条命令能重复启动、监控和停止完整观测，失败路径不遗留进程、ring 或
+capability。
+
+## Milestone 5：持续观测和异常验收
+
+- 多 transfer 与长时间运行；
+- 0.001%–0.1% 低错误率、duplicate/late/bad packet 和 zero-fill 统计；
+- mandatory Station 启动失败/提前退出时中止完整 transfer；
+- header/EOD、下一次观测重新开始、资源恢复和无泄漏；
+- 使用稳定速率并保留运行安全余量，不在极限点冒充生产配置。
+
+## Milestone 6：输出链和后续优化
+
+完成前述契约与整链基线后再：
+
+- 设计并实现 `dada2rdma` processed packetization 与网络发送；
+- 按完整链证据决定是否引入 pinned memory、双 buffer、CUDA event/multi-stream overlap；
+- 再评估 GPUDirect 或其他进程边界；
+- 对 Time Integration 和其他 kernel 做证据驱动优化。
+
+所有优化必须保留相同输入输出 oracle，并用重复服务器基准证明收益。
+
+## 当前执行入口
+
+Milestone 1–2 的任务、文件、命令和验收条件见：
+
+[`../docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md`](../docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md)
+
+每个 milestone 的正式结果记录在 GitHub Issue；测试通过后由用户决定 commit 和 push。

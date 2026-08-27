@@ -6,6 +6,7 @@
 #include "rdma_dada/pipeline/ascii_metadata.h"
 #include "rdma_dada/pipeline/module_chain.h"
 #include "rdma_dada/pipeline/worker_config.h"
+#include "rdma_dada/pipeline/worker_metrics.h"
 
 #include <dada_client.h>
 #include <dada_hdu.h>
@@ -18,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -42,10 +44,12 @@ struct WorkerRuntime {
           input_block_capacity(0), converted_block_capacity(0),
           scratch_block_capacity(0),
           output_block_capacity(0), output_block_open(false),
-          input_ring_location(rdma_dada::pipeline::MemoryLocation::kHost)
+          input_ring_location(rdma_dada::pipeline::MemoryLocation::kHost),
+          metrics_transfer_started(false)
 #if defined(RDMA_DADA_HAVE_CUDA)
           , stream(NULL), device_input(NULL), device_converted(NULL),
-          device_scratch(NULL), device_output(NULL)
+          device_scratch(NULL), device_output(NULL), event_start(NULL),
+          event_h2d(NULL), event_algorithm(NULL), event_d2h(NULL)
 #endif
     {}
 
@@ -69,6 +73,10 @@ struct WorkerRuntime {
     std::uint64_t output_block_capacity;
     bool output_block_open;
     rdma_dada::pipeline::MemoryLocation input_ring_location;
+    std::string metrics_path;
+    rdma_dada::pipeline::WorkerMetrics metrics;
+    std::chrono::steady_clock::time_point metrics_transfer_start;
+    bool metrics_transfer_started;
     std::vector<std::uint8_t> host_scratch;
     std::vector<std::uint8_t> host_converted;
 #if defined(RDMA_DADA_HAVE_CUDA)
@@ -77,8 +85,21 @@ struct WorkerRuntime {
     std::uint8_t* device_converted;
     std::uint8_t* device_scratch;
     std::uint8_t* device_output;
+    cudaEvent_t event_start;
+    cudaEvent_t event_h2d;
+    cudaEvent_t event_algorithm;
+    cudaEvent_t event_d2h;
 #endif
 };
+
+typedef std::chrono::steady_clock WorkerClock;
+
+std::uint64_t ElapsedNs(const WorkerClock::time_point& start,
+                        const WorkerClock::time_point& finish) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start)
+            .count());
+}
 
 void SetFailure(WorkerRuntime* runtime, const std::string& message) {
     if (!runtime) return;
@@ -236,6 +257,14 @@ void ReleaseExecutionBuffers(WorkerRuntime* runtime) {
     runtime->device_converted = NULL;
     runtime->device_scratch = NULL;
     runtime->device_output = NULL;
+    if (runtime->event_start) cudaEventDestroy(runtime->event_start);
+    if (runtime->event_h2d) cudaEventDestroy(runtime->event_h2d);
+    if (runtime->event_algorithm) cudaEventDestroy(runtime->event_algorithm);
+    if (runtime->event_d2h) cudaEventDestroy(runtime->event_d2h);
+    runtime->event_start = NULL;
+    runtime->event_h2d = NULL;
+    runtime->event_algorithm = NULL;
+    runtime->event_d2h = NULL;
     if (runtime->stream) cudaStreamDestroy(runtime->stream);
     runtime->stream = NULL;
 #endif
@@ -289,6 +318,16 @@ bool PrepareExecutionBuffers(WorkerRuntime* runtime) {
                    "cudaStreamCreateWithFlags")) {
         return false;
     }
+    if (!CheckCuda(runtime, cudaEventCreate(&runtime->event_start),
+                   "cudaEventCreate start") ||
+        !CheckCuda(runtime, cudaEventCreate(&runtime->event_h2d),
+                   "cudaEventCreate H2D") ||
+        !CheckCuda(runtime, cudaEventCreate(&runtime->event_algorithm),
+                   "cudaEventCreate algorithm") ||
+        !CheckCuda(runtime, cudaEventCreate(&runtime->event_d2h),
+                   "cudaEventCreate D2H")) {
+        return false;
+    }
     if (!CheckCuda(runtime,
                    cudaMalloc(reinterpret_cast<void**>(&runtime->device_input),
                               static_cast<std::size_t>(
@@ -337,6 +376,9 @@ int OpenTransfer(dada_client_t* client) {
     runtime->failed = false;
     runtime->error.clear();
     runtime->output_block_open = false;
+    runtime->metrics.Reset();
+    runtime->metrics_transfer_start = WorkerClock::now();
+    runtime->metrics_transfer_started = true;
 
     try {
         rdma_dada::pipeline::Metadata input_header;
@@ -672,9 +714,13 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
     WorkerRuntime* runtime =
         static_cast<WorkerRuntime*>(client ? client->context : NULL);
     if (!client || !runtime || runtime->failed || !data) return -1;
+    const WorkerClock::time_point service_start = WorkerClock::now();
 
     std::uint64_t scratch_bytes = 0;
     std::uint64_t output_bytes = 0;
+    double h2d_ms_recorded = 0.0;
+    double algorithm_ms_recorded = 0.0;
+    double d2h_ms_recorded = 0.0;
     if (data_size == 0 ||
         data_size % runtime->geometry.input_frame_bytes != 0) {
         SetFailure(runtime,
@@ -701,8 +747,11 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
     }
 
     std::uint64_t output_block_id = 0;
+    const WorkerClock::time_point output_wait_start = WorkerClock::now();
     char* output_data = ipcio_open_block_write(
         runtime->output_hdu->data_block, &output_block_id);
+    const std::uint64_t output_wait_ns = ElapsedNs(
+        output_wait_start, WorkerClock::now());
     if (!output_data) {
         SetFailure(runtime, "cannot acquire output DADA data block");
         return -1;
@@ -746,6 +795,10 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         }
     } else {
 #if defined(RDMA_DADA_HAVE_CUDA)
+        bool gpu_timing_ready = CheckCuda(
+            runtime,
+            cudaEventRecord(runtime->event_start, runtime->stream),
+            "cudaEventRecord start");
         const rdma_dada::pipeline::BlockExecutionContext cuda_context = {
             rdma_dada::pipeline::ExecutionBackend::kCuda,
             runtime->config.cuda_device,
@@ -759,8 +812,15 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
             runtime->device_input, runtime->input_block_capacity,
             0, 0, rdma_dada::pipeline::MemoryLocation::kCudaDevice
         };
-        status = runtime->h2d.ProcessBlock(
-            host_input, &device_input, cuda_context);
+        status = gpu_timing_ready ? runtime->h2d.ProcessBlock(
+            host_input, &device_input, cuda_context) :
+            rdma_dada::pipeline::StageStatus::Error(runtime->error);
+        if (status.ok() && gpu_timing_ready) {
+            gpu_timing_ready = CheckCuda(
+                runtime,
+                cudaEventRecord(runtime->event_h2d, runtime->stream),
+                "cudaEventRecord H2D");
+        }
         if (status.ok()) {
             const rdma_dada::pipeline::InputBlock integer_input = {
                 device_input.data, device_input.size, device_input.sequence,
@@ -792,6 +852,13 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                 status = rdma_dada::pipeline::StageStatus::Error(
                     "module chain produced an unexpected output byte count");
             }
+            if (status.ok() && gpu_timing_ready) {
+                gpu_timing_ready = CheckCuda(
+                    runtime,
+                    cudaEventRecord(runtime->event_algorithm,
+                                    runtime->stream),
+                    "cudaEventRecord algorithm");
+            }
             if (status.ok()) {
                 const rdma_dada::pipeline::InputBlock device_result = {
                     output.data, output.size, output.sequence,
@@ -808,6 +875,13 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                     status = rdma_dada::pipeline::StageStatus::Error(
                         "D2H produced an unexpected output byte count");
                 }
+                if (status.ok() && gpu_timing_ready) {
+                    gpu_timing_ready = CheckCuda(
+                        runtime,
+                        cudaEventRecord(runtime->event_d2h,
+                                        runtime->stream),
+                        "cudaEventRecord D2H");
+                }
             }
         }
         if (!CheckCuda(runtime, cudaStreamSynchronize(runtime->stream),
@@ -815,7 +889,34 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
             status = status.ok() ?
                 rdma_dada::pipeline::StageStatus::Error(runtime->error) :
                 rdma_dada::pipeline::StageStatus::Error(
-                    status.message() + "; " + runtime->error);
+                status.message() + "; " + runtime->error);
+        }
+        if (status.ok() && gpu_timing_ready) {
+            float h2d_ms = 0.0F;
+            float algorithm_ms = 0.0F;
+            float d2h_ms = 0.0F;
+            if (!CheckCuda(runtime,
+                           cudaEventElapsedTime(
+                               &h2d_ms, runtime->event_start,
+                               runtime->event_h2d),
+                           "cudaEventElapsedTime H2D") ||
+                !CheckCuda(runtime,
+                           cudaEventElapsedTime(
+                               &algorithm_ms, runtime->event_h2d,
+                               runtime->event_algorithm),
+                           "cudaEventElapsedTime algorithm") ||
+                !CheckCuda(runtime,
+                           cudaEventElapsedTime(
+                               &d2h_ms, runtime->event_algorithm,
+                               runtime->event_d2h),
+                           "cudaEventElapsedTime D2H")) {
+                status = rdma_dada::pipeline::StageStatus::Error(
+                    runtime->error);
+            } else {
+                h2d_ms_recorded = h2d_ms;
+                algorithm_ms_recorded = algorithm_ms;
+                d2h_ms_recorded = d2h_ms;
+            }
         }
 #else
         status = rdma_dada::pipeline::StageStatus::Error(
@@ -837,6 +938,10 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
         return -1;
     }
     runtime->output_block_open = false;
+    const std::uint64_t service_ns = ElapsedNs(service_start, WorkerClock::now());
+    runtime->metrics.RecordBlock(
+        data_size, output_bytes, service_ns, output_wait_ns,
+        h2d_ms_recorded, algorithm_ms_recorded, d2h_ms_recorded);
     return static_cast<int64_t>(data_size);
 }
 
@@ -845,6 +950,11 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
         static_cast<WorkerRuntime*>(client ? client->context : NULL);
     if (!runtime) return -1;
     bool cleanup_failed = false;
+    if (runtime->metrics_transfer_started) {
+        runtime->metrics.SetTransferElapsedNs(ElapsedNs(
+            runtime->metrics_transfer_start, WorkerClock::now()));
+        runtime->metrics_transfer_started = false;
+    }
     if (runtime->output_block_open) {
         if (ipcio_close_block_write(
                 runtime->output_hdu->data_block, 0) < 0) {
@@ -887,6 +997,11 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
                    "D2H finish failed: " + d2h_finish_status.message());
         cleanup_failed = true;
     }
+    std::string metrics_error;
+    if (!runtime->metrics.WriteJson(runtime->metrics_path, &metrics_error)) {
+        SetFailure(runtime, metrics_error);
+        cleanup_failed = true;
+    }
     ReleaseExecutionBuffers(runtime);
     if (runtime->output_locked) {
         if (dada_hdu_unlock_write(runtime->output_hdu) < 0) {
@@ -902,18 +1017,24 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
 }
 
 void PrintUsage(const char* program) {
-    std::cerr << "Usage: " << program << " RESOLVED_OBSERVATION.json\n";
+    std::cerr << "Usage: " << program
+              << " RESOLVED_OBSERVATION.json [--metrics-json PATH]\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc != 2 && argc != 4) {
+        PrintUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (argc == 4 && std::string(argv[2]) != "--metrics-json") {
         PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
 
     WorkerRuntime runtime;
+    if (argc == 4) runtime.metrics_path = argv[3];
     std::string config_error;
     if (!rdma_dada::LoadResolvedObservationPlan(
             argv[1], &runtime.plan, &config_error) ||
@@ -1021,6 +1142,18 @@ int main(int argc, char** argv) {
     }
 
     if (runtime.output_locked) AbortOpenTransfer(&runtime);
+    if (!runtime.metrics_path.empty()) {
+        if (runtime.metrics_transfer_started) {
+            runtime.metrics.SetTransferElapsedNs(ElapsedNs(
+                runtime.metrics_transfer_start, WorkerClock::now()));
+            runtime.metrics_transfer_started = false;
+        }
+        std::string metrics_error;
+        if (!runtime.metrics.WriteJson(runtime.metrics_path, &metrics_error)) {
+            SetFailure(&runtime, metrics_error);
+            result = EXIT_FAILURE;
+        }
+    }
     if (input_locked && dada_hdu_unlock_read(input_hdu) < 0) {
         result = EXIT_FAILURE;
     }

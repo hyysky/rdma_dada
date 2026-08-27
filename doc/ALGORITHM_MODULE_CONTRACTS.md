@@ -421,17 +421,8 @@ S = [AA, BB, AB_REAL, AB_IMAG]
 ORDER=TFBS
 ```
 
-这些量严格来说是 coherency/correlation products。它们可以进一步转换为
-`I/Q/U/V`：
-
-```text
-I = AA + BB
-Q = AA - BB
-U = 2 * AB_REAL
-V = sign * 2 * AB_IMAG
-```
-
-第一版 `stokes` 模块输出相关产物，不隐式转换成 `I/Q/U/V`。header 必须明确：
+当前 `stokes` 模块及论文验证范围只包含上述四个 coherency/correlation products，
+不包含 `I/Q/U/V` 的物理输出或推导。header 必须明确：
 
 ```text
 DATA_STAGE=POLARIZATION_PRODUCTS

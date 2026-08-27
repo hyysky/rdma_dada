@@ -10,6 +10,12 @@ output header 与编译器生成的最终 header 完全比对，然后逐个 dat
 算法模块不连接 ring。worker 持有 ring lock、host/device buffer、CUDA stream 和
 模块生命周期。
 
+可选参数 `--metrics-json PATH` 在 transfer 结束时原子写入结构化指标，包括处理 block
+数、输入/输出 bytes、每 block 总 service time、output-ring wait，以及同一 CUDA stream
+上的 H2D、算法链、D2H 累计时间。该参数不增加第二条 stream，也不引入已有逐 block
+同步之外的额外同步；测试控制器用这些字段核对每个 compute block 都产生一个 output
+block。旧的一参数调用保持兼容。
+
 固定前缀为 `H2D -> ComplexConvert`：输入 ring 的块级 `ATFP/CI8` 先在 GPU 上融合
 完成物理转置、CI8→CF32 和 scale，得到独立的 `TFPA/CF32` buffer，再进入以下算法链。
 
@@ -155,7 +161,8 @@ cmake -S . -B build-linux \
 cmake --build build-linux --parallel
 
 ./build-linux/observation_config_compile \
-  config/observation.json run/observation
+  --config config/observation.json \
+  --output-dir run/observation
 ./build-linux/pipeline_worker \
   run/observation/resolved_observation.json
 ```
@@ -175,5 +182,40 @@ transfer。`SIGINT`/`SIGTERM` 会请求在当前 PSRDADA 操作返回后停止�
   正确。
 - 尚未实现双 buffer/event，因此当前版本没有跨 block overlap；后续优化不改变模块接口和
   header/block 契约。
+
+## GPU block deadline 与容量预检
+
+编译 Observation 时会把 `gpu_pipeline_budget` 写入 `validation_report.json`。普通观测使用
+Observation 自身推导的 payload 速率；吞吐测试必须显式传入目标速率，例如：
+
+```bash
+./build-linux/observation_config_compile \
+  config/testing/atfp-throughput-observation.json run/full-30g \
+  --budget-payload-gbps 30
+```
+
+当前 30 Gbps 小几何测试链为 Beamform → Power → Integrate(K=128, MEAN)。compute block
+含 6,553,600 个时间采样，能被 128 整除；积分后 `T=51,200`。compute、Beamform、
+Power 和最终 output block 分别为 52,428,800、209,715,200、104,857,600 和 819,200 B，
+block 到达间隔 13,981,013 ns。保留 20% 余量后，单 stream 整链 deadline 为
+11,184,810 ns；H2D+D2H 合计 53,248,000 B/block，最低合计 host/device 传输速率为
+4,760,742,472 B/s。计划显存为 577,536,064 B（含 64 B 权重及算法 scratch），建议启动时
+至少有 693,043,277 B 空闲显存；该值不含 CUDA/cuBLAS/驱动 workspace。
+
+同一测试配置的 host ring 容量由 `ring_plan.json` 单独给出：raw 845,414,400 B、compute
+419,430,400 B、output 6,553,600 B，合计 1,271,398,400 B。ring 容量只提供突发
+缓冲时间，不计入显存，也不能弥补下游稳态服务率不足。
+
+服务器 full-chain 功能诊断已在 1 Gbps 精确闭合。单次 30 Gbps 诊断中 GPU 处理 2,130
+个 block，平均 service time 为 16.243 ms，超过 13.981 ms 的 block 到达间隔和
+11.185 ms 的安全 deadline；平均 H2D/算法/D2H 分别约 12.077/3.873/0.260 ms，output
+wait 平均约 0.0013 ms。Power+积分已消除原有 D2H/output 扩张，但当前单 stream、逐 block
+同步路径仍不能持续 30 Gbps；该结果不是正式重复性能验收。
+
+下一组 GPU-only 压力不再使用上述 `A=2,B=2` 小几何判断 CUDA 核心能力，而使用接近
+目标观测的 `A≈500,F=4,P=1,B≈350`。数据由 `dada_junkdb` 以完整 ATFP block 注入，权重
+必须是匹配的 FPAB 矩阵，因此实际 GEMM、输出扩张、显存和传输量均按生产几何发生。
+`A=469,F=4` 用作约 30 Gbps 基线，`A=500,F=4` 用作 32 Gbps 压力点。该测试不经过
+Station-ID 聚合，不能替代多 Station sender 驱动的 full-stage 验收。
 
 macOS 只构建并测试 worker core；PSRDADA/CUDA 可执行文件需要在 Linux 服务器构建。

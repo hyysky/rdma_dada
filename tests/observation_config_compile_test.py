@@ -23,6 +23,20 @@ def main():
     gpu_config = pathlib.Path(sys.argv[3]).resolve()
     root = pathlib.Path(tempfile.mkdtemp(prefix="rdma_dada_compile_"))
     try:
+        gpu_document = json.loads(gpu_config.read_text())
+        assert gpu_document["processing"]["modules"] == [
+            {
+                "type": "beamform",
+                "weights_file": "../../tests/data/beamform_cuda_weights_f2_p1_a2_b2_i8.npy",
+                "weights_order": "FPAB2",
+                "weights_id": "atfp-throughput-f2-p1-a2-b2-i8-v1",
+                "weights_scale": "0.5",
+                "compute_mode": "FP32",
+            },
+            {"type": "power"},
+            {"type": "integrate", "length": 128, "operation": "MEAN"},
+        ]
+
         preflight = run([str(binary), "--config", str(config),
                          "--preflight-only"])
         assert preflight.returncode == 0, preflight.stderr
@@ -41,6 +55,17 @@ def main():
         assert override_budget["budget_target_payload_bits_per_second"] == 30_000_000_000
         assert override_budget["rate_source"] == "PERFORMANCE_OVERRIDE"
         assert override_budget["deadline_reserve_percent"] == 20
+        assert override_budget["block_bytes"] == {
+            "compute": 52_428_800,
+            "converted": 209_715_200,
+            "beamformed": 209_715_200,
+            "product": 104_857_600,
+            "output": 819_200,
+        }
+        assert override_report["stage_headers"] == [
+            "RAW", "UNPACKED", "CONVERTED", "BEAMFORMED",
+            "POWER_INTEGRATED",
+        ]
         assert override_budget["required_rates_bytes_per_second"][
             "host_device_transfer_bytes_per_block"
         ] > 0
@@ -53,6 +78,27 @@ def main():
         assert json.loads(fractional_budget.stdout)["gpu_pipeline_budget"][
             "budget_target_payload_bits_per_second"
         ] == 100_000_000
+
+        invalid_integration = root / "invalid-integration.json"
+        invalid_gpu_document = json.loads(gpu_config.read_text())
+        invalid_gpu_document["wire"]["profile"] = str(
+            (gpu_config.parent / invalid_gpu_document["wire"]["profile"])
+            .resolve()
+        )
+        invalid_gpu_document["processing"]["modules"][0]["weights_file"] = str(
+            (gpu_config.parent / invalid_gpu_document["processing"]["modules"][0]["weights_file"])
+            .resolve()
+        )
+        invalid_gpu_document["processing"]["modules"][-1]["length"] = 127
+        invalid_integration.write_text(json.dumps(invalid_gpu_document))
+        rejected_integration = run([
+            str(binary), "--config", str(invalid_integration),
+            "--preflight-only",
+        ])
+        assert rejected_integration.returncode != 0
+        assert "integration length must divide block sample count" in (
+            rejected_integration.stderr
+        )
 
         output = root / "artifacts"
         written = run([str(binary), "--config", str(config),

@@ -128,6 +128,35 @@ def make_suite_fixture(
 
 
 class CatalogTest(unittest.TestCase):
+    def test_catalog_records_split_ingress_and_processing_numa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = make_suite_fixture(
+                directory,
+                suite_id="full-30Gbps-split-numa",
+                topology="full",
+            )
+            summary_path = suite / "summary.json"
+            summary = json.loads(summary_path.read_text())
+            summary["request"]["numa_node"] = None
+            summary["request"]["ingress_numa_node"] = 1
+            summary["request"]["processing_numa_node"] = 0
+            summary_path.write_text(json.dumps(summary) + "\n")
+            task8c_artifacts.write_manifest(suite)
+            (suite / "origin.json").write_text(json.dumps({
+                "schema_version": 1,
+                "suite_id": suite.name,
+                "source_host": "HF",
+                "remote_suite_root": f"/results/{suite.name}",
+                "imported_utc": "2026-08-27T00:00:00Z",
+                "source_manifest_sha256": "a" * 64,
+            }) + "\n")
+
+            entry = catalog.derive_catalog_entry(suite)
+
+        self.assertIsNone(entry["configuration"]["numa_node"])
+        self.assertEqual(entry["configuration"]["ingress_numa_node"], 1)
+        self.assertEqual(entry["configuration"]["processing_numa_node"], 0)
+
     def test_rebuild_empty_root_creates_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

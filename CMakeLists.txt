@@ -214,7 +214,8 @@ if(USE_CUDA)
 endif()
 
 add_library(rdma_pipeline_worker_core STATIC
-    src/pipeline/module_chain.cpp)
+    src/pipeline/module_chain.cpp
+    src/pipeline/worker_metrics.cpp)
 target_include_directories(rdma_pipeline_worker_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -336,6 +337,10 @@ if(BUILD_TESTING)
     add_executable(pipeline_worker_core_test
         tests/pipeline_worker_core_test.cpp)
     target_link_libraries(pipeline_worker_core_test
+        PRIVATE rdma_pipeline_worker_core)
+    add_executable(pipeline_worker_metrics_test
+        tests/pipeline_worker_metrics_test.cpp)
+    target_link_libraries(pipeline_worker_metrics_test
         PRIVATE rdma_pipeline_worker_core)
     add_executable(worker_resolved_plan_test
         tests/worker_resolved_plan_test.cpp)
@@ -510,6 +515,10 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/beamform_test_weights_generator_test.py
                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_beamform_test_weights.py)
         add_test(
+            NAME gpu_pressure_fixture_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_pressure_fixture_test.py)
+        add_test(
             NAME task8c_rate_point_test
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
@@ -552,6 +561,7 @@ if(BUILD_TESTING)
         COMMAND pipeline_worker_core_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline_worker.example.json
                 ${CMAKE_CURRENT_BINARY_DIR}/pipeline_worker_test_weights.npy)
+    add_test(NAME pipeline_worker_metrics_test COMMAND pipeline_worker_metrics_test)
     add_test(
         NAME worker_resolved_plan_test
         COMMAND worker_resolved_plan_test

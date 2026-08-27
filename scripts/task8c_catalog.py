@@ -26,7 +26,8 @@ CSV_FIELDS = [
     "first_failure_stage", "first_failure_classification",
     "baseline_profile_id", "source_manifest_sha256", "config_id",
     "geometry_id", "receiver_poll_cpu", "worker_cpu_list", "gpu_worker_cpu",
-    "sink_cpu_list", "numa_node", "receiver_poll_batch", "receiver_wr_num",
+    "sink_cpu_list", "numa_node", "ingress_numa_node",
+    "processing_numa_node", "receiver_poll_batch", "receiver_wr_num",
     "result_path",
 ]
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -59,8 +60,12 @@ IDENTITY_FIELDS = {
 }
 CONFIGURATION_FIELDS = {
     "receiver_poll_cpu", "worker_cpu_list", "gpu_worker_cpu", "sink_cpu_list",
-    "numa_node", "receiver_poll_batch", "receiver_wr_num", "rings",
+    "numa_node", "ingress_numa_node", "processing_numa_node",
+    "receiver_poll_batch", "receiver_wr_num", "rings",
     "window_groups", "reorder_horizon_groups", "unpack_start_delay_seconds",
+}
+LEGACY_CONFIGURATION_FIELDS = CONFIGURATION_FIELDS - {
+    "ingress_numa_node", "processing_numa_node"
 }
 
 
@@ -495,6 +500,8 @@ def derive_catalog_entry(suite_root):
             "gpu_worker_cpu": request.get("gpu_worker_cpu"),
             "sink_cpu_list": request.get("sink_cpu_list"),
             "numa_node": request.get("numa_node"),
+            "ingress_numa_node": request.get("ingress_numa_node"),
+            "processing_numa_node": request.get("processing_numa_node"),
             "receiver_poll_batch": request.get("receiver_poll_batch"),
             "receiver_wr_num": request.get("receiver_wr_num"),
             "rings": rings,
@@ -622,7 +629,9 @@ def validate_catalog_value(value):
         configuration = entry["configuration"]
         if (
             not isinstance(configuration, dict)
-            or set(configuration) != CONFIGURATION_FIELDS
+            or set(configuration) not in (
+                CONFIGURATION_FIELDS, LEGACY_CONFIGURATION_FIELDS
+            )
         ):
             raise ValueError("invalid configuration fields")
         rings = configuration["rings"]
@@ -642,8 +651,9 @@ def validate_catalog_value(value):
                 raise ValueError("invalid ring geometry")
         for field in (
             "receiver_poll_cpu", "gpu_worker_cpu", "numa_node",
+            "ingress_numa_node", "processing_numa_node",
         ):
-            field_value = configuration[field]
+            field_value = configuration.get(field)
             if field_value is not None and (
                 isinstance(field_value, bool) or not isinstance(field_value, int)
             ):
@@ -703,6 +713,8 @@ def _csv_row(entry):
         "gpu_worker_cpu": configuration.get("gpu_worker_cpu"),
         "sink_cpu_list": configuration.get("sink_cpu_list") or "",
         "numa_node": configuration.get("numa_node"),
+        "ingress_numa_node": configuration.get("ingress_numa_node"),
+        "processing_numa_node": configuration.get("processing_numa_node"),
         "receiver_poll_batch": configuration.get("receiver_poll_batch"),
         "receiver_wr_num": configuration.get("receiver_wr_num"),
         "result_path": entry["result_path"],

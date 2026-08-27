@@ -169,27 +169,28 @@ only to audit a cited raw line or diagnose a failure. The tracked
 with user approval. Promotion records evidence selection, not necessarily a
 product PASS.
 
-After remote cleanup, the testing task attempts local import and then sends its
-complete result to the development task and a bounded second notification to
-`总结成文`, even when import fails. Import and both deliveries are independent
-states:
+After remote cleanup, the testing task sends the complete result and the exact
+compact-suite location to the originating development task. The development
+task verifies/transfers the suite, runs the local catalog importer, and
+maintains the generated catalog and any user-approved accepted-results entry.
+The callback is:
 
 ```text
-CATALOG_IMPORT_RESULT=<PASS|FAIL>
 RESULT_NOTIFICATION=<PASS|FAIL>
-RESULT_CATALOG_NOTIFICATION=<PASS|FAIL>
 SUITE_ID=<suite-id>
 TEST_TOPOLOGY=<receive|unpack|gpu|full>
 TEST_RESULT=<result>
 CLEANUP_RESULT=<result>
-CATALOG_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/catalog.json
-LOCAL_SUITE_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/suites/<suite-id>
+REMOTE_SUITE_PATH=<absolute compact-suite path>
+SUITE_MANIFEST_SHA256=<sha256>
 ```
 
-Remote test result, cleanup result, `CATALOG_IMPORT_RESULT`, development
-`RESULT_NOTIFICATION` and reporting `RESULT_CATALOG_NOTIFICATION` are
-independent states. A catalog or notification
-failure never rewrites the underlying test or cleanup result.
+Remote test result, cleanup result and development `RESULT_NOTIFICATION` are
+independent states. After receipt, the development task records
+`CATALOG_IMPORT_RESULT` independently; an import failure never rewrites the
+remote test or cleanup result. `总结成文` receives no per-test callback. When
+asked to update a chapter, table or status, it queries the catalog maintained
+by the development task and reads only the selected suite artifacts.
 
 On PASS, remove copied bundles, bootstrap artifacts, helper scripts, PID,
 ready/exit files, duplicate headers/configs, raw data and full progress logs
@@ -216,6 +217,12 @@ ring/window geometry and preparation policy. GPU/full profiles are invalid
 without an explicit GPU-worker CPU. Rebuilding binaries updates recorded
 binary identities but does not
 reset the runtime profile to unpinned or single-thread defaults.
+
+Split-socket tests record `ingress_numa_node` separately from
+`processing_numa_node`. The ingress node owns the raw ring and `rdma2dada`;
+the processing node owns `vdif_unpack_worker`, compute/output rings,
+`pipeline_worker` and the sink. The legacy `numa_node` field binds both zones
+to one node and must not be combined with the split fields.
 
 Every run records the profile path and SHA256. Before resource creation the
 controller compares effective parameters with the profile. An exact match

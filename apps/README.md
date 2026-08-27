@@ -6,13 +6,16 @@ run it between PSRDADA HDUs.
 
 Application directories:
 
-- `rdma2dada`: implemented NIC to raw host ring A entry point.
+- `rdma2dada`: implemented direct NIC to raw host ring A entry point; one
+  QP/CQ/thread uses NSGE=2 to place the VDIF record directly in the PSRDADA
+  slot while the network header lands in scratch memory.
 - `fpga_sender_sim`: implemented deterministic UDP/Project VDIF v1 source;
   each process simulates one Station ID and all instances may target the same
   receiver IP/port.
-- `vdif_unpack_worker`: implemented CPU/PSRDADA raw-to-compute worker; validates
-  each transfer header, groups Project VDIF TFP packets into payload-only
-  block-scoped ATFP blocks, zero-fills missing Stations and propagates EOD.
+- `vdif_unpack_worker`: implemented parallel CPU/PSRDADA raw-to-compute worker;
+  a coordinator dispatches pointer-free descriptors to fixed parser workers and
+  a sole writer publishes ordered payload-only ATFP blocks, zero-fills missing
+  Stations and propagates EOD.
 - `pipeline_worker`: implemented Resolved-Plan-driven composition of fused
   ATFP/CI8-to-TFPA/CF32 conversion, Beamform, optional Power or Stokes, optional
   Time Integration, and D2H between one compute ring and one output ring.

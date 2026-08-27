@@ -118,6 +118,12 @@
             "numa_node": {
               "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
             },
+            "ingress_numa_node": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
+            "processing_numa_node": {
+              "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+            },
             "receiver_poll_batch": {
               "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]
             },

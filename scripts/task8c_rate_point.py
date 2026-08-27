@@ -13,12 +13,16 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import statistics
 import sys
 import time
 import uuid
 from typing import Any, Iterable, Sequence
+
+import task8c_profiles
+import task8c_artifacts
 
 
 class StageError(RuntimeError):
@@ -51,6 +55,67 @@ class StageError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class PipelineTopology:
+    """Process/ring boundary for one independently runnable pipeline slice."""
+
+    stage: str
+    rings: tuple[str, ...]
+    consumer_ring: str
+    input_kind: str
+    uses_receiver: bool
+    uses_unpack_worker: bool
+    uses_pipeline_worker: bool
+    uses_network_senders: bool
+    requires_rdma_capability: bool
+
+
+_PIPELINE_TOPOLOGIES = {
+    "receive": PipelineTopology(
+        "receive", ("raw",), "raw", "network",
+        True, False, False, True, True
+    ),
+    "unpack": PipelineTopology(
+        "unpack", ("raw", "compute"), "compute", "network",
+        True, True, False, True, True,
+    ),
+    "gpu": PipelineTopology(
+        "gpu", ("compute", "output"), "output", "junkdb",
+        False, False, True, False, False,
+    ),
+    "full": PipelineTopology(
+        "full", ("raw", "compute", "output"), "output", "network",
+        True, True, True, True, True,
+    ),
+}
+
+
+def pipeline_topology(stage: str) -> PipelineTopology:
+    try:
+        return _PIPELINE_TOPOLOGIES[stage]
+    except KeyError as error:
+        raise ValueError(
+            "pipeline_stage must be receive, unpack, gpu or full"
+        ) from error
+
+
+def required_process_roles(topology: PipelineTopology) -> tuple[str, ...]:
+    """Return the complete PASS process ledger expected for one topology."""
+    roles = [f"{ring}-ring" for ring in topology.rings]
+    if topology.input_kind == "junkdb":
+        roles.append("dada_junkdb")
+    if topology.uses_receiver:
+        roles.append("rdma2dada")
+    if topology.uses_unpack_worker:
+        roles.append("vdif_unpack_worker")
+    if topology.uses_pipeline_worker:
+        roles.append("pipeline_worker")
+    roles.append(f"{topology.consumer_ring}-consumer")
+    if topology.uses_network_senders:
+        roles.append("sender")
+    return tuple(roles)
+
+
+@dataclasses.dataclass(frozen=True)
 class RateRequest:
     aggregate_gbps: float
     duration_seconds: float
@@ -60,15 +125,21 @@ class RateRequest:
     missing_wait_ms: float = 200.0
     station_skew_reserve_ms: float = 200.0
     worker_cpu_list: str | None = None
+    gpu_worker_cpu: int | None = None
     sink_cpu_list: str | None = None
     receiver_poll_cpu: int | None = None
     numa_node: int | None = None
+    ingress_numa_node: int | None = None
+    processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
     unpack_missing_per_second: bool = False
     unpack_start_delay_seconds: int = 0
     station_id: int | None = None
     sender_source_port: int | None = None
+    baseline_profile_path: str | None = None
+    baseline_profile_sha256: str | None = None
+    experiment_name: str | None = None
 
     def validate(self) -> None:
         if (
@@ -95,8 +166,7 @@ class RateRequest:
             raise ValueError("receiver queue parameters are invalid")
         if self.compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
-        if self.pipeline_stage not in ("receive", "unpack", "full"):
-            raise ValueError("pipeline_stage must be receive, unpack or full")
+        topology = pipeline_topology(self.pipeline_stage)
         if self.pipeline_stage in ("receive", "unpack") and self.compute_consumer != "dbnull":
             raise ValueError(f"{self.pipeline_stage} pipeline_stage requires dbnull")
         if self.pipeline_stage == "receive" and self.unpack_missing_per_second:
@@ -136,27 +206,54 @@ class RateRequest:
             unpack_cpus = [int(value) for value in self.worker_cpu_list.split(",")]
             if len(set(unpack_cpus)) != len(unpack_cpus):
                 raise ValueError("unpack thread CPUs must be distinct")
+        if self.numa_node is not None and (
+            self.ingress_numa_node is not None
+            or self.processing_numa_node is not None
+        ):
+            raise ValueError(
+                "numa_node cannot be combined with split NUMA placement"
+            )
+        ingress_numa = (
+            self.ingress_numa_node
+            if self.ingress_numa_node is not None else self.numa_node
+        )
+        processing_numa = (
+            self.processing_numa_node
+            if self.processing_numa_node is not None else self.numa_node
+        )
         placement_active = any(value is not None for value in (
-            self.receiver_poll_cpu, self.sink_cpu_list, self.numa_node,
-            self.worker_cpu_list,
+            self.receiver_poll_cpu, self.sink_cpu_list, ingress_numa,
+            processing_numa, self.worker_cpu_list, self.gpu_worker_cpu,
         ))
         if placement_active:
-            worker_required = self.pipeline_stage != "receive"
-            if (self.receiver_poll_cpu is None or
-                    self.sink_cpu_list is None or self.numa_node is None or
-                    (worker_required and self.worker_cpu_list is None)):
+            receiver_required = topology.uses_receiver
+            unpack_required = topology.uses_unpack_worker
+            gpu_required = topology.uses_pipeline_worker
+            processing_required = unpack_required or gpu_required
+            if (self.sink_cpu_list is None or
+                    (receiver_required and ingress_numa is None) or
+                    (processing_required and processing_numa is None) or
+                    (receiver_required and self.receiver_poll_cpu is None) or
+                    (unpack_required and self.worker_cpu_list is None) or
+                    (gpu_required and self.gpu_worker_cpu is None)):
                 raise ValueError(
-                    "receiver poll, worker when used, sink and NUMA placement "
-                    "must be supplied together"
+                    "used receiver, processing, worker, sink and NUMA "
+                    "placement must be supplied together"
                 )
             if (
-                self.receiver_poll_cpu < 0
-                or self.numa_node < 0
+                (receiver_required and self.receiver_poll_cpu < 0)
+                or (gpu_required and self.gpu_worker_cpu < 0)
+                or (ingress_numa is not None and ingress_numa < 0)
+                or (processing_numa is not None and processing_numa < 0)
                 or not re.fullmatch(r"[0-9]+", self.sink_cpu_list)
             ):
                 raise ValueError("explicit CPU/NUMA placement is invalid")
-            roles = [self.receiver_poll_cpu, int(self.sink_cpu_list)]
-            if worker_required:
+            roles = [int(self.sink_cpu_list)]
+            if receiver_required:
+                roles.append(self.receiver_poll_cpu)
+            if gpu_required:
+                roles.append(self.gpu_worker_cpu)
+            if unpack_required:
                 roles.extend(
                     int(value) for value in self.worker_cpu_list.split(",")
                 )
@@ -220,9 +317,12 @@ class RatePlan:
     pipeline_stage: str = "full"
     reorder_horizon_groups: int = 0
     worker_cpu_list: str | None = None
+    gpu_worker_cpu: int | None = None
     sink_cpu_list: str | None = None
     receiver_poll_cpu: int | None = None
     numa_node: int | None = None
+    ingress_numa_node: int | None = None
+    processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
     unpack_missing_per_second: bool = False
@@ -230,6 +330,7 @@ class RatePlan:
     preparation_groups: int = 0
     packets_per_second: int = 0
     sender_source_port: int | None = None
+    profile_evidence: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def sender_group_count(self) -> int:
@@ -237,11 +338,29 @@ class RatePlan:
 
     @property
     def uses_pipeline_worker(self) -> bool:
-        return self.pipeline_stage == "full" and self.compute_consumer == "dbnull"
+        return pipeline_topology(self.pipeline_stage).uses_pipeline_worker
 
     @property
     def uses_unpack_worker(self) -> bool:
-        return self.pipeline_stage != "receive"
+        return pipeline_topology(self.pipeline_stage).uses_unpack_worker
+
+    @property
+    def topology(self) -> PipelineTopology:
+        return pipeline_topology(self.pipeline_stage)
+
+    @property
+    def effective_ingress_numa_node(self) -> int | None:
+        return (
+            self.ingress_numa_node
+            if self.ingress_numa_node is not None else self.numa_node
+        )
+
+    @property
+    def effective_processing_numa_node(self) -> int | None:
+        return (
+            self.processing_numa_node
+            if self.processing_numa_node is not None else self.numa_node
+        )
 
     @property
     def raw_block_bytes(self) -> int:
@@ -412,8 +531,7 @@ class RatePlan:
             raise ValueError("rate, duration and batch size must be positive")
         if compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
-        if pipeline_stage not in ("receive", "unpack", "full"):
-            raise ValueError("pipeline_stage must be receive, unpack or full")
+        pipeline_topology(pipeline_stage)
         if pipeline_stage in ("receive", "unpack") and compute_consumer != "dbnull":
             raise ValueError(f"{pipeline_stage} pipeline_stage requires dbnull")
         source = json.loads(resolved["source_json"])
@@ -449,6 +567,9 @@ class RatePlan:
             "compute_block_bytes": self.compute_block_bytes,
             "raw_ring_blocks": self.raw_ring_blocks,
             "compute_ring_blocks": self.compute_ring_blocks,
+            "nant": self.nant,
+            "nchan": self.nchan,
+            "npol": self.npol,
             "config_id": self.config_id,
             "geometry_id": self.geometry_id,
             "artifact_sha256": {
@@ -460,6 +581,27 @@ class RatePlan:
             result.pop("compute_key", None)
             result.pop("compute_block_bytes", None)
             result.pop("compute_ring_blocks", None)
+        elif self.pipeline_stage == "gpu":
+            result.pop("raw_key", None)
+            result.pop("raw_block_bytes", None)
+            result.pop("raw_ring_blocks", None)
+            result.update({
+                "output_block_bytes": self.output_block_bytes,
+                "output_ring_blocks": self.output_ring_blocks,
+                "output_key": self.output_key,
+            })
+            junk = derive_gpu_junk_input(self)
+            result["gpu_input"] = {
+                "target_payload_gbps": self.aggregate_gbps,
+                "blocks_per_second": junk.blocks_per_second,
+                "block_count": junk.block_count,
+                "bytes_per_second": junk.bytes_per_second,
+                "actual_payload_gbps": (
+                    junk.bytes_per_second * 8 / 1_000_000_000
+                ),
+                "total_bytes": junk.total_bytes,
+                "duration_seconds": junk.duration_seconds,
+            }
         elif self.pipeline_stage != "unpack" and "output" in self.ring_plan.get("rings", {}):
             result.update({
                 "output_block_bytes": self.output_block_bytes,
@@ -467,6 +609,73 @@ class RatePlan:
                 "output_key": self.output_key,
             })
         return result
+
+
+@dataclasses.dataclass(frozen=True)
+class GpuJunkInputPlan:
+    blocks_per_second: int
+    block_count: int
+    total_bytes: int
+    bytes_per_second: int
+    megabytes_per_second: str
+    duration_seconds: int
+    input_header_bytes: bytes
+
+
+def _rewrite_ascii_header(header: bytes,
+                          updates: dict[str, int]) -> bytes:
+    if len(header) != 4096:
+        raise ValueError("unpacked header must be exactly 4096 bytes")
+    text = header.rstrip(b"\0").decode("ascii")
+    lines = []
+    seen = set()
+    for line in text.splitlines():
+        fields = line.split(None, 1)
+        if fields and fields[0] in updates:
+            key = fields[0]
+            lines.append(f"{key} {updates[key]}")
+            seen.add(key)
+        else:
+            lines.append(line)
+    for key in ("FILE_SIZE", "TRANSFER_SIZE", "BYTES_PER_SECOND"):
+        if key not in seen:
+            lines.append(f"{key} {updates[key]}")
+    encoded = ("\n".join(lines).rstrip("\n") + "\n").encode("ascii")
+    if len(encoded) > 4096:
+        raise ValueError("GPU input header exceeds 4096 bytes")
+    return encoded + bytes(4096 - len(encoded))
+
+
+def derive_gpu_junk_input(plan: RatePlan) -> GpuJunkInputPlan:
+    """Round the configured target up to whole compute blocks per second."""
+    if not plan.duration_seconds.is_integer():
+        raise ValueError("GPU junk pressure duration must be whole seconds")
+    duration = int(plan.duration_seconds)
+    requested_rate = (
+        decimal.Decimal(str(plan.aggregate_gbps))
+        * decimal.Decimal(1_000_000_000) / decimal.Decimal(8)
+    )
+    blocks_per_second = int(
+        (requested_rate / decimal.Decimal(plan.compute_block_bytes))
+        .to_integral_value(rounding=decimal.ROUND_CEILING)
+    )
+    block_count = blocks_per_second * duration
+    total_bytes = block_count * plan.compute_block_bytes
+    bytes_per_second = blocks_per_second * plan.compute_block_bytes
+    rate_mb = decimal.Decimal(bytes_per_second) / decimal.Decimal(1_000_000)
+    rate_text = format(rate_mb, "f").rstrip("0").rstrip(".")
+    header = _rewrite_ascii_header(
+        plan.artifact_files["unpacked.header"],
+        {
+            "FILE_SIZE": total_bytes,
+            "TRANSFER_SIZE": total_bytes,
+            "BYTES_PER_SECOND": bytes_per_second,
+        },
+    )
+    return GpuJunkInputPlan(
+        blocks_per_second, block_count, total_bytes, bytes_per_second,
+        rate_text, duration, header
+    )
 
 
 def _seconds_from_picoseconds(value: int) -> str:
@@ -567,12 +776,19 @@ def _run_observation_compiler(
     compiler: pathlib.Path,
     config_path: pathlib.Path,
     output_directory: pathlib.Path | None,
+    budget_payload_gbps: float,
     executor: Any | None = None,
 ) -> None:
     if executor is not None:
-        executor(config_path, output_directory)
+        executor(config_path, output_directory, budget_payload_gbps)
         return
-    argv = [str(compiler), "--config", str(config_path)]
+    budget_text = format(
+        decimal.Decimal(str(budget_payload_gbps)), "f"
+    ).rstrip("0").rstrip(".")
+    argv = [
+        str(compiler), "--config", str(config_path),
+        "--budget-payload-gbps", budget_text,
+    ]
     if output_directory is None:
         argv.append("--preflight-only")
     else:
@@ -610,19 +826,25 @@ def compile_rate_plan(
         )
     root = pathlib.Path(run_directory)
     root.mkdir(parents=True, exist_ok=True)
+
+    def runtime_path(path: pathlib.Path) -> str:
+        resolved_path = path.resolve()
+        mapper = getattr(compiler_executor, "map_runtime_path", None)
+        return str(mapper(resolved_path) if mapper is not None else resolved_path)
+
     try:
         observation = json.loads(template_path.read_text())
         wire_reference = pathlib.Path(observation["wire"]["profile"])
         if not wire_reference.is_absolute():
-            observation["wire"]["profile"] = str(
-                (template_path.parent / wire_reference).resolve()
+            observation["wire"]["profile"] = runtime_path(
+                template_path.parent / wire_reference
             )
         for module in observation["processing"]["modules"]:
             if module.get("type") == "beamform":
                 weight = pathlib.Path(module["weights_file"])
                 if not weight.is_absolute():
-                    module["weights_file"] = str(
-                        (template_path.parent / weight).resolve()
+                    module["weights_file"] = runtime_path(
+                        template_path.parent / weight
                     )
         observation["observation"]["observation_id"] = (
             observation_id_for_run_directory(root)
@@ -650,10 +872,12 @@ def compile_rate_plan(
     bootstrap_config.write_text(json.dumps(observation, indent=2) + "\n")
     bootstrap_artifacts = root / "observation-bootstrap-artifacts"
     _run_observation_compiler(
-        compiler_path, bootstrap_config, None, compiler_executor
+        compiler_path, bootstrap_config, None, request.aggregate_gbps,
+        compiler_executor
     )
     _run_observation_compiler(
-        compiler_path, bootstrap_config, bootstrap_artifacts, compiler_executor
+        compiler_path, bootstrap_config, bootstrap_artifacts,
+        request.aggregate_gbps, compiler_executor
     )
     bootstrap = RatePlan.from_artifact_directory(
         bootstrap_artifacts, request.aggregate_gbps,
@@ -701,10 +925,12 @@ def compile_rate_plan(
     final_config.write_text(json.dumps(observation, indent=2) + "\n")
     final_artifacts = root / "observation-artifacts"
     _run_observation_compiler(
-        compiler_path, final_config, None, compiler_executor
+        compiler_path, final_config, None, request.aggregate_gbps,
+        compiler_executor
     )
     _run_observation_compiler(
-        compiler_path, final_config, final_artifacts, compiler_executor
+        compiler_path, final_config, final_artifacts,
+        request.aggregate_gbps, compiler_executor
     )
     plan = RatePlan.from_artifact_directory(
         final_artifacts, request.aggregate_gbps, request.duration_seconds,
@@ -718,12 +944,15 @@ def compile_rate_plan(
     preparation_groups = (
         request.unpack_start_delay_seconds * packets_per_second
     )
-    return dataclasses.replace(
+    plan = dataclasses.replace(
         plan, reorder_horizon_groups=reorder_horizon_groups,
         worker_cpu_list=request.worker_cpu_list,
+        gpu_worker_cpu=request.gpu_worker_cpu,
         sink_cpu_list=request.sink_cpu_list,
         receiver_poll_cpu=request.receiver_poll_cpu,
         numa_node=request.numa_node,
+        ingress_numa_node=request.ingress_numa_node,
+        processing_numa_node=request.processing_numa_node,
         receiver_poll_batch=request.receiver_poll_batch,
         receiver_wr_num=request.receiver_wr_num,
         unpack_missing_per_second=request.unpack_missing_per_second,
@@ -732,6 +961,60 @@ def compile_rate_plan(
         packets_per_second=packets_per_second,
         sender_source_port=request.sender_source_port,
     )
+    profile_evidence: dict[str, Any]
+    if request.baseline_profile_path is not None:
+        try:
+            profile = task8c_profiles.load_profile(
+                pathlib.Path(request.baseline_profile_path)
+            )
+        except ValueError as error:
+            raise StageError(
+                "CONFIG_PREFLIGHT", ["load-profile", request.baseline_profile_path],
+                1, "", str(error), "HARNESS_FAIL"
+            ) from error
+        if profile.target_host != "qths1" or profile.pipeline_stage != request.pipeline_stage:
+            raise StageError(
+                "CONFIG_PREFLIGHT", ["validate-profile", str(profile.path)], 1,
+                "", "baseline profile host or pipeline stage does not match request",
+                "HARNESS_FAIL",
+            )
+        if (
+            request.baseline_profile_sha256 is not None
+            and profile.sha256 != request.baseline_profile_sha256
+        ):
+            raise StageError(
+                "CONFIG_PREFLIGHT", ["verify-profile", str(profile.path)], 1,
+                profile.sha256, request.baseline_profile_sha256,
+                "SYNC_FAIL",
+            )
+        differences = task8c_profiles.compare_profile(plan, profile)
+        if differences and not request.experiment_name:
+            raise StageError(
+                "CONFIG_PREFLIGHT", ["compare-profile", str(profile.path)], 1,
+                json.dumps(differences, sort_keys=True),
+                "baseline profile differs; name the experiment explicitly",
+                "HARNESS_FAIL",
+            )
+        profile_evidence = {
+            "status": "EXPERIMENT" if differences else "EXACT",
+            "profile_id": profile.profile_id,
+            "path": str(profile.path),
+            "sha256": profile.sha256,
+            "source_result": profile.source_result,
+            "experiment_name": request.experiment_name,
+            "differences": differences,
+        }
+    else:
+        profile_evidence = {
+            "status": "BOOTSTRAP_CANDIDATE",
+            "profile_id": None,
+            "path": None,
+            "sha256": None,
+            "source_result": None,
+            "experiment_name": request.experiment_name,
+            "differences": [],
+        }
+    return dataclasses.replace(plan, profile_evidence=profile_evidence)
 
 
 def observation_id_for_run_directory(run_directory: pathlib.Path) -> str:
@@ -881,17 +1164,112 @@ def build_sender_config(
     return result
 
 
+def build_process_supervisor() -> str:
+    """Return the remote wrapper that persists one qths process lifecycle."""
+    return '''#!/usr/bin/env python3
+import datetime
+import json
+import os
+import pathlib
+import signal
+import socket
+import subprocess
+import sys
+
+if len(sys.argv) < 3:
+    raise SystemExit("usage: supervise.py EXIT_PATH COMMAND [ARG ...]")
+
+exit_path = pathlib.Path(sys.argv[1])
+role = exit_path.stem
+process_path = exit_path.with_name(role + ".process.json")
+child_pid_path = exit_path.with_name(role + ".child.pid")
+argv = sys.argv[2:]
+child = None
+pending_signal = None
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def write(value):
+    temporary = process_path.with_suffix(process_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\\n")
+    temporary.replace(process_path)
+
+
+def forward(signum, _frame):
+    global pending_signal
+    pending_signal = signum
+    if child is not None and child.poll() is None:
+        child.send_signal(signum)
+
+
+signal.signal(signal.SIGTERM, forward)
+signal.signal(signal.SIGINT, forward)
+started = now()
+child = subprocess.Popen(argv)
+child_pid_path.write_text(str(child.pid) + "\\n")
+allowed_env = {
+    name: os.environ[name]
+    for name in (
+        "PATH", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS",
+        "MALLOC_ARENA_MAX", "TASK8C_NUMA_NODE"
+    )
+    if name in os.environ
+}
+try:
+    cpu_affinity = sorted(os.sched_getaffinity(child.pid))
+except (AttributeError, OSError):
+    cpu_affinity = []
+record = {
+    "schema_version": 1,
+    "host": socket.gethostname(),
+    "role": role,
+    "argv": argv,
+    "env": allowed_env,
+    "supervisor_pid": os.getpid(),
+    "pid": child.pid,
+    "cpu_affinity": cpu_affinity,
+    "numa_node": os.environ.get("TASK8C_NUMA_NODE"),
+    "started_utc": started,
+    "ended_utc": None,
+    "returncode": None,
+    "state": "RUNNING",
+}
+write(record)
+if pending_signal is not None and child.poll() is None:
+    child.send_signal(pending_signal)
+return_code = child.wait()
+exit_code = return_code if return_code >= 0 else 128 - return_code
+exit_path.write_text(str(exit_code) + "\\n")
+record.update({
+    "ended_utc": now(),
+    "returncode": exit_code,
+    "state": "EXITED",
+})
+write(record)
+raise SystemExit(exit_code)
+'''
+
+
 def build_qths_bundle(
     plan: RatePlan,
     remote_run_dir: str,
     dada_db_path: str = "dada_db",
     dbdisk_path: str = "dada_dbdisk",
     dbnull_path: str = "dada_dbnull",
+    dada_junkdb_path: str = "dada_junkdb",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
     ethtool_path: str = "ethtool",
 ) -> dict[str, str | bytes]:
     if not plan.artifact_files:
         raise ValueError("compiler artifact bundle is required")
+    if plan.pipeline_stage == "gpu":
+        return _build_gpu_qths_bundle(
+            plan, remote_run_dir, dada_db_path, dbdisk_path, dbnull_path,
+            dada_junkdb_path, qths_binary_dir,
+        )
     receive_only = plan.pipeline_stage == "receive"
     full_gpu_pipeline = plan.uses_pipeline_worker
     consumer_key = (
@@ -899,6 +1277,7 @@ def build_qths_bundle(
         else plan.output_key if full_gpu_pipeline
         else plan.compute_key
     )
+    consumer_name = plan.topology.consumer_ring
     receiver_device = str(plan.source["receiver"]["device"])
     receiver_args = ""
     if plan.receiver_poll_cpu is not None:
@@ -958,39 +1337,7 @@ temporary = path.with_suffix(path.suffix + ".tmp")
 temporary.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\\n")
 temporary.replace(path)
 '''
-    supervise = '''#!/usr/bin/env python3
-import pathlib
-import signal
-import subprocess
-import sys
-
-if len(sys.argv) < 3:
-    raise SystemExit("usage: supervise.py EXIT_PATH COMMAND [ARG ...]")
-
-exit_path = pathlib.Path(sys.argv[1])
-child = None
-pending_signal = None
-
-
-def forward(signum, _frame):
-    global pending_signal
-    pending_signal = signum
-    if child is not None and child.poll() is None:
-        child.send_signal(signum)
-
-
-signal.signal(signal.SIGTERM, forward)
-signal.signal(signal.SIGINT, forward)
-child = subprocess.Popen(sys.argv[2:])
-child_pid_path = exit_path.with_name(exit_path.stem + ".child.pid")
-child_pid_path.write_text(str(child.pid) + "\\n")
-if pending_signal is not None and child.poll() is None:
-    child.send_signal(pending_signal)
-return_code = child.wait()
-exit_code = return_code if return_code >= 0 else 128 - return_code
-exit_path.write_text(str(exit_code) + "\\n")
-raise SystemExit(exit_code)
-'''
+    supervise = build_process_supervisor()
     validate_worker_ready = '''#!/usr/bin/env python3
 import json
 import pathlib
@@ -1013,40 +1360,68 @@ for name, wanted in expected.items():
 if value.get("schema_version") != 1 or int(value.get("pid", 0)) <= 0:
     raise SystemExit("worker ready metadata is invalid")
 '''
-    numa_prefix = (
-        f"/usr/bin/numactl --membind={plan.numa_node} "
-        if plan.numa_node is not None else ""
-    )
-    sink_prefix = numa_prefix
+    ingress_numa = plan.effective_ingress_numa_node
+    processing_numa = plan.effective_processing_numa_node
+
+    def numa_prefix(node: int | None) -> str:
+        return (
+            f"/usr/bin/numactl --membind={node} "
+            if node is not None else ""
+        )
+
+    def numa_env(node: int | None) -> str:
+        return f"TASK8C_NUMA_NODE={node} " if node is not None else ""
+
+    ingress_prefix = numa_prefix(ingress_numa)
+    ingress_env = numa_env(ingress_numa)
+    processing_prefix = numa_prefix(processing_numa)
+    processing_env = numa_env(processing_numa)
+    sink_numa = ingress_numa if receive_only else processing_numa
+    sink_prefix = numa_prefix(sink_numa)
+    sink_env = numa_env(sink_numa)
     if plan.sink_cpu_list is not None:
         sink_prefix += f"/usr/bin/taskset -c {plan.sink_cpu_list} "
     if plan.compute_consumer == "dbnull":
-        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbnull_path} -k {consumer_key} -s -z -q >"$run_dir/reader.log" 2>&1 &
+        reader_start = f'''{sink_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbnull_path} -k {consumer_key} -s -z -q >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
     else:
-        reader_start = f'''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbdisk_path} -k {plan.compute_key} -D "$run_dir/compute" -s -W >"$run_dir/reader.log" 2>&1 &
+        reader_start = f'''{sink_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" {sink_prefix}{dbdisk_path} -k {consumer_key} -D "$run_dir/{consumer_name}" -s -W >"$run_dir/reader.log" 2>&1 &
 echo $! >"$run_dir/reader.pid"'''
-    compute_ring_prepare = "" if receive_only else f'''{numa_prefix}{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
+    compute_ring_prepare = "" if receive_only else f'''{processing_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/compute-ring.exit" {processing_prefix}{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
 echo $! >"$run_dir/compute-ring.pid"
 touch "$run_dir/compute-ring.created"
 '''
     prepare = f"""#!/usr/bin/env bash
 set -euo pipefail
 run_dir={remote_run_dir}
-mkdir -p "$run_dir/compute"
-{numa_prefix}{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
+mkdir -p "$run_dir/{consumer_name}"
+check_ring_owner() {{
+  name=$1
+  pid=$(cat "$run_dir/$name-ring.pid")
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "$name ring owner exited during prepare" >&2
+    if [[ -f "$run_dir/$name-ring.log" ]]; then
+      tail -n 80 "$run_dir/$name-ring.log" >&2
+    fi
+    exit 1
+  fi
+}}
+{ingress_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/raw-ring.exit" {ingress_prefix}{dada_db_path} -k {plan.raw_key} -b {plan.raw_block_bytes} -a 4096 -n {plan.raw_ring_blocks} -r 1 -p -w -l >"$run_dir/raw-ring.log" 2>&1 &
 echo $! >"$run_dir/raw-ring.pid"
 touch "$run_dir/raw-ring.created"
-{compute_ring_prepare}""" + (f'''{numa_prefix}{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
+{compute_ring_prepare}""" + (f'''{processing_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/output-ring.exit" {processing_prefix}{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
 echo $! >"$run_dir/output-ring.pid"
 touch "$run_dir/output-ring.created"
 ''' if full_gpu_pipeline else "") + f"""
 sleep 1
-kill -0 "$(cat "$run_dir/raw-ring.pid")"
-""" + ('kill -0 "$(cat "$run_dir/compute-ring.pid")"\n' if not receive_only else "") + ('kill -0 "$(cat "$run_dir/output-ring.pid")"\n' if full_gpu_pipeline else "")
+check_ring_owner raw
+""" + ("check_ring_owner compute\n" if not receive_only else "") + ("check_ring_owner output\n" if full_gpu_pipeline else "")
     pipeline_worker_start = ""
     if full_gpu_pipeline:
-        pipeline_worker_start = '''/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" "$project/pipeline_worker" "$run_dir/resolved_observation.json" >"$run_dir/pipeline-worker.log" 2>&1 &
+        gpu_worker_prefix = processing_prefix
+        if plan.gpu_worker_cpu is not None:
+            gpu_worker_prefix += f"/usr/bin/taskset -c {plan.gpu_worker_cpu} "
+        pipeline_worker_start = f'''{processing_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" {gpu_worker_prefix}"$project/pipeline_worker" "$run_dir/resolved_observation.json" --metrics-json "$run_dir/pipeline-worker-metrics.json" >"$run_dir/pipeline-worker.log" 2>&1 &
 echo $! >"$run_dir/pipeline-worker.pid"'''
     process_names = (
         ("reader", "pipeline-worker", "worker", "receiver")
@@ -1083,7 +1458,7 @@ report_readiness_failure() {
   report_readiness_state "$name"
 }
 '''
-    worker_program = numa_prefix + '"$project/vdif_unpack_worker"'
+    worker_program = processing_prefix + '"$project/vdif_unpack_worker"'
     worker_start = ""
     if not receive_only:
         worker_diagnostics = (
@@ -1103,7 +1478,7 @@ report_readiness_failure() {
             if plan.worker_cpu_list is not None else ""
         )
         worker_start = f'''rm -f "$run_dir/worker.ready"
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics}{pre_timeline_policy}{fixed_packet_rate}{thread_cpus} >"$run_dir/worker.log" 2>&1 &
+{processing_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/worker.exit" {worker_program} --plan "$run_dir/resolved_observation.json" --reorder-horizon-groups {plan.reorder_horizon_groups} --ready-file "$run_dir/worker.ready"{worker_diagnostics}{pre_timeline_policy}{fixed_packet_rate}{thread_cpus} >"$run_dir/worker.log" 2>&1 &
 echo $! >"$run_dir/worker.pid"
 for _ in $(seq 1 300); do
   if ! kill -0 "$(cat "$run_dir/worker.pid")" 2>/dev/null; then
@@ -1147,7 +1522,7 @@ project={qths_binary_dir}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {numa_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{receiver_args} >"$run_dir/receiver.log" 2>&1 &
+{ingress_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {ingress_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{receiver_args} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
@@ -1232,9 +1607,9 @@ import json
 from pathlib import Path
 
 run_dir = Path({remote_run_dir!r})
-files = sorted((run_dir / "compute").glob("*.dada"))
+files = sorted((run_dir / {consumer_name!r}).glob("*.dada"))
 if not files:
-    raise SystemExit("no compute DADA output")
+    raise SystemExit("no {consumer_name} DADA output")
 data_bytes = 0
 header_fields = None
 sample = b""
@@ -1260,10 +1635,10 @@ summary = {{
     "header": header_fields or {{}},
     "sample_hex": sample.hex(),
 }}
-(run_dir / "compute-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
+(run_dir / {f'{consumer_name}-summary.json'!r}).write_text(json.dumps(summary, indent=2) + "\\n")
 '''
     if plan.compute_consumer == "dbnull":
-        summary_name = "raw-summary.json" if receive_only else "compute-summary.json"
+        summary_name = f"{consumer_name}-summary.json"
         summarize = f'''#!/usr/bin/env python3
 import json
 from pathlib import Path
@@ -1282,9 +1657,9 @@ summary = {{
 '''
     worker_argv: list[str] = []
     if not receive_only:
-        if plan.numa_node is not None:
+        if processing_numa is not None:
             worker_argv += [
-                "/usr/bin/numactl", f"--membind={plan.numa_node}"
+                "/usr/bin/numactl", f"--membind={processing_numa}"
             ]
         worker_argv += [
             f"{qths_binary_dir}/vdif_unpack_worker",
@@ -1315,6 +1690,150 @@ summary = {{
     if not receive_only:
         bundle["validate_worker_ready.py"] = validate_worker_ready
         bundle["worker-argv.json"] = json.dumps(worker_argv, indent=2) + "\n"
+    return bundle
+
+
+def _build_gpu_qths_bundle(
+    plan: RatePlan,
+    remote_run_dir: str,
+    dada_db_path: str,
+    dbdisk_path: str,
+    dbnull_path: str,
+    dada_junkdb_path: str,
+    qths_binary_dir: str,
+) -> dict[str, str | bytes]:
+    """Build an isolated compute-ring -> GPU worker -> output-ring run."""
+    supervise = build_process_supervisor()
+    junk = derive_gpu_junk_input(plan)
+    sink_directory = "$run_dir/output"
+    processing_numa = plan.effective_processing_numa_node
+    numa_env = (
+        f"TASK8C_NUMA_NODE={processing_numa} "
+        if processing_numa is not None else ""
+    )
+    numa_prefix = (
+        f"/usr/bin/numactl --membind={processing_numa} "
+        if processing_numa is not None else ""
+    )
+    gpu_worker_prefix = numa_prefix
+    if plan.gpu_worker_cpu is not None:
+        gpu_worker_prefix += f"/usr/bin/taskset -c {plan.gpu_worker_cpu} "
+    sink_prefix = numa_prefix
+    if plan.sink_cpu_list is not None:
+        sink_prefix += f"/usr/bin/taskset -c {plan.sink_cpu_list} "
+    if plan.compute_consumer == "dbnull":
+        reader_start = (
+            f'{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" '
+            f'{sink_prefix}{dbnull_path} -k {plan.output_key} -s -z -q '
+            f'>"$run_dir/reader.log" 2>&1 &'
+        )
+    else:
+        reader_start = (
+            f'{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/reader.exit" '
+            f'{sink_prefix}{dbdisk_path} -k {plan.output_key} '
+            f'-D {sink_directory} -s -W >"$run_dir/reader.log" 2>&1 &'
+        )
+    prepare = f'''#!/usr/bin/env bash
+set -euo pipefail
+run_dir={remote_run_dir}
+mkdir -p "$run_dir/output"
+{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/compute-ring.exit" {numa_prefix}{dada_db_path} -k {plan.compute_key} -b {plan.compute_block_bytes} -a 4096 -n {plan.compute_ring_blocks} -r 1 -p -w -l >"$run_dir/compute-ring.log" 2>&1 &
+echo $! >"$run_dir/compute-ring.pid"
+touch "$run_dir/compute-ring.created"
+{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/output-ring.exit" {numa_prefix}{dada_db_path} -k {plan.output_key} -b {plan.output_block_bytes} -a 4096 -n {plan.output_ring_blocks} -r 1 -p -w -l >"$run_dir/output-ring.log" 2>&1 &
+echo $! >"$run_dir/output-ring.pid"
+touch "$run_dir/output-ring.created"
+sleep 1
+kill -0 "$(cat "$run_dir/compute-ring.pid")"
+kill -0 "$(cat "$run_dir/output-ring.pid")"
+'''
+    start = f'''#!/usr/bin/env bash
+set -euo pipefail
+run_dir={remote_run_dir}
+project={qths_binary_dir}
+{reader_start}
+echo $! >"$run_dir/reader.pid"
+{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" {gpu_worker_prefix}"$project/pipeline_worker" "$run_dir/resolved_observation.json" --metrics-json "$run_dir/pipeline-worker-metrics.json" >"$run_dir/pipeline-worker.log" 2>&1 &
+echo $! >"$run_dir/pipeline-worker.pid"
+sleep 1
+kill -0 "$(cat "$run_dir/reader.pid")"
+kill -0 "$(cat "$run_dir/pipeline-worker.pid")"
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/input-writer.exit" {dada_junkdb_path} -k {plan.compute_key} -b {junk.total_bytes} -t {junk.duration_seconds} -R {junk.megabytes_per_second} -z "$run_dir/gpu-input.header" >"$run_dir/input-writer.log" 2>&1 &
+echo $! >"$run_dir/input-writer.pid"
+touch "$run_dir/pipeline.ready"
+'''
+    finish = f'''#!/usr/bin/env bash
+set -euo pipefail
+run_dir={remote_run_dir}
+attempts=${{TASK8C_WAIT_ATTEMPTS:-600}}
+wait_sleep=${{TASK8C_WAIT_SLEEP:-0.1}}
+for name in input-writer pipeline-worker reader; do
+  pid=$(cat "$run_dir/$name.pid")
+  for _ in $(seq 1 "$attempts"); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep "$wait_sleep"
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "$name pid $pid did not exit" >&2
+    exit 1
+  fi
+  test "$(cat "$run_dir/$name.exit")" = 0
+done
+'''
+    cleanup = f'''#!/usr/bin/env bash
+set +e
+run_dir={remote_run_dir}
+status=0
+for name in input-writer pipeline-worker reader output-ring compute-ring; do
+  if [[ -f "$run_dir/$name.pid" ]]; then
+    pid=$(cat "$run_dir/$name.pid")
+    kill -TERM "$pid" 2>/dev/null
+    for _ in $(seq 1 100); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    kill -0 "$pid" 2>/dev/null && status=1
+  fi
+done
+if [[ -f "$run_dir/compute-ring.created" ]]; then
+  {dada_db_path} -d -k {plan.compute_key} || status=1
+fi
+if [[ -f "$run_dir/output-ring.created" ]]; then
+  {dada_db_path} -d -k {plan.output_key} || status=1
+fi
+exit "$status"
+'''
+    if plan.compute_consumer == "dbnull":
+        summarize = f'''#!/usr/bin/env python3
+import json
+import pathlib
+root = pathlib.Path({remote_run_dir!r})
+summary = {{"consumer": "dada_dbnull", "exit_code": int((root / "reader.exit").read_text()), "zero_copy": True, "single_transfer": True}}
+(root / "output-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
+'''
+    else:
+        summarize = f'''#!/usr/bin/env python3
+import json
+import pathlib
+root = pathlib.Path({remote_run_dir!r})
+files = sorted((root / "output").glob("*.dada"))
+if not files:
+    raise SystemExit("no output DADA file")
+payload_bytes = sum(path.stat().st_size - 4096 for path in files)
+summary = {{"consumer": "dada_dbdisk", "exit_code": int((root / "reader.exit").read_text()), "file_count": len(files), "data_bytes": payload_bytes}}
+(root / "output-summary.json").write_text(json.dumps(summary, indent=2) + "\\n")
+'''
+    bundle: dict[str, str | bytes] = dict(plan.artifact_files)
+    bundle.update({
+        "supervise.py": supervise,
+        "gpu-input.header": junk.input_header_bytes,
+        "prepare.sh": prepare,
+        "start.sh": start,
+        "finish.sh": finish,
+        "cleanup.sh": cleanup,
+        "summarize.py": summarize,
+    })
     return bundle
 
 
@@ -1391,12 +1910,17 @@ class RemoteObservationCompiler:
         known_hosts: pathlib.Path,
         compiler: pathlib.Path,
         run_directory: pathlib.Path,
+        remote_project_root: pathlib.Path = pathlib.Path(
+            "/home/user/wy/rdma_dada"
+        ),
     ) -> None:
         self.transport = transport
         self.known_hosts = pathlib.Path(known_hosts).with_name(
             pathlib.Path(known_hosts).name + ".compiler"
         )
         self.compiler = pathlib.Path(compiler)
+        self.local_project_root = pathlib.Path(__file__).resolve().parents[1]
+        self.remote_project_root = pathlib.PurePosixPath(remote_project_root)
         identity = re.sub(
             r"[^A-Za-z0-9_.-]+", "-", str(run_directory)
         ).strip("-.")
@@ -1404,6 +1928,15 @@ class RemoteObservationCompiler:
         self.remote_root = f"/tmp/task8c-compiler-{identity[-40:]}-{digest}"
         self._prepared = False
         self._sequence = 0
+
+    def map_runtime_path(self, path: pathlib.Path) -> str:
+        """Map repository-owned runtime inputs into the qths1 mirror."""
+        resolved = pathlib.Path(path).resolve()
+        try:
+            relative = resolved.relative_to(self.local_project_root)
+        except ValueError:
+            return str(resolved)
+        return str(self.remote_project_root.joinpath(*relative.parts))
 
     def _ssh(self, argv: Sequence[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         return self.transport.run(
@@ -1440,13 +1973,22 @@ class RemoteObservationCompiler:
         self._prepared = True
 
     def __call__(
-        self, config_path: pathlib.Path, output_directory: pathlib.Path | None
+        self,
+        config_path: pathlib.Path,
+        output_directory: pathlib.Path | None,
+        budget_payload_gbps: float,
     ) -> None:
         self._prepare()
         self._sequence += 1
         remote_config = f"{self.remote_root}/config-{self._sequence}.json"
         self._scp(str(config_path), f"qths1:{remote_config}")
-        argv = [str(self.compiler), "--config", remote_config]
+        budget_text = format(
+            decimal.Decimal(str(budget_payload_gbps)), "f"
+        ).rstrip("0").rstrip(".")
+        argv = [
+            str(self.compiler), "--config", remote_config,
+            "--budget-payload-gbps", budget_text,
+        ]
         if output_directory is None:
             argv.append("--preflight-only")
         else:
@@ -1507,6 +2049,7 @@ class SshBackend:
         self._rings_acquired: list[str] = []
         self._capability_added = False
         self._sender_processes: list[Any] = []
+        self._sender_runtime: list[dict[str, Any]] = []
         self._sender_endpoints: list[tuple[str, str, int]] = []
         self._sender_specs: list[SenderSpec] = []
         self._compute_consumer = "dbdisk"
@@ -1515,6 +2058,7 @@ class SshBackend:
             "dada_db": "dada_db",
             "dada_dbdisk": "dada_dbdisk",
             "dada_dbnull": "dada_dbnull",
+            "dada_junkdb": "dada_junkdb",
         }
         self._diagnostic_paths = {"ethtool": "ethtool"}
         self._sender_ethtool_paths: dict[str, str] = {}
@@ -1523,7 +2067,8 @@ class SshBackend:
         self, compiler: pathlib.Path, run_directory: pathlib.Path
     ) -> RemoteObservationCompiler:
         return RemoteObservationCompiler(
-            self.transport, self.known_hosts, compiler, run_directory
+            self.transport, self.known_hosts, compiler, run_directory,
+            self.project_root,
         )
 
     def _ssh(
@@ -1589,12 +2134,16 @@ class SshBackend:
         self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
         if self.known_hosts.exists():
             self.known_hosts.unlink()
-        self._sender_specs = sender_specs_for_plan(
-            plan, sender_source_identity(plan, identity)
+        self._sender_specs = (
+            sender_specs_for_plan(plan, sender_source_identity(plan, identity))
+            if plan.topology.uses_network_senders else []
         )
         for host in ("qths1", *(spec.host for spec in self._sender_specs)):
             self._bootstrap_host(host)
-        start = self._future_start_utc("PREPARE")
+        start = (
+            self._future_start_utc("PREPARE")
+            if plan.topology.uses_network_senders else None
+        )
         self.preparation = {
             "start_utc": start,
             "remote_run_dir": self.remote_run_dir,
@@ -1606,9 +2155,12 @@ class SshBackend:
         qths_root = bundle_root / "qths"
         qths_root.mkdir(parents=True, exist_ok=True)
         try:
-            self._sender_specs = sender_specs_for_plan(
-                plan,
-                sender_source_identity(plan, self.remote_run_dir),
+            self._sender_specs = (
+                sender_specs_for_plan(
+                    plan,
+                    sender_source_identity(plan, self.remote_run_dir),
+                )
+                if plan.topology.uses_network_senders else []
             )
         except ValueError as error:
             raise StageError(
@@ -1622,6 +2174,7 @@ class SshBackend:
             self._psrdada_paths["dada_db"],
             self._psrdada_paths["dada_dbdisk"],
             self._psrdada_paths["dada_dbnull"],
+            self._psrdada_paths["dada_junkdb"],
             str(self.qths_binary_dir),
             self._diagnostic_paths["ethtool"],
         ).items():
@@ -1684,11 +2237,14 @@ class SshBackend:
         required_psrdada_tools.append(
             "dada_dbnull" if plan.compute_consumer == "dbnull" else "dada_dbdisk"
         )
+        if plan.pipeline_stage == "gpu":
+            required_psrdada_tools.append("dada_junkdb")
         for tool in required_psrdada_tools:
             self._psrdada_paths[tool] = self._resolve_psrdada_tool(tool)
-        self._diagnostic_paths["ethtool"] = self._resolve_executable(
-            "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"), "qths1"
-        )
+        if plan.topology.uses_receiver:
+            self._diagnostic_paths["ethtool"] = self._resolve_executable(
+                "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"), "qths1"
+            )
         self._sender_ethtool_paths = {
             spec.host: self._resolve_executable(
                 "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"),
@@ -1724,28 +2280,33 @@ class SshBackend:
                 )
             probe_hashes[f"{host}:probe_sender_endpoint.py"] = local_probe_sha
             self._preflight_sender_endpoint(host, source_ip, source_port)
-        capture_path = bundle_root / "qths" / "capture_nic_counters.py"
-        local_capture_sha = self.transport.run(
-            ["sha256sum", str(capture_path)], "CONFIG_READY", True
-        ).stdout.split()[0]
-        for spec in self._sender_specs:
-            remote_capture = f"{self.remote_run_dir}/capture_nic_counters.py"
-            self.transport.run(
-                self._scp_argv(str(capture_path), f"{spec.host}:{remote_capture}"),
-                "CONFIG_READY", True,
-            )
-            remote_capture_sha = self._ssh(
-                spec.host, ["sha256sum", remote_capture], "CONFIG_READY"
+        if self._sender_specs:
+            capture_path = bundle_root / "qths" / "capture_nic_counters.py"
+            local_capture_sha = self.transport.run(
+                ["sha256sum", str(capture_path)], "CONFIG_READY", True
             ).stdout.split()[0]
-            if local_capture_sha != remote_capture_sha:
-                raise StageError(
-                    "CONFIG_READY", ["sha256sum", spec.host, remote_capture],
-                    1, f"local={local_capture_sha} remote={remote_capture_sha}",
-                    "sender NIC capture SHA mismatch",
+            for spec in self._sender_specs:
+                remote_capture = f"{self.remote_run_dir}/capture_nic_counters.py"
+                self.transport.run(
+                    self._scp_argv(
+                        str(capture_path), f"{spec.host}:{remote_capture}"
+                    ),
+                    "CONFIG_READY", True,
                 )
-            probe_hashes[f"{spec.host}:capture_nic_counters.py"] = (
-                local_capture_sha
-            )
+                remote_capture_sha = self._ssh(
+                    spec.host, ["sha256sum", remote_capture], "CONFIG_READY"
+                ).stdout.split()[0]
+                if local_capture_sha != remote_capture_sha:
+                    raise StageError(
+                        "CONFIG_READY",
+                        ["sha256sum", spec.host, remote_capture],
+                        1,
+                        f"local={local_capture_sha} remote={remote_capture_sha}",
+                        "sender NIC capture SHA mismatch",
+                    )
+                probe_hashes[f"{spec.host}:capture_nic_counters.py"] = (
+                    local_capture_sha
+                )
         qths_files = sorted((bundle_root / "qths").iterdir())
         qths_hashes: dict[str, str] = {}
         for path in qths_files:
@@ -1775,7 +2336,10 @@ class SshBackend:
         hashes.update(probe_hashes)
         hashes.update(self._transfer_sender_configs(bundle_root))
         binaries = [
-            ("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),
+            *(
+                (("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),)
+                if plan.topology.uses_receiver else ()
+            ),
             *(
                 (spec.host, "fpga_sender_sim",
                  self.sender_binary_dir / "fpga_sender_sim")
@@ -1823,17 +2387,19 @@ class SshBackend:
                     f"missing {tool} SHA256",
                 )
             binary_hashes[f"qths1:{tool}"] = output[0]
-        ethtool_path = self._diagnostic_paths["ethtool"]
-        output = self._ssh(
-            "qths1", ["sha256sum", ethtool_path], "CONFIG_READY"
-        ).stdout.split()
-        if not output:
-            raise StageError(
-                "CONFIG_READY", ["sha256sum", ethtool_path], 1, "",
-                "missing ethtool SHA256",
-            )
-        binary_hashes["qths1:ethtool"] = output[0]
-        binary_paths["qths1:ethtool"] = ethtool_path
+            binary_paths[f"qths1:{tool}"] = tool_path
+        if plan.topology.uses_receiver:
+            ethtool_path = self._diagnostic_paths["ethtool"]
+            output = self._ssh(
+                "qths1", ["sha256sum", ethtool_path], "CONFIG_READY"
+            ).stdout.split()
+            if not output:
+                raise StageError(
+                    "CONFIG_READY", ["sha256sum", ethtool_path], 1, "",
+                    "missing ethtool SHA256",
+                )
+            binary_hashes["qths1:ethtool"] = output[0]
+            binary_paths["qths1:ethtool"] = ethtool_path
         for host, sender_ethtool_path in self._sender_ethtool_paths.items():
             output = self._ssh(
                 host, ["sha256sum", sender_ethtool_path], "CONFIG_READY"
@@ -1845,17 +2411,19 @@ class SshBackend:
                 )
             binary_hashes[f"{host}:ethtool"] = output[0]
             binary_paths[f"{host}:ethtool"] = sender_ethtool_path
-        preflight_argv = [
-            str(self.qths_binary_dir / "rdma2dada"),
-            "--plan",
-            f"{self.remote_run_dir}/resolved_observation.json",
-            "--preflight-only",
-        ]
-        if plan.receiver_poll_cpu is not None:
-            preflight_argv += ["--poll-cpu", str(plan.receiver_poll_cpu)]
-        receiver_preflight = self._ssh(
-            "qths1", preflight_argv, "CONFIG_READY"
-        )
+        receiver_preflight = None
+        if plan.topology.uses_receiver:
+            preflight_argv = [
+                str(self.qths_binary_dir / "rdma2dada"),
+                "--plan",
+                f"{self.remote_run_dir}/resolved_observation.json",
+                "--preflight-only",
+            ]
+            if plan.receiver_poll_cpu is not None:
+                preflight_argv += ["--poll-cpu", str(plan.receiver_poll_cpu)]
+            receiver_preflight = self._ssh(
+                "qths1", preflight_argv, "CONFIG_READY"
+            ).stdout
         return {
             "config_sha": hashes,
             "binary_sha": binary_hashes,
@@ -1866,7 +2434,7 @@ class SshBackend:
             ],
             "config_id": plan.config_id,
             "geometry_id": plan.geometry_id,
-            "receiver_preflight": receiver_preflight.stdout,
+            "receiver_preflight": receiver_preflight,
         }
 
     def _resolve_psrdada_tool(self, tool: str) -> str:
@@ -1999,33 +2567,37 @@ class SshBackend:
                 error.stderr,
                 "ENV_BLOCKED",
             ) from error
-        self._rings_acquired = [plan.raw_key]
-        if plan.pipeline_stage != "receive":
-            self._rings_acquired.append(plan.compute_key)
-        if plan.uses_pipeline_worker:
-            self._rings_acquired.append(plan.output_key)
-        binary = str(self.qths_binary_dir / "rdma2dada")
-        try:
+        ring_key_resolvers = {
+            "raw": lambda: plan.raw_key,
+            "compute": lambda: plan.compute_key,
+            "output": lambda: plan.output_key,
+        }
+        self._rings_acquired = [
+            ring_key_resolvers[name]() for name in plan.topology.rings
+        ]
+        if plan.topology.requires_rdma_capability:
+            binary = str(self.qths_binary_dir / "rdma2dada")
+            try:
+                self._ssh(
+                    "qths1",
+                    ["sudo", "-n", "setcap", "cap_net_raw+ep", binary],
+                    "PIPELINE_READY",
+                )
+            except StageError as error:
+                raise StageError(
+                    error.stage,
+                    error.argv,
+                    error.exit_code,
+                    error.stdout,
+                    error.stderr,
+                    "ENV_BLOCKED",
+                ) from error
+            self._capability_added = True
             self._ssh(
                 "qths1",
-                ["sudo", "-n", "setcap", "cap_net_raw+ep", binary],
+                ["touch", f"{self.remote_run_dir}/capability.added"],
                 "PIPELINE_READY",
             )
-        except StageError as error:
-            raise StageError(
-                error.stage,
-                error.argv,
-                error.exit_code,
-                error.stdout,
-                error.stderr,
-                "ENV_BLOCKED",
-            ) from error
-        self._capability_added = True
-        self._ssh(
-            "qths1",
-            ["touch", f"{self.remote_run_dir}/capability.added"],
-            "PIPELINE_READY",
-        )
         try:
             self._ssh(
                 "qths1",
@@ -2043,7 +2615,7 @@ class SshBackend:
             ) from error
         readiness: dict[str, Any] = {
             "rings": list(self._rings_acquired),
-            "capability_added": True,
+            "capability_added": self._capability_added,
         }
         if plan.uses_unpack_worker:
             worker_ready_completed = self._ssh(
@@ -2097,6 +2669,7 @@ class SshBackend:
         self._capture_sender_nic("before")
         binary = str(self.sender_binary_dir / "fpga_sender_sim")
         started: list[Any] = []
+        self._sender_runtime = []
         for spec in self._sender_specs:
             host = spec.host
             config = f"{self.remote_run_dir}/{spec.remote_name}"
@@ -2117,20 +2690,54 @@ class SshBackend:
                 ) from error
             started.append(process)
             self._sender_processes.append(process)
+            self._sender_runtime.append({
+                "host": host,
+                "role": "sender",
+                "station_id": spec.station_id,
+                "argv": list(argv),
+                "env": {},
+                "cpu_affinity": [],
+                "numa_node": None,
+                "thread_mapping": [],
+                "config_sha256": plan.config_id,
+                "pid": getattr(process, "pid", None),
+                "output_path": str(log),
+                "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "ended_utc": None,
+                "returncode": None,
+                "state": "RUNNING",
+                "output": "",
+            })
+            self._persist_sender_runtime()
         return started
+
+    def _persist_sender_runtime(self) -> None:
+        if self._sender_runtime and self.local_run_dir:
+            _atomic_json(
+                self.local_run_dir / "sender-processes.json",
+                self._sender_runtime,
+            )
 
     def wait_senders(self, plan: RatePlan, processes: Sequence[Any]) -> list[str]:
         outputs = [""] * len(processes)
         pending = set(range(len(processes)))
         deadline = time.monotonic() + plan.duration_seconds + 300.0
 
-        def terminate_running() -> None:
-            for peer in processes:
+        def terminate_running(reason: str) -> None:
+            for peer_index, peer in enumerate(processes):
                 try:
                     if peer.poll() is None:
                         peer.terminate()
+                        if peer_index < len(self._sender_runtime):
+                            runtime = self._sender_runtime[peer_index]
+                            runtime["state"] = reason
+                            runtime["ended_utc"] = dt.datetime.now(
+                                dt.timezone.utc
+                            ).isoformat()
+                            runtime["returncode"] = peer.poll()
                 except Exception:
                     pass
+            self._persist_sender_runtime()
 
         def read_output(process: Any) -> str:
             stream = getattr(process, "_task8c_stream", None)
@@ -2153,16 +2760,31 @@ class SshBackend:
                 pending.remove(index)
                 output = read_output(process)
                 outputs[index] = output
+                if index < len(self._sender_runtime):
+                    runtime = self._sender_runtime[index]
+                    runtime["state"] = "EXITED"
+                    runtime["ended_utc"] = dt.datetime.now(
+                        dt.timezone.utc
+                    ).isoformat()
+                    runtime["returncode"] = int(returncode)
+                    runtime["output"] = output
+                    self._persist_sender_runtime()
                 if returncode != 0:
-                    terminate_running()
+                    terminate_running("TERMINATED_BY_PEER_FAILURE")
                     classification = (
                         "ENV_BLOCKED"
                         if "bind source endpoint:" in output
+                        else "HARNESS_FAIL" if returncode == 255
                         else "PRODUCT_FAIL"
+                    )
+                    failure_argv = (
+                        self._sender_runtime[index]["argv"]
+                        if index < len(self._sender_runtime)
+                        else ["fpga_sender_sim", str(index)]
                     )
                     raise StageError(
                         "SENDERS_RUNNING",
-                        ["fpga_sender_sim", str(index)],
+                        failure_argv,
                         int(returncode),
                         output,
                         "sender exited non-zero; aborting all Station streams",
@@ -2171,7 +2793,7 @@ class SshBackend:
             if not pending:
                 break
             if time.monotonic() >= deadline:
-                terminate_running()
+                terminate_running("TERMINATED_BY_GROUP_TIMEOUT")
                 raise StageError(
                     "SENDERS_RUNNING",
                     ["fpga_sender_sim", "all"],
@@ -2198,16 +2820,66 @@ class SshBackend:
         )
         qths_copy = run_dir / "qths"
         qths_copy.mkdir(exist_ok=True)
-        summary_name = (
-            "raw-summary.json" if plan.pipeline_stage == "receive"
-            else "compute-summary.json"
-        )
+        qths_process_roles = [
+            role for role in required_process_roles(plan.topology)
+            if role != "sender"
+        ]
+        process_files = {
+            "rdma2dada": "receiver.process.json",
+            "vdif_unpack_worker": "worker.process.json",
+            "pipeline_worker": "pipeline-worker.process.json",
+            "dada_junkdb": "input-writer.process.json",
+            f"{plan.topology.consumer_ring}-consumer": "reader.process.json",
+            "raw-ring": "raw-ring.process.json",
+            "compute-ring": "compute-ring.process.json",
+            "output-ring": "output-ring.process.json",
+        }
+        process_artifacts = [
+            process_files[role] for role in qths_process_roles
+            if role in process_files
+        ]
+        if plan.pipeline_stage == "gpu":
+            artifact_names = [
+                "pipeline.ready", "pipeline-worker.log", "reader.log",
+                "reader.exit", "input-writer.log", "input-writer.exit",
+                "pipeline-worker-metrics.json",
+                "output-summary.json", "MANIFEST.sha256",
+                "resolved_observation.json", "ring_plan.json",
+                "unpacked.header", "output.header", "validation_report.json",
+            ] + process_artifacts
+            for name in artifact_names:
+                self.transport.run(
+                    self._scp_argv(
+                        f"qths1:{self.remote_run_dir}/{name}",
+                        str(qths_copy / name),
+                    ),
+                    "COLLECTING", True,
+                )
+            pipeline_log = (qths_copy / "pipeline-worker.log").read_text()
+            if "pipeline transfer completed" not in pipeline_log:
+                raise StageError(
+                    "COLLECTING", ["parse", "pipeline-worker.log"], 1,
+                    pipeline_log, "missing pipeline worker completed marker",
+                    "PRODUCT_FAIL",
+                )
+            return {
+                "gpu": {
+                    "completed": True,
+                    "metrics": json.loads(
+                        (qths_copy / "pipeline-worker-metrics.json").read_text()
+                    ),
+                },
+                "output": json.loads(
+                    (qths_copy / "output-summary.json").read_text()
+                ),
+            }
+        summary_name = f"{plan.topology.consumer_ring}-summary.json"
         artifact_names = [
             "receiver.log", "pipeline.ready", "reader.log",
             "nic-before.json", "nic-after.json", summary_name,
             "MANIFEST.sha256", "resolved_observation.json", "ring_plan.json",
             "raw.header", "validation_report.json",
-        ]
+        ] + process_artifacts
         if plan.uses_unpack_worker:
             artifact_names.extend((
                 "worker.log", "worker.ready", "worker-affinity.txt",
@@ -2216,7 +2888,10 @@ class SshBackend:
         if plan.compute_consumer == "dbnull":
             artifact_names.append("reader.exit")
         if plan.uses_pipeline_worker:
-            artifact_names.extend(("pipeline-worker.log", "output.header"))
+            artifact_names.extend((
+                "pipeline-worker.log", "pipeline-worker-metrics.json",
+                "output.header",
+            ))
         for name in artifact_names:
             self.transport.run(
                 self._scp_argv(
@@ -2240,6 +2915,10 @@ class SshBackend:
                 pipeline_worker_log,
                 expect_pipeline_worker=plan.uses_pipeline_worker,
                 expect_missing_per_second=plan.unpack_missing_per_second,
+            )
+        if plan.uses_pipeline_worker:
+            statistics.setdefault("gpu", {})["metrics"] = json.loads(
+                (qths_copy / "pipeline-worker-metrics.json").read_text()
             )
         statistics["nic"] = nic_counter_evidence(
             json.loads((qths_copy / "nic-before.json").read_text()),
@@ -2309,13 +2988,22 @@ class SshBackend:
         if self.remote_run_dir and has_runtime_resources:
             diagnostic_root = run_dir / "qths-cleanup"
             diagnostic_root.mkdir(exist_ok=True)
-            diagnostic_names = [
-                "receiver.log", "pipeline.ready", "reader.log",
-                "nic-before.json", "nic-after.json", "raw-ring.log",
-                "raw-summary.json" if self._pipeline_stage == "receive"
-                else "compute-summary.json",
-            ]
-            if self._pipeline_stage != "receive":
+            if self._pipeline_stage == "gpu":
+                diagnostic_names = [
+                    "pipeline.ready", "reader.log", "reader.exit",
+                    "pipeline-worker.log", "input-writer.log",
+                    "input-writer.exit", "compute-ring.log",
+                    "output-ring.log", "output-summary.json",
+                    "pipeline-worker-metrics.json",
+                ]
+            else:
+                diagnostic_names = [
+                    "receiver.log", "pipeline.ready", "reader.log",
+                    "nic-before.json", "nic-after.json", "raw-ring.log",
+                    f"{pipeline_topology(self._pipeline_stage).consumer_ring}"
+                    "-summary.json",
+                ]
+            if self._pipeline_stage in ("unpack", "full"):
                 diagnostic_names.extend((
                     "worker.log", "worker.ready", "worker-affinity.txt",
                     "worker-argv.json", "compute-ring.log",
@@ -2350,6 +3038,24 @@ class SshBackend:
                 record_nonzero(completed)
             except Exception as error:
                 errors.append(repr(error))
+            diagnostic_root = run_dir / "qths-cleanup"
+            diagnostic_root.mkdir(exist_ok=True)
+            for name in (
+                "raw-ring.process.json", "compute-ring.process.json",
+                "output-ring.process.json", "receiver.process.json",
+                "worker.process.json", "pipeline-worker.process.json",
+                "reader.process.json", "input-writer.process.json",
+            ):
+                completed = self.transport.run(
+                    self._scp_argv(
+                        f"qths1:{self.remote_run_dir}/{name}",
+                        str(diagnostic_root / name),
+                    ),
+                    "CLEANUP", check=False,
+                )
+                diagnostic = nonzero_diagnostic(completed)
+                if diagnostic is not None:
+                    diagnostic_errors.append(diagnostic)
         if self.remote_run_dir:
             try:
                 completed = self._ssh(
@@ -2446,6 +3152,50 @@ def _validate_sender(
 def _validate_statistics(
     statistics: dict[str, Any], plan: RatePlan, expected_sample_prefix: str
 ) -> None:
+    if plan.pipeline_stage == "gpu":
+        junk = derive_gpu_junk_input(plan)
+        required = {
+            ("gpu", "completed"): True,
+            ("gpu", "metrics", "blocks"): junk.block_count,
+            ("gpu", "metrics", "input_bytes"): junk.total_bytes,
+            ("gpu", "metrics", "output_bytes"): (
+                junk.block_count * plan.output_block_bytes
+            ),
+            ("output", "exit_code"): 0,
+        }
+        if plan.compute_consumer == "dbnull":
+            required.update({
+                ("output", "consumer"): "dada_dbnull",
+                ("output", "zero_copy"): True,
+                ("output", "single_transfer"): True,
+            })
+        mismatches = []
+        for path, expected in required.items():
+            actual: Any = statistics
+            for name in path:
+                actual = actual.get(name) if isinstance(actual, dict) else None
+            if actual != expected:
+                mismatches.append({
+                    "field": ".".join(path),
+                    "expected": expected,
+                    "actual": actual,
+                })
+        gpu_metrics = statistics.get("gpu", {}).get("metrics", {})
+        for name in ("transfer_elapsed_ns", "input_payload_gbps"):
+            actual = gpu_metrics.get(name) if isinstance(gpu_metrics, dict) else None
+            if not isinstance(actual, (int, float)) or actual <= 0:
+                mismatches.append({
+                    "field": f"gpu.metrics.{name}",
+                    "expected": "> 0",
+                    "actual": actual,
+                })
+        if mismatches:
+            raise StageError(
+                "COLLECTING", ["validate", "gpu-statistics"], 1,
+                json.dumps(statistics, sort_keys=True),
+                json.dumps(mismatches, sort_keys=True), "PRODUCT_FAIL",
+            )
+        return
     expected_receiver_records = plan.sender_group_count * plan.nant
     expected_unpack_records = plan.group_count * plan.nant
     expected_data_bytes = plan.group_count * plan.payload_bytes * plan.nant
@@ -2481,19 +3231,35 @@ def _validate_statistics(
             ("unpack", "missing_station"): 0,
         })
     if plan.pipeline_stage != "receive" and plan.compute_consumer == "dbnull":
+        sink_section = "output" if plan.uses_pipeline_worker else "compute"
         required.update(
             {
-                ("compute", "consumer"): "dada_dbnull",
-                ("compute", "exit_code"): 0,
-                ("compute", "zero_copy"): True,
-                ("compute", "single_transfer"): True,
+                (sink_section, "consumer"): "dada_dbnull",
+                (sink_section, "exit_code"): 0,
+                (sink_section, "zero_copy"): True,
+                (sink_section, "single_transfer"): True,
             }
         )
         if plan.uses_pipeline_worker:
             required[("gpu", "completed")] = True
     elif plan.pipeline_stage != "receive":
-        required.update(
-            {
+        if plan.uses_pipeline_worker:
+            groups_per_block = plan.records_per_block // plan.nant
+            output_blocks = (
+                plan.group_count + groups_per_block - 1
+            ) // groups_per_block
+            output_contract = plan.resolved_plan.get("output_contract", {})
+            required.update({
+                ("output", "data_bytes"): (
+                    output_blocks * plan.output_block_bytes
+                ),
+                ("output", "DATA_STAGE"): output_contract.get("data_stage"),
+                ("output", "ORDER"): output_contract.get("order"),
+                ("output", "CONFIG_ID"): plan.config_id,
+                ("output", "GEOMETRY_ID"): plan.geometry_id,
+            })
+        else:
+            required.update({
                 ("compute", "data_bytes"): expected_data_bytes,
                 ("compute", "DATA_STAGE"): "UNPACKED",
                 ("compute", "ORDER"): "ATFP",
@@ -2503,8 +3269,7 @@ def _validate_statistics(
                 ("compute", "CONFIG_ID"): plan.config_id,
                 ("compute", "GEOMETRY_ID"): plan.geometry_id,
                 ("compute", "sample_prefix_hex"): expected_sample_prefix,
-            }
-        )
+            })
     mismatches = []
     if plan.unpack_start_delay_seconds:
         receiver = statistics.get("receiver", {})
@@ -2591,10 +3356,13 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
         r"repost_batches=(\d+),\s*min_posted_wrs=(\d+),\s*"
         r"poll_batch_high_watermark=(\d+),\s*"
         r"completion_to_repost_ns_total=(\d+),\s*"
-        r"completion_to_repost_ns_max=(\d+)",
+        r"completion_to_repost_ns_max=(\d+)"
+        r"(?:,\s*drain_duration_ns=(\d+),\s*"
+        r"completions_after_stop=(\d+),\s*exit_reason=([A-Z_]+))?",
         receiver_log,
     )
     if direct_match:
+        numeric_groups = direct_match.groups()[:10]
         result["direct"] = dict(zip(
             (
                 "poll_calls", "empty_polls", "full_polls",
@@ -2603,8 +3371,14 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
                 "completion_to_repost_ns_total",
                 "completion_to_repost_ns_max",
             ),
-            (int(value) for value in direct_match.groups()),
+            (int(value) for value in numeric_groups),
         ))
+        if direct_match.group(11) is not None:
+            result["direct"].update({
+                "drain_duration_ns": int(direct_match.group(11)),
+                "completions_after_stop": int(direct_match.group(12)),
+                "exit_reason": direct_match.group(13),
+            })
     return result
 
 
@@ -2695,12 +3469,14 @@ def parse_qths_statistics(
             worker_log,
             "missing unpack skew or per-Station diagnostics",
         )
+    summary_section = "output" if expect_pipeline_worker else "compute"
+    summary_filename = f"{summary_section}-summary.json"
     if compute_summary.get("consumer") == "dada_dbnull":
-        compute = _parse_dbnull_summary(compute_summary, "compute-summary.json")
+        sink = _parse_dbnull_summary(compute_summary, summary_filename)
     else:
         header = compute_summary.get("header", {})
         try:
-            compute = {
+            sink = {
                 "data_bytes": int(compute_summary["data_bytes"]),
                 "DATA_STAGE": header["DATA_STAGE"],
                 "ORDER": header["ORDER"],
@@ -2715,7 +3491,7 @@ def parse_qths_statistics(
         except (KeyError, TypeError, ValueError) as error:
             raise StageError(
                 "COLLECTING",
-                ["parse", "compute-summary.json"],
+                ["parse", summary_filename],
                 1,
                 json.dumps(compute_summary, sort_keys=True),
                 repr(error),
@@ -2803,7 +3579,7 @@ def parse_qths_statistics(
     result = {
         "receiver": receiver,
         "unpack": unpack,
-        "compute": compute,
+        summary_section: sink,
     }
     if compute_summary.get("consumer") == "dada_dbnull" and expect_pipeline_worker:
         if "pipeline transfer completed" not in pipeline_worker_log:
@@ -2835,13 +3611,22 @@ class RatePointController:
         self.run_dir = self.result_root / self.run_id
 
     def _state(self, state: str, **extra: Any) -> None:
-        _atomic_json(self.run_dir / "state.json", {"state": state, **extra})
+        entry = {
+            "state": state,
+            "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            **extra,
+        }
+        _atomic_json(self.run_dir / "state.json", entry)
+        history_path = self.run_dir / "state-history.jsonl"
+        with history_path.open("a") as stream:
+            stream.write(json.dumps(entry, sort_keys=True) + "\n")
 
     def _manifest(self, plan: RatePlan) -> dict[str, Any]:
         controller_path = pathlib.Path(__file__).resolve()
-        sender_hosts = [
-            spec.host for spec in sender_specs_for_plan(plan, self.run_id)
-        ]
+        sender_hosts = (
+            [spec.host for spec in sender_specs_for_plan(plan, self.run_id)]
+            if plan.topology.uses_network_senders else []
+        )
         return {
             "run_id": self.run_id,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -2849,6 +3634,11 @@ class RatePointController:
             "plan": plan.as_dict(),
             "controller": str(controller_path),
             "controller_sha256": hashlib.sha256(controller_path.read_bytes()).hexdigest(),
+            "launcher": {
+                "argv": list(sys.argv),
+                "pid": os.getpid(),
+                "pgid": os.getpgrp(),
+            },
             "git_commit": None,
             "git_required_on_test_host": False,
             "python_version": sys.version,
@@ -2926,28 +3716,36 @@ class RatePointController:
             _atomic_json(self.run_dir / "manifest.json", manifest)
             self._state("PIPELINE_READY", **config,
                         readiness=manifest["pipeline_ready"])
-            processes = self.backend.start_senders(plan, self.run_dir)
-            resources.processes = list(processes)
-            self._state("SENDERS_WAITING")
-            sender_outputs = self.backend.wait_senders(plan, processes)
-            self._state("SENDERS_RUNNING")
-            summaries = [_parse_sender_summary(output) for output in sender_outputs]
-            stations = plan.source["observation"]["station_ids"]
-            if len(summaries) != len(stations):
-                raise StageError(
-                    "SENDERS_RUNNING",
-                    ["validate", "sender-count"],
-                    1,
-                    str(len(summaries)),
-                    str(len(stations)),
-                    "PRODUCT_FAIL",
-                )
-            for summary, station in zip(summaries, stations):
-                _validate_sender(summary, plan.per_station_gbps, int(station))
+            summaries: list[dict[str, Any]] = []
+            if plan.topology.uses_network_senders:
+                processes = self.backend.start_senders(plan, self.run_dir)
+                resources.processes = list(processes)
+                self._state("SENDERS_WAITING")
+                sender_outputs = self.backend.wait_senders(plan, processes)
+                self._state("SENDERS_RUNNING")
+                summaries = [
+                    _parse_sender_summary(output) for output in sender_outputs
+                ]
+                stations = plan.source["observation"]["station_ids"]
+                if len(summaries) != len(stations):
+                    raise StageError(
+                        "SENDERS_RUNNING",
+                        ["validate", "sender-count"],
+                        1,
+                        str(len(summaries)),
+                        str(len(stations)),
+                        "PRODUCT_FAIL",
+                    )
+                for summary, station in zip(summaries, stations):
+                    _validate_sender(
+                        summary, plan.per_station_gbps, int(station)
+                    )
             self._state("COLLECTING")
             statistics = self.backend.collect(plan, self.run_dir)
             _validate_statistics(
-                statistics, plan, str(summaries[0]["payload_prefix_hex"])
+                statistics,
+                plan,
+                str(summaries[0]["payload_prefix_hex"]) if summaries else "",
             )
             result.update(
                 {
@@ -3128,6 +3926,298 @@ class RatePointController:
         return self.preflight(plan)
 
 
+_EVIDENCE_LINE = re.compile(
+    r"(?:^\s*\{.*\}\s*$|Receive summary:|Direct receive summary:|"
+    r"VDIF unpack statistics:|VDIF unpack station statistics:|"
+    r"VDIF missing per second:|transfer (?:opened|completed)|\bEOD\b|"
+    r"\b(?:ERROR|WARNING|WARN|FAIL|FATAL)\b|Could not |"
+    r"Created DADA |Destroyed DADA )",
+    re.IGNORECASE,
+)
+
+
+def _suite_identity_matches(name: str, existing: bytes, candidate: bytes) -> bool:
+    if name != "resolved_observation.json":
+        return existing == candidate
+    try:
+        existing_json = json.loads(existing)
+        candidate_json = json.loads(candidate)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return existing == candidate
+    if not isinstance(existing_json, dict) or not isinstance(candidate_json, dict):
+        return existing_json == candidate_json
+    existing_json.pop("source_path", None)
+    candidate_json.pop("source_path", None)
+    return existing_json == candidate_json
+
+
+def _copy_suite_identity(run_dir: pathlib.Path, suite_root: pathlib.Path,
+                         result: dict[str, Any]) -> None:
+    """Copy immutable configuration identity once per compact suite."""
+    candidates: dict[str, pathlib.Path] = {
+        "observation.json": run_dir / "observation.json",
+        "resolved_observation.json": (
+            run_dir / "observation-artifacts" / "resolved_observation.json"
+        ),
+    }
+    plan = result.get("plan", {})
+    resolved = plan.get("resolved_plan", {}) if isinstance(plan, dict) else {}
+    generated: dict[str, bytes] = {}
+    if not candidates["resolved_observation.json"].is_file() and resolved:
+        generated["resolved_observation.json"] = (
+            json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+        ).encode()
+    if not candidates["observation.json"].is_file() and resolved:
+        source_json = resolved.get("source_json")
+        if isinstance(source_json, str):
+            try:
+                source = json.loads(source_json)
+            except json.JSONDecodeError:
+                source = None
+            if source is not None:
+                generated["observation.json"] = (
+                    json.dumps(source, indent=2, sort_keys=True) + "\n"
+                ).encode()
+    for name, source in candidates.items():
+        contents = source.read_bytes() if source.is_file() else generated.get(name)
+        if contents is None:
+            continue
+        destination = suite_root / name
+        if destination.exists() and not _suite_identity_matches(
+            name, destination.read_bytes(), contents
+        ):
+            raise ValueError(f"suite configuration identity changed: {name}")
+        if not destination.exists():
+            destination.write_bytes(contents)
+
+
+def _load_json_file(path: pathlib.Path, default: Any) -> Any:
+    if not path.is_file():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _compact_processes(run_dir: pathlib.Path,
+                       manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    processes: list[dict[str, Any]] = []
+    launcher = manifest.get("launcher")
+    if isinstance(launcher, dict):
+        processes.append({"host": "HF", "role": "controller", **launcher})
+    configured = manifest.get("config", {}).get("processes", [])
+    if isinstance(configured, list):
+        processes.extend(item for item in configured if isinstance(item, dict))
+    sender_runtime = _load_json_file(run_dir / "sender-processes.json", [])
+    if isinstance(sender_runtime, list):
+        processes.extend(item for item in sender_runtime if isinstance(item, dict))
+    role_by_file = {
+        "raw-ring.process.json": "raw-ring",
+        "compute-ring.process.json": "compute-ring",
+        "output-ring.process.json": "output-ring",
+        "receiver.process.json": "rdma2dada",
+        "worker.process.json": "vdif_unpack_worker",
+        "pipeline-worker.process.json": "pipeline_worker",
+        "input-writer.process.json": "dada_junkdb",
+    }
+    plan = manifest.get("plan", {})
+    consumer_ring = pipeline_topology(
+        str(plan.get("pipeline_stage", "full"))
+    ).consumer_ring if isinstance(plan, dict) else "output"
+    role_by_file["reader.process.json"] = f"{consumer_ring}-consumer"
+    qths_records: dict[str, dict[str, Any]] = {}
+    for root_name in ("qths", "qths-cleanup"):
+        root = run_dir / root_name
+        for file_name, role in role_by_file.items():
+            value = _load_json_file(root / file_name, None)
+            if isinstance(value, dict):
+                value = dict(value)
+                value["host"] = "qths1"
+                value["role"] = role
+                qths_records[role] = value
+    binary_sha = manifest.get("config", {}).get("binary_sha", {})
+    binary_path = manifest.get("config", {}).get("binary_path", {})
+    consumer_tool = (
+        "dada_dbnull"
+        if isinstance(plan, dict) and plan.get("compute_consumer") == "dbnull"
+        else "dada_dbdisk"
+    )
+    binary_role = {
+        "raw-ring": "dada_db",
+        "compute-ring": "dada_db",
+        "output-ring": "dada_db",
+        "rdma2dada": "rdma2dada",
+        "vdif_unpack_worker": "vdif_unpack_worker",
+        "pipeline_worker": "pipeline_worker",
+        "dada_junkdb": "dada_junkdb",
+        f"{consumer_ring}-consumer": consumer_tool,
+    }
+    worker_affinity = ""
+    for root_name in ("qths", "qths-cleanup"):
+        affinity_path = run_dir / root_name / "worker-affinity.txt"
+        if affinity_path.is_file():
+            worker_affinity = affinity_path.read_text(errors="replace").strip()
+    for role, value in qths_records.items():
+        binary_name = binary_role.get(role)
+        key = f"qths1:{binary_name}" if binary_name else ""
+        value["binary_sha256"] = binary_sha.get(key)
+        value["binary_path"] = binary_path.get(key)
+        value["config_sha256"] = (
+            plan.get("config_id") if isinstance(plan, dict) else None
+        )
+        value.setdefault("thread_mapping", [])
+        if role == "vdif_unpack_worker" and worker_affinity:
+            value["thread_mapping"] = worker_affinity.splitlines()
+        processes.append(value)
+    for value in processes:
+        if value.get("role") == "sender":
+            host = value.get("host")
+            key = f"{host}:fpga_sender_sim"
+            value["binary_sha256"] = binary_sha.get(key)
+            value["binary_path"] = binary_path.get(key)
+            value.setdefault(
+                "config_sha256",
+                plan.get("config_id") if isinstance(plan, dict) else None,
+            )
+            value.setdefault("thread_mapping", [])
+    return processes
+
+
+def _compact_evidence(run_dir: pathlib.Path, result: dict[str, Any]) -> str:
+    lines = [
+        "[controller] TEST_RESULT=" + str(result.get("TEST_RESULT", "UNKNOWN")),
+        "[controller] CLEANUP_RESULT=" + str(
+            result.get("cleanup", {}).get("CLEANUP_RESULT", "UNKNOWN")
+        ),
+    ]
+    for path in sorted(run_dir.rglob("*.log")):
+        try:
+            relative = path.relative_to(run_dir)
+            source_lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in source_lines:
+            if _EVIDENCE_LINE.search(line):
+                lines.append(f"[{relative}] {line}")
+    for relative_name in (
+        "qths/pipeline-worker-metrics.json",
+        "qths-cleanup/pipeline-worker-metrics.json",
+    ):
+        path = run_dir / relative_name
+        if not path.is_file():
+            continue
+        for line in path.read_text(errors="replace").splitlines():
+            lines.append(f"[{relative_name}] {line}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_failure_debug(suite_root: pathlib.Path, run_id: str,
+                         result: dict[str, Any]) -> None:
+    failure = result.get("failure")
+    if result.get("TEST_RESULT") == "PASS" or not isinstance(failure, dict):
+        return
+    debug = suite_root / "debug" / run_id
+    debug.mkdir(parents=True, exist_ok=True)
+    _atomic_json(debug / "failed-command.json", {
+        "stage": failure.get("stage"),
+        "argv": failure.get("argv", []),
+        "exit_code": failure.get("exit_code"),
+        "classification": failure.get(
+            "classification", result.get("TEST_RESULT")
+        ),
+    })
+    stdout = str(failure.get("stdout", ""))
+    stderr = str(failure.get("stderr", ""))
+    (debug / "failed-process.log").write_text(
+        stdout.rstrip("\n") + "\n" + stderr.rstrip("\n") + "\n"
+    )
+    _atomic_json(debug / "resource-snapshot.json", {
+        "cleanup": result.get("cleanup", {}),
+        "statistics": result.get("statistics", {}),
+    })
+
+
+def compact_suite_run(suite_root: pathlib.Path, run_id: str,
+                      result: dict[str, Any]) -> dict[str, Any]:
+    """Replace a completed verbose run directory with JSON plus raw evidence."""
+    suite_root = pathlib.Path(suite_root)
+    run_dir = suite_root / run_id
+    runs_root = suite_root / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    _copy_suite_identity(run_dir, suite_root, result)
+    manifest = _load_json_file(run_dir / "manifest.json", {})
+    preflight_path = suite_root / "preflight.json"
+    if not preflight_path.exists():
+        _atomic_json(preflight_path, {
+            "run_id": run_id,
+            "created_utc": manifest.get("created_utc"),
+            "hosts": manifest.get("hosts", []),
+            "plan": manifest.get("plan", {}),
+            "profile_evidence": manifest.get("plan", {}).get(
+                "profile_evidence", {}
+            ),
+            "controller": manifest.get("controller"),
+            "controller_sha256": manifest.get("controller_sha256"),
+            "preparation": manifest.get("preparation", result.get("preparation", {})),
+            "config": manifest.get("config", {}),
+            "pipeline_ready": manifest.get("pipeline_ready", {}),
+        })
+    stages = []
+    history = run_dir / "state-history.jsonl"
+    if history.is_file():
+        for line in history.read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                stages.append(value)
+    compact = dict(result)
+    compact["processes"] = _compact_processes(run_dir, manifest)
+    manifest_plan = manifest.get("plan")
+    binary_sha = manifest.get("config", {}).get("binary_sha")
+    if (
+        result.get("TEST_RESULT") == "PASS"
+        and isinstance(manifest_plan, dict)
+        and isinstance(binary_sha, dict)
+        and binary_sha
+    ):
+        topology = pipeline_topology(str(manifest_plan["pipeline_stage"]))
+        try:
+            task8c_artifacts.validate_process_ledger(
+                compact["processes"], required_process_roles(topology),
+                {"sender": int(manifest_plan.get("nant", 1))}
+                if topology.uses_network_senders else None,
+            )
+        except ValueError as error:
+            compact["TEST_RESULT"] = "HARNESS_FAIL"
+            compact["failure"] = {
+                "stage": "ARTIFACT_COMPACTION",
+                "argv": ["validate", "process-ledger"],
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": str(error),
+                "classification": "HARNESS_FAIL",
+            }
+    compact["stages"] = stages
+    evidence_path = runs_root / f"{run_id}.evidence.log"
+    evidence_path.write_text(_compact_evidence(run_dir, compact))
+    compact["evidence_file"] = evidence_path.name
+    compact["evidence_sha256"] = hashlib.sha256(
+        evidence_path.read_bytes()
+    ).hexdigest()
+    _atomic_json(runs_root / f"{run_id}.json", compact)
+    _write_failure_debug(suite_root, run_id, compact)
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    return compact
+
+
+def _write_suite_manifest(suite_root: pathlib.Path) -> None:
+    task8c_artifacts.write_manifest(suite_root)
+
+
 def run_rate_sequence(
     plan: RatePlan,
     backend_factory: Any,
@@ -3152,6 +4242,7 @@ def run_rate_sequence(
             result = RatePointController(
                 backend_factory(), suite_root, run_id=run_id
             ).run(plan)
+            result = compact_suite_run(suite_root, run_id, result)
             runs.append(
                 {
                     "role": role,
@@ -3161,7 +4252,7 @@ def run_rate_sequence(
                     "CLEANUP_RESULT": result.get("cleanup", {}).get(
                         "CLEANUP_RESULT", "FAIL"
                     ),
-                    "result_path": f"{run_id}/result.json",
+                    "result_path": f"runs/{run_id}.json",
                 }
             )
             if (
@@ -3178,7 +4269,7 @@ def run_rate_sequence(
         if run["role"] == "measured"
     ]
     measured_rates = [
-        sum(float(sender["actual_payload_gbps"]) for sender in result["senders"])
+        _actual_result_payload_gbps(result)
         for result in measured_results
         if result["TEST_RESULT"] == "PASS"
         and result.get("cleanup", {}).get("CLEANUP_RESULT") == "PASS"
@@ -3212,6 +4303,7 @@ def run_rate_sequence(
         "actual_aggregate_gbps": aggregate,
     }
     _atomic_json(suite_root / "summary.json", summary)
+    _write_suite_manifest(suite_root)
     return summary
 
 
@@ -3240,6 +4332,7 @@ def run_rate_request_sequence(
             result = RatePointController(
                 backend_factory(), suite_root, run_id=run_id
             ).run_request(request, observation_template, compiler)
+            result = compact_suite_run(suite_root, run_id, result)
             run = {
                 "role": role,
                 "index": index,
@@ -3248,7 +4341,7 @@ def run_rate_request_sequence(
                 "CLEANUP_RESULT": result.get("cleanup", {}).get(
                     "CLEANUP_RESULT", "FAIL"
                 ),
-                "result_path": f"{run_id}/result.json",
+                "result_path": f"runs/{run_id}.json",
             }
             runs.append(run)
             if run["TEST_RESULT"] != "PASS" or run["CLEANUP_RESULT"] != "PASS":
@@ -3263,9 +4356,7 @@ def run_rate_request_sequence(
         if run["role"] != "measured" or run["TEST_RESULT"] != "PASS":
             continue
         result = json.loads((suite_root / run["result_path"]).read_text())
-        measured_rates.append(
-            sum(float(sender["actual_payload_gbps"]) for sender in result["senders"])
-        )
+        measured_rates.append(_actual_result_payload_gbps(result))
     failures = [
         run for run in runs
         if run["TEST_RESULT"] != "PASS" or run["CLEANUP_RESULT"] != "PASS"
@@ -3294,7 +4385,25 @@ def run_rate_request_sequence(
         "actual_aggregate_gbps": aggregate,
     }
     _atomic_json(suite_root / "summary.json", summary)
+    _write_suite_manifest(suite_root)
     return summary
+
+
+def _actual_result_payload_gbps(result: dict[str, Any]) -> float:
+    """Return the measured/configured pressure rate for the selected input."""
+    metrics = result.get("statistics", {}).get("gpu", {}).get("metrics", {})
+    if isinstance(metrics, dict) and float(
+        metrics.get("input_payload_gbps", 0.0)
+    ) > 0.0:
+        return float(metrics["input_payload_gbps"])
+    plan = result.get("plan", {})
+    gpu_input = plan.get("gpu_input", {}) if isinstance(plan, dict) else {}
+    if isinstance(gpu_input, dict) and "actual_payload_gbps" in gpu_input:
+        return float(gpu_input["actual_payload_gbps"])
+    return sum(
+        float(sender["actual_payload_gbps"])
+        for sender in result.get("senders", [])
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3304,7 +4413,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--missing-wait-ms",
         type=float,
-        default=200.0,
+        default=None,
         help=(
             "maximum wait for a missing Station packet in milliseconds"
         ),
@@ -3312,7 +4421,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--station-skew-reserve-ms",
         type=float,
-        default=200.0,
+        default=None,
         help=(
             "additional window capacity for Station watermark skew in "
             "milliseconds"
@@ -3325,22 +4434,40 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pipeline-stage",
-        choices=("receive", "unpack", "full"),
+        choices=("receive", "unpack", "gpu", "full"),
         default="full",
         help=(
             "receive drains the raw ring; unpack stops at the compute ring; "
-            "full also runs pipeline_worker"
+            "gpu runs compute ring through pipeline_worker to output ring; "
+            "full composes receive, unpack and gpu"
         ),
     )
     parser.add_argument(
         "--worker-cpu-list",
         help="ordered coordinator,worker...,writer CPU mapping for unpack",
     )
+    parser.add_argument(
+        "--gpu-worker-cpu", type=int,
+        help="CPU used to launch pipeline_worker in gpu/full stages",
+    )
     parser.add_argument("--sink-cpu-list")
     parser.add_argument("--receiver-poll-cpu", type=int)
-    parser.add_argument("--numa-node", type=int)
-    parser.add_argument("--receiver-poll-batch", type=int, default=32)
-    parser.add_argument("--receiver-wr-num", type=int, default=1024)
+    parser.add_argument(
+        "--numa-node", type=int,
+        help="legacy placement: bind ingress and processing to one NUMA node",
+    )
+    parser.add_argument(
+        "--ingress-numa-node", type=int,
+        help="NUMA node for raw ring and rdma2dada",
+    )
+    parser.add_argument(
+        "--processing-numa-node", type=int,
+        help=(
+            "NUMA node for unpack, compute/output rings, GPU worker and sink"
+        ),
+    )
+    parser.add_argument("--receiver-poll-batch", type=int, default=None)
+    parser.add_argument("--receiver-wr-num", type=int, default=None)
     parser.add_argument(
         "--station-id",
         type=int,
@@ -3360,7 +4487,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--unpack-start-delay-seconds",
         type=int,
-        default=0,
+        default=None,
         help=(
             "start sender this many whole VDIF/actual seconds before the "
             "formal acceptance timeline (receive/unpack with dbnull)"
@@ -3374,6 +4501,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--measured-runs", type=int, default=1)
     parser.add_argument("--suite-id")
+    parser.add_argument(
+        "--baseline-profile",
+        type=pathlib.Path,
+        help="versioned passing profile for the selected host and topology",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        help=(
+            "required for a named baseline deviation, or use exactly "
+            "bootstrap-<pipeline-stage>-v1 when creating the first baseline"
+        ),
+    )
     parser.add_argument(
         "--project-root",
         type=pathlib.Path,
@@ -3415,32 +4554,94 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    explicit_profile_fields = {
+        name
+        for name, value in (
+            ("missing_wait_ms", args.missing_wait_ms),
+            ("station_skew_reserve_ms", args.station_skew_reserve_ms),
+            ("worker_cpu_list", args.worker_cpu_list),
+            ("gpu_worker_cpu", args.gpu_worker_cpu),
+            ("sink_cpu_list", args.sink_cpu_list),
+            ("receiver_poll_cpu", args.receiver_poll_cpu),
+            ("numa_node", args.numa_node),
+            ("ingress_numa_node", args.ingress_numa_node),
+            ("processing_numa_node", args.processing_numa_node),
+            ("receiver_poll_batch", args.receiver_poll_batch),
+            ("receiver_wr_num", args.receiver_wr_num),
+            ("unpack_start_delay_seconds", args.unpack_start_delay_seconds),
+        )
+        if value is not None
+    }
     request = RateRequest(
         args.aggregate_gbps,
         args.duration_seconds,
         compute_consumer=args.compute_consumer,
         pipeline_stage=args.pipeline_stage,
-        missing_wait_ms=args.missing_wait_ms,
-        station_skew_reserve_ms=args.station_skew_reserve_ms,
+        missing_wait_ms=args.missing_wait_ms if args.missing_wait_ms is not None else 200.0,
+        station_skew_reserve_ms=(
+            args.station_skew_reserve_ms
+            if args.station_skew_reserve_ms is not None else 200.0
+        ),
         worker_cpu_list=args.worker_cpu_list,
+        gpu_worker_cpu=args.gpu_worker_cpu,
         sink_cpu_list=args.sink_cpu_list,
         receiver_poll_cpu=args.receiver_poll_cpu,
         numa_node=args.numa_node,
-        receiver_poll_batch=args.receiver_poll_batch,
-        receiver_wr_num=args.receiver_wr_num,
+        ingress_numa_node=args.ingress_numa_node,
+        processing_numa_node=args.processing_numa_node,
+        receiver_poll_batch=(
+            args.receiver_poll_batch if args.receiver_poll_batch is not None else 32
+        ),
+        receiver_wr_num=args.receiver_wr_num if args.receiver_wr_num is not None else 1024,
         unpack_missing_per_second=args.unpack_missing_per_second,
-        unpack_start_delay_seconds=args.unpack_start_delay_seconds,
+        unpack_start_delay_seconds=(
+            args.unpack_start_delay_seconds
+            if args.unpack_start_delay_seconds is not None else 0
+        ),
         station_id=args.station_id,
         sender_source_port=args.sender_source_port,
+        experiment_name=args.experiment_name,
     )
+    if args.baseline_profile is not None:
+        try:
+            profile = task8c_profiles.load_profile(args.baseline_profile)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        if profile.target_host != "qths1" or profile.pipeline_stage != request.pipeline_stage:
+            print(
+                "baseline profile host or pipeline stage does not match request",
+                file=sys.stderr,
+            )
+            return 2
+        request = task8c_profiles.apply_profile(
+            request, profile, explicit_profile_fields
+        )
+        request = dataclasses.replace(
+            request,
+            baseline_profile_path=str(profile.path),
+            baseline_profile_sha256=profile.sha256,
+        )
     if args.dry_run:
         request.validate()
         print(json.dumps(dataclasses.asdict(request), indent=2, sort_keys=True))
         return 0
-    if args.qths_binary_dir is None or args.sender_binary_dir is None:
+    if args.baseline_profile is None:
+        expected_bootstrap = f"bootstrap-{request.pipeline_stage}-v1"
+        if args.experiment_name != expected_bootstrap:
+            print(
+                "a baseline profile is required for formal execution; "
+                f"use --baseline-profile or explicitly bootstrap with "
+                f"--experiment-name {expected_bootstrap}",
+                file=sys.stderr,
+            )
+            return 2
+    if args.qths_binary_dir is None or (
+        request.pipeline_stage != "gpu" and args.sender_binary_dir is None
+    ):
         print(
-            "--qths-binary-dir and --sender-binary-dir are required with "
-            "--preflight-only or --execute",
+            "--qths-binary-dir is required; --sender-binary-dir is also "
+            "required for receive, unpack and full execution",
             file=sys.stderr,
         )
         return 2
@@ -3467,12 +4668,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         result = RatePointController(
             backend, args.result_root, run_id=f"{default_result_id}-preflight"
         ).preflight_request(
-            request, args.observation_config, args.config_compiler
-        )
-    elif args.warmup_runs == 0 and args.measured_runs == 1:
-        result = RatePointController(
-            backend, args.result_root, run_id=default_result_id
-        ).run_request(
             request, args.observation_config, args.config_compiler
         )
     else:

@@ -71,6 +71,25 @@ def valid_gpu_profile():
     }
 
 
+def valid_split_full_profile():
+    value = valid_profile()
+    value["profile_id"] = "qths1-full-30gbps-split-numa-v1"
+    value["pipeline_stage"] = "full"
+    value["runtime"].pop("numa_node")
+    value["runtime"].update({
+        "worker_cpu_list": "24,25,26,27,28,29",
+        "gpu_worker_cpu": 30,
+        "sink_cpu_list": "31",
+        "ingress_numa_node": 1,
+        "processing_numa_node": 0,
+    })
+    value["geometry"].update({
+        "output_block_bytes": 819200,
+        "output_ring_blocks": 8,
+    })
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class FakeRequest:
     receiver_poll_cpu: int | None = None
@@ -78,6 +97,8 @@ class FakeRequest:
     gpu_worker_cpu: int | None = None
     sink_cpu_list: str | None = None
     numa_node: int | None = None
+    ingress_numa_node: int | None = None
+    processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
     unpack_start_delay_seconds: int = 0
@@ -100,6 +121,8 @@ class FakePlan:
     gpu_worker_cpu: int | None = None
     sink_cpu_list: str = "20"
     numa_node: int = 1
+    ingress_numa_node: int | None = None
+    processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
     unpack_start_delay_seconds: int = 1
@@ -152,6 +175,16 @@ class Task8cProfilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "missing fields"):
                 profiles.load_profile(self.write_profile(directory, value))
+
+    def test_full_profile_accepts_split_ingress_and_processing_numa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = profiles.load_profile(
+                self.write_profile(directory, valid_split_full_profile())
+            )
+
+        self.assertNotIn("numa_node", profile.runtime)
+        self.assertEqual(profile.runtime["ingress_numa_node"], 1)
+        self.assertEqual(profile.runtime["processing_numa_node"], 0)
 
     def test_apply_profile_fills_only_non_explicit_fields(self):
         with tempfile.TemporaryDirectory() as directory:

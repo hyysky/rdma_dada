@@ -28,6 +28,8 @@ _RUNTIME_FIELDS = {
     "gpu_worker_cpu",
     "sink_cpu_list",
     "numa_node",
+    "ingress_numa_node",
+    "processing_numa_node",
     "receiver_poll_batch",
     "receiver_wr_num",
     "unpack_start_delay_seconds",
@@ -75,20 +77,20 @@ _REQUIRED_GEOMETRY = {
 }
 _REQUIRED_RUNTIME = {
     "receive": {
-        "receiver_poll_cpu", "sink_cpu_list", "numa_node",
+        "receiver_poll_cpu", "sink_cpu_list",
         "receiver_poll_batch", "receiver_wr_num",
         "unpack_start_delay_seconds",
     },
     "unpack": {
-        "receiver_poll_cpu", "worker_cpu_list", "sink_cpu_list", "numa_node",
+        "receiver_poll_cpu", "worker_cpu_list", "sink_cpu_list",
         "receiver_poll_batch", "receiver_wr_num",
         "unpack_start_delay_seconds", "missing_wait_ms",
         "station_skew_reserve_ms",
     },
-    "gpu": {"gpu_worker_cpu", "sink_cpu_list", "numa_node"},
+    "gpu": {"gpu_worker_cpu", "sink_cpu_list"},
     "full": {
         "receiver_poll_cpu", "worker_cpu_list", "gpu_worker_cpu",
-        "sink_cpu_list", "numa_node", "receiver_poll_batch",
+        "sink_cpu_list", "receiver_poll_batch",
         "receiver_wr_num", "missing_wait_ms", "station_skew_reserve_ms",
     },
 }
@@ -135,10 +137,32 @@ def _validate_runtime(stage: str, runtime: object) -> dict[str, object]:
     missing = _REQUIRED_RUNTIME[stage] - set(runtime)
     if missing:
         raise ValueError(f"profile runtime is missing fields: {sorted(missing)}")
+    legacy_numa = "numa_node" in runtime
+    split_numa = (
+        "ingress_numa_node" in runtime or "processing_numa_node" in runtime
+    )
+    if legacy_numa and split_numa:
+        raise ValueError(
+            "profile runtime numa_node cannot be combined with split NUMA fields"
+        )
+    ingress_required = stage in ("receive", "unpack", "full")
+    processing_required = stage in ("unpack", "gpu", "full")
+    missing_numa = []
+    if not legacy_numa:
+        if ingress_required and "ingress_numa_node" not in runtime:
+            missing_numa.append("ingress_numa_node")
+        if processing_required and "processing_numa_node" not in runtime:
+            missing_numa.append("processing_numa_node")
+    if missing_numa:
+        raise ValueError(
+            f"profile runtime is missing fields: {sorted(missing_numa)}"
+        )
     for name in (
         "receiver_poll_cpu",
         "gpu_worker_cpu",
         "numa_node",
+        "ingress_numa_node",
+        "processing_numa_node",
         "receiver_poll_batch",
         "receiver_wr_num",
         "unpack_start_delay_seconds",

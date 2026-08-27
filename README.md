@@ -3,8 +3,9 @@
 该项目正在重构为独立的 PSRDADA ring-connected 实时天线阵列处理 pipeline。当前已实现
 统一 Observation/Resolved Plan、RoCE v2 ingest、Project VDIF TFP→ATFP 解包、GPU 上的
 ATFP→TFPA 转换，以及 Beamform、Power/Stokes、Time Integration 组成的双 ring
-`pipeline_worker`。功能、数值和 PSRDADA/CUDA 集成已经通过对应服务器验收；新 ATFP
-整链的持续吞吐和运行余量仍在测试，不能仅凭 correctness 结果声明满足实时观测速率。
+`pipeline_worker`。功能、数值和 PSRDADA/CUDA 集成已经通过对应服务器验收；当前将
+30 Gbps 作为 receive/unpack 阶段性规划基线，但正式重复门禁已延期。完整 GPU 整链的
+持续吞吐尚未验收。
 
 各应用、算法、配置、测试和后续工作的统一状态见
 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
@@ -20,7 +21,10 @@ ATFP→TFPA 转换，以及 Beamform、Power/Stokes、Time Integration 组成的
 - 一个解包/计算 block 包含所有 `A` 个阵元的数据。总 UDP record 数必须是 `A` 的
   整数倍；`T=PKT_NSAMP×每阵元每block的UDP包数`。
 - `.dada` 文件大小由 `blocks_per_file` 配置，因此是 ring data block 大小的整数倍。
-- 当前 RDMA ingest 使用内部注册缓冲区，验证 CQ completion 后再拷贝到 raw ring。尚未启用 RDMA 直接写 ring 的优化路径。
+- 当前 RDMA ingest 使用一个 QP/CQ/接收线程和 NSGE=2：42-byte Ethernet/IPv4/UDP header
+  写入固定 scratch，Project VDIF record 由 RNIC 直接写入 PSRDADA raw-ring slot。接收端
+  同时持有两块 raw block 处理 WR completion、保序发布和尾块 EOD，不再执行 packet→ring
+  payload memcpy。
 
 完整的目标架构和 header 传播规则见 [doc/PIPELINE_ARCHITECTURE.md](doc/PIPELINE_ARCHITECTURE.md)。
 算法模块的输入输出、`TFPA/TFPB/TFBS` 数据布局、独立积分模块和 worker 调用规则见
@@ -108,6 +112,11 @@ Observation JSON、Resolved Plan、ring plan 和 DADA header artifact 的生成�
   config/observation.example.json run/observation
 ```
 
+性能测试可额外传入 `--budget-payload-gbps 30`。编译器会在
+`validation_report.json.gpu_pipeline_budget` 中同时记录 Observation 速率和测试目标速率，
+并按 20% 初始安全余量计算 block deadline、每级最低吞吐、H2D+D2H 合计传输量以及显存
+计划；该预算是完整 GPU 链运行前的门禁，不等同于实测通过。
+
 `config/pipeline_worker.example.json` 仅用于模块级兼容测试，不再作为应用入口。
 
 前端固定 32-byte Project VDIF v1 header 和 TFP payload 轴布局使用独立
@@ -129,14 +138,18 @@ python3 scripts/convert_config_to_json.py old.conf config/pipeline.json
 
 ## 运行 RDMA 接收测试
 
-当前唯一入口是 `scripts/task8c_rate_point.py`，由它按 resolved plan 创建
-ring、启动 consumer、`rdma2dada` 和 sender，并保存计数与清理证据。
+当前版本化测试入口是 `scripts/task8c_rate_point.py`。它按同一 resolved plan 显式组合
+`receive`、`unpack`、`gpu`、`full` 四种拓扑：GPU-only 只创建 compute/output ring，
+full 则在现有 sender→`rdma2dada`→unpack 链后复用同一个 `pipeline_worker`。控制器保存
+各阶段计数、进程身份与定向清理证据；算法模块组合仍由 `pipeline_worker` 负责，不写入
+控制器条件分支。
 `rdma2dada` 本身只保留 direct raw-ring 接收路径。
 
 ## 当前限制
 
 - Linux RDMA 构建、CQ 错误路径、NIC flow steering 和有限 transfer 已有服务器验证；
-  新 ATFP 完整整链的目标速率、持续运行和安全余量仍在验证。
+  新 ATFP 完整链已通过 0.1 Gbps warm-up+3 正确性验收；目标速率、持续运行和实际
+  headroom 仍待速率阶梯验证。
 - `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32
   backend；`power`、`stokes`、`time_integrate` 已有 host FP32 reference 和异步
   CUDA kernel。独立 CUDA correctness、GPU 数值组合链和 Resolved Plan 驱动的
@@ -150,9 +163,14 @@ ring、启动 consumer、`rdma2dada` 和 sender，并保存计数与清理证据
   仍待实现。
 - 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
   同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
+- GPU 资源测试将先保持双 Station sender 不变，使用 `dada_junkdb` 向 compute ring 注入
+  `A≈500,F=4,P=1,B≈350` 的生产几何 block。该路径用于验证真实 GPU 矩阵、显存和传输
+  能力，不代表约 500 Station 的网络整链；后者仍需多 Station sender 或合法 raw-VDIF
+  generator。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
-  binary decoder、packet-group 状态机、ATFP 聚合、partial/EOD 和缺失补零已通过功能
-  验收；unpack-only 链已在 10 Gbps payload、30 秒单次测试中精确闭合，15 Gbps
-  仍存在 receiver 接收/发布缺口。10 Gbps 尚未完成 warm-up+3，完整 GPU pipeline
-  速率和低错误率测试也尚未完成。
+  unpack 采用 coordinator、固定 parser worker pool 和单 compute writer，并支持显式线程
+  affinity。30 Gbps payload 在 unpack-only 的 30/60 秒探索 run 中精确闭合，但两组重复
+  测试仍出现 251/700 包的 receiver/NIC admission 缺口；35 Gbps 未通过。项目当前暂按
+  30 Gbps receive/unpack 满足推进，正式 warm-up+3 门禁延期；完整 GPU pipeline 速率和
+  低错误率测试仍未完成。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

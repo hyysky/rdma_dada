@@ -59,6 +59,14 @@
         "weights_id": "atfp-throughput-f2-p1-a2-b2-i8-v1",
         "weights_scale": "0.5",
         "compute_mode": "FP32"
+      },
+      {
+        "type": "power"
+      },
+      {
+        "type": "integrate",
+        "length": 128,
+        "operation": "MEAN"
       }
     ]
   }

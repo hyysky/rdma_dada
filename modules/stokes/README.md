@@ -18,8 +18,8 @@ AB_IMAG = Im(X * conj(Y))
 [AA, BB, AB_REAL, AB_IMAG]
 ```
 
-这些是 coherency/correlation products，不是已经转换完成的 `I/Q/U/V`。如后续需要
-`I/Q/U/V`，应增加显式转换模式并定义 `V` 的符号约定。
+当前工程和论文验证范围固定为这四个 coherency/correlation products，不包含
+`I/Q/U/V` 的物理输出或推导。
 
 ## 参数
 

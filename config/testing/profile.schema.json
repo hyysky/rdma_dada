@@ -27,6 +27,8 @@
         "gpu_worker_cpu": {"type": "integer", "minimum": 0},
         "sink_cpu_list": {"type": "string", "minLength": 1},
         "numa_node": {"type": "integer", "minimum": 0},
+        "ingress_numa_node": {"type": "integer", "minimum": 0},
+        "processing_numa_node": {"type": "integer", "minimum": 0},
         "receiver_poll_batch": {"type": "integer", "minimum": 1},
         "receiver_wr_num": {"type": "integer", "minimum": 1},
         "unpack_start_delay_seconds": {"type": "integer", "minimum": 0},

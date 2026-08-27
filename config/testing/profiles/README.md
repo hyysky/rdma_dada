@@ -9,9 +9,11 @@ Normal `--execute` and `--preflight-only` runs load a profile with
 controller records every changed field before creating a ring or process.
 
 GPU and full profiles must record `gpu_worker_cpu`, `sink_cpu_list` and
-`numa_node`. Receive/unpack profiles must record receiver, coordinator,
-parser, writer and sink placement plus queue geometry. Scheduler-default
-placement is not an accepted baseline.
+NUMA placement. A legacy profile may use one `numa_node`; split placement uses
+`ingress_numa_node` for the raw ring/receiver and `processing_numa_node` for
+unpack, compute/output rings, GPU worker and sink. Receive/unpack profiles must
+record receiver, coordinator, parser, writer and sink placement plus queue
+geometry. Scheduler-default placement is not an accepted baseline.
 
 When no accepted profile exists, the only allowed formal bootstrap name is
 `bootstrap-<pipeline-stage>-v1`. A bootstrap run is a candidate only. It becomes

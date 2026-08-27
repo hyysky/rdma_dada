@@ -34,6 +34,9 @@ use the worker-owned execution stream by default.
 The authoritative data layouts, module inputs/outputs, integration rules and
 worker invocation contract are documented in
 [`doc/ALGORITHM_MODULE_CONTRACTS.md`](../doc/ALGORITHM_MODULE_CONTRACTS.md).
+The current direct-receive and parallel-unpack architecture, test boundary and
+performance evidence are summarized in
+[`docs/VDIF_UNPACK_STATUS.md`](../docs/VDIF_UNPACK_STATUS.md).
 
 Module order is configuration-driven and compatibility-checked. Each module
 must declare/validate its accepted input header and publish its output datatype,

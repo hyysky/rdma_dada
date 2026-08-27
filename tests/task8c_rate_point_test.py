@@ -17,6 +17,7 @@ from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "task8c_rate_point.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("task8c_rate_point", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
@@ -72,6 +73,11 @@ def make_plan(
         "schema_version": 1,
         "config_id": "a" * 64,
         "geometry_id": "b" * 64,
+        "output_contract": {
+            "data_stage": "BEAMFORMED",
+            "order": "TFPB",
+            "sample_format": "CF32",
+        },
         "source_json": json.dumps(source),
         "resolved": {
             "expected_groups": group_count,
@@ -116,9 +122,10 @@ def make_plan(
             f"GEOMETRY_ID {resolved['geometry_id']}\n"
         ).encode(),
         "unpacked.header": (
-            f"DATA_STAGE UNPACKED\nCONFIG_ID {resolved['config_id']}\n"
+            f"HDR_SIZE 4096\nNBIT 8\nDATA_STAGE UNPACKED\nORDER ATFP\n"
+            f"CONFIG_ID {resolved['config_id']}\n"
             f"GEOMETRY_ID {resolved['geometry_id']}\n"
-        ).encode(),
+        ).encode().ljust(4096, b"\0"),
         "output.header": (
             f"DATA_STAGE BEAMFORMED\nCONFIG_ID {resolved['config_id']}\n"
             f"GEOMETRY_ID {resolved['geometry_id']}\n"
@@ -241,9 +248,7 @@ class FakeBackend:
         return self._stage("SENDERS_RUNNING", outputs)
 
     def collect(self, plan, run_dir):
-        return self._stage(
-            "COLLECTING",
-            {
+        statistics = {
                 "receiver": {
                     "accepted": plan.group_count * 2,
                     "published": plan.group_count * 2,
@@ -264,7 +269,24 @@ class FakeBackend:
                     "fully_missing_groups": 0,
                     "missing_station": 0,
                 },
-                "compute": {
+        }
+        if plan.uses_pipeline_worker:
+            groups_per_block = plan.records_per_block // plan.nant
+            output_blocks = (
+                plan.group_count + groups_per_block - 1
+            ) // groups_per_block
+            statistics.update({
+                "output": {
+                    "data_bytes": output_blocks * plan.output_block_bytes,
+                    "DATA_STAGE": "BEAMFORMED",
+                    "ORDER": "TFPB",
+                    "CONFIG_ID": plan.config_id,
+                    "GEOMETRY_ID": plan.geometry_id,
+                },
+                "gpu": {"completed": True},
+            })
+        else:
+            statistics["compute"] = {
                     "data_bytes": plan.group_count * 8192,
                     "DATA_STAGE": "UNPACKED",
                     "ORDER": "ATFP",
@@ -274,9 +296,8 @@ class FakeBackend:
                     "CONFIG_ID": plan.config_id,
                     "GEOMETRY_ID": plan.geometry_id,
                     "sample_prefix_hex": "65667071",
-                },
-            },
-        )
+                }
+        return self._stage("COLLECTING", statistics)
 
     def cleanup(self, resources, run_dir):
         self.calls.append("CLEANUP")
@@ -286,6 +307,49 @@ class FakeBackend:
             "CLEANUP_RESULT": "PASS",
             "errors": [],
         }
+
+
+class GpuOnlyFakeBackend(FakeBackend):
+    def start_pipeline(self, plan, run_dir):
+        return self._stage(
+            "PIPELINE_READY",
+            {"rings": [plan.compute_key, plan.output_key],
+             "capability_added": False},
+        )
+
+    def start_senders(self, plan, run_dir):
+        raise AssertionError("gpu-only stage must not start network senders")
+
+    def wait_senders(self, plan, processes):
+        raise AssertionError("gpu-only stage must not wait for network senders")
+
+    def collect(self, plan, run_dir):
+        junk = MODULE.derive_gpu_junk_input(plan)
+        return self._stage(
+            "COLLECTING",
+            {
+                "gpu": {
+                    "completed": True,
+                    "metrics": {
+                        "blocks": junk.block_count,
+                        "input_bytes": junk.total_bytes,
+                        "output_bytes": (
+                            junk.block_count * plan.output_block_bytes
+                        ),
+                        "transfer_elapsed_ns": 10_000_000_000,
+                        "input_payload_gbps": (
+                            junk.total_bytes * 8 / 10_000_000_000
+                        ),
+                    },
+                },
+                "output": {
+                    "consumer": "dada_dbnull",
+                    "exit_code": 0,
+                    "zero_copy": True,
+                    "single_transfer": True,
+                },
+            },
+        )
 
 
 class RecordingTransport:
@@ -309,6 +373,19 @@ class RecordingTransport:
         return FakeProcess(
             output='{"sent_packets":10,"scheduled_packets":10,"failed_packets":0,"backend":"SENDMMSG","actual_payload_gbps":0.5}'
         )
+
+
+class LocalArtifactCheckingTransport(RecordingTransport):
+    def run(self, argv, stage, check=True):
+        if argv and argv[0] == "sha256sum" and not pathlib.Path(argv[1]).is_file():
+            if check:
+                raise MODULE.StageError(
+                    stage, argv, 1, "", f"{argv[1]}: file not found"
+                )
+            return MODULE.subprocess.CompletedProcess(
+                argv, 1, "", f"{argv[1]}: file not found"
+            )
+        return super().run(argv, stage, check)
 
 
 class ExpiringStartTransport(RecordingTransport):
@@ -367,10 +444,10 @@ class MissingDiagnosticTransport(RecordingTransport):
         if (
             stage == "CLEANUP"
             and argv[0] == "scp"
-            and any("compute-summary.json" in item for item in argv)
+            and any("output-summary.json" in item for item in argv)
         ):
             return MODULE.subprocess.CompletedProcess(
-                argv, 1, "", "compute-summary.json does not exist"
+                argv, 1, "", "output-summary.json does not exist"
             )
         return MODULE.subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -460,7 +537,107 @@ class SecondSenderStartFailureTransport(ExpiringStartTransport):
         return self.started_process
 
 
+class NonzeroSenderTransport(ExpiringStartTransport):
+    def __init__(self):
+        super().__init__()
+        self.start_count = 0
+
+    def start(self, argv, stdout_path):
+        self.start_count += 1
+        process = PolledProcess(
+            255 if self.start_count == 1 else None,
+            "ssh: connection closed by remote host" if self.start_count == 1 else "",
+        )
+        process.pid = 4100 + self.start_count
+        self.calls.append(("start", "SENDERS_WAITING", list(argv)))
+        return process
+
+
 class Task8cRatePointTest(unittest.TestCase):
+    def test_pipeline_topologies_define_process_and_ring_boundaries(self):
+        expected = {
+            "receive": {
+                "rings": ("raw",),
+                "consumer_ring": "raw",
+                "input_kind": "network",
+                "receiver": True,
+                "unpack": False,
+                "gpu": False,
+                "senders": True,
+            },
+            "unpack": {
+                "rings": ("raw", "compute"),
+                "consumer_ring": "compute",
+                "input_kind": "network",
+                "receiver": True,
+                "unpack": True,
+                "gpu": False,
+                "senders": True,
+            },
+            "gpu": {
+                "rings": ("compute", "output"),
+                "consumer_ring": "output",
+                "input_kind": "junkdb",
+                "receiver": False,
+                "unpack": False,
+                "gpu": True,
+                "senders": False,
+            },
+            "full": {
+                "rings": ("raw", "compute", "output"),
+                "consumer_ring": "output",
+                "input_kind": "network",
+                "receiver": True,
+                "unpack": True,
+                "gpu": True,
+                "senders": True,
+            },
+        }
+
+        for stage, values in expected.items():
+            with self.subTest(stage=stage):
+                topology = MODULE.pipeline_topology(stage)
+                self.assertEqual(topology.rings, values["rings"])
+                self.assertEqual(topology.consumer_ring, values["consumer_ring"])
+                self.assertEqual(topology.input_kind, values["input_kind"])
+                self.assertEqual(topology.uses_receiver, values["receiver"])
+                self.assertEqual(topology.uses_unpack_worker, values["unpack"])
+                self.assertEqual(topology.uses_pipeline_worker, values["gpu"])
+                self.assertEqual(topology.uses_network_senders, values["senders"])
+                self.assertEqual(
+                    topology.requires_rdma_capability, values["receiver"]
+                )
+
+    def test_gpu_topology_requires_only_compute_pressure_processes(self):
+        self.assertEqual(
+            MODULE.required_process_roles(MODULE.pipeline_topology("gpu")),
+            (
+                "compute-ring",
+                "output-ring",
+                "dada_junkdb",
+                "pipeline_worker",
+                "output-consumer",
+            ),
+        )
+
+    def test_gpu_stage_is_valid_and_does_not_accept_receiver_only_options(self):
+        MODULE.RateRequest(
+            aggregate_gbps=30.0,
+            duration_seconds=30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="gpu",
+        ).validate()
+
+        with self.assertRaisesRegex(ValueError, "station_id requires receive"):
+            MODULE.RateRequest(
+                aggregate_gbps=30.0,
+                duration_seconds=30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="gpu",
+                station_id=101,
+                sender_source_port=41001,
+            ).validate()
+
     def test_result_directory_name_contains_stage_rate_duration_and_utc_time(self):
         request = MODULE.RateRequest(
             aggregate_gbps=5.0,
@@ -510,8 +687,8 @@ class Task8cRatePointTest(unittest.TestCase):
                 ),
                 root / "run",
             )
-            compiler(config, None)
-            compiler(config, output)
+            compiler(config, None, 30.0)
+            compiler(config, output, 30.0)
             compiler.close()
 
         flattened = [call[0] for call in transport.calls]
@@ -523,11 +700,36 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(len(remote_invocations), 2)
         self.assertIn("--preflight-only", remote_invocations[0])
         self.assertIn("--output-dir", remote_invocations[1])
+        for invocation in remote_invocations:
+            budget_index = invocation.index("--budget-payload-gbps")
+            self.assertEqual(invocation[budget_index + 1], "30")
         self.assertTrue(
             any(argv[0] == "scp" and "-r" in argv for argv in flattened)
         )
         self.assertTrue(
             any("rm" in argv and "-rf" in argv for argv in flattened)
+        )
+
+    def test_remote_compiler_maps_repository_runtime_inputs_to_qths_mirror(self):
+        compiler = MODULE.RemoteObservationCompiler(
+            RecordingTransport(),
+            pathlib.Path("/tmp/known-hosts"),
+            pathlib.Path("/remote/build/observation_config_compile"),
+            pathlib.Path("/tmp/run"),
+            pathlib.Path("/home/user/wy/rdma_dada"),
+        )
+        local_weight = (
+            pathlib.Path(MODULE.__file__).resolve().parents[1]
+            / "tests/data/weights.npy"
+        )
+
+        self.assertEqual(
+            compiler.map_runtime_path(local_weight),
+            "/home/user/wy/rdma_dada/tests/data/weights.npy",
+        )
+        self.assertEqual(
+            compiler.map_runtime_path(pathlib.Path("/opt/shared/weights.npy")),
+            "/opt/shared/weights.npy",
         )
 
     def test_group_count_uses_exact_decimal_rate_arithmetic(self):
@@ -725,6 +927,69 @@ class Task8cRatePointTest(unittest.TestCase):
         request = json.loads(stdout.getvalue())
         self.assertEqual(request["missing_wait_ms"], 200.0)
         self.assertEqual(request["station_skew_reserve_ms"], 200.0)
+
+    def test_dry_run_loads_profile_runtime_and_preserves_explicit_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = pathlib.Path(directory) / "profile.json"
+            profile_path.write_text(json.dumps({
+                "schema_version": 1,
+                "profile_id": "qths1-unpack-30gbps-v1",
+                "target_host": "qths1",
+                "pipeline_stage": "unpack",
+                "source_result": "/results/unpack-pass",
+                "runtime": {
+                    "receiver_poll_cpu": 13,
+                    "worker_cpu_list": "14,15,16,17,18,19",
+                    "sink_cpu_list": "20",
+                    "numa_node": 1,
+                    "receiver_poll_batch": 32,
+                    "receiver_wr_num": 1024,
+                    "unpack_start_delay_seconds": 1,
+                    "missing_wait_ms": 200.0,
+                    "station_skew_reserve_ms": 200.0,
+                },
+                "geometry": {
+                    "target_payload_gbps": 30.0,
+                    "duration_seconds": 60.0,
+                    "raw_block_bytes": 52838400,
+                    "raw_ring_blocks": 16,
+                    "compute_block_bytes": 52428800,
+                    "compute_ring_blocks": 8,
+                    "window_blocks": 31,
+                    "reorder_horizon_groups": 96000,
+                },
+            }) + "\n")
+            expected_profile_sha = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                return_code = MODULE.main([
+                    "--aggregate-gbps", "30",
+                    "--duration-seconds", "60",
+                    "--compute-consumer", "dbnull",
+                    "--pipeline-stage", "unpack",
+                    "--baseline-profile", str(profile_path),
+                    "--receiver-poll-cpu", "12",
+                    "--experiment-name", "poll-cpu-comparison",
+                    "--dry-run",
+                ])
+
+        self.assertEqual(return_code, 0)
+        request = json.loads(stdout.getvalue())
+        self.assertEqual(request["receiver_poll_cpu"], 12)
+        self.assertEqual(request["worker_cpu_list"], "14,15,16,17,18,19")
+        self.assertEqual(request["sink_cpu_list"], "20")
+        self.assertEqual(request["baseline_profile_sha256"], expected_profile_sha)
+
+    def test_formal_entry_rejects_missing_baseline_without_bootstrap_name(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            return_code = MODULE.main([
+                "--aggregate-gbps", "1",
+                "--duration-seconds", "10",
+                "--pipeline-stage", "gpu",
+                "--compute-consumer", "dbnull",
+                "--preflight-only",
+            ])
+        self.assertEqual(return_code, 2)
+        self.assertIn("baseline profile", stderr.getvalue())
 
     def test_rate_plan_loads_all_geometry_from_compiler_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -970,6 +1235,116 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertIn("Receive threads ready", bundle["start.sh"])
 
+    def test_full_stage_pins_gpu_worker_separately_from_unpack_threads(self):
+        plan = dataclasses.replace(
+            make_plan(1.0, 30.0, compute_consumer="dbnull"),
+            receiver_poll_cpu=13,
+            worker_cpu_list="14,15,16,17,18,19",
+            sink_cpu_list="20",
+            gpu_worker_cpu=21,
+            numa_node=1,
+        )
+        start = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-full-placement"
+        )["start.sh"]
+        self.assertIn("--thread-cpus 14,15,16,17,18,19", start)
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 21 "
+            '"$project/pipeline_worker"',
+            start,
+        )
+
+    def test_full_stage_can_split_ingress_and_processing_numa_domains(self):
+        plan = dataclasses.replace(
+            make_plan(1.0, 30.0, compute_consumer="dbnull"),
+            receiver_poll_cpu=13,
+            worker_cpu_list="24,25,26,27,28,29",
+            gpu_worker_cpu=30,
+            sink_cpu_list="31",
+            numa_node=None,
+            ingress_numa_node=1,
+            processing_numa_node=0,
+        )
+
+        bundle = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-split-numa"
+        )
+        prepare = bundle["prepare.sh"]
+        start = bundle["start.sh"]
+
+        self.assertIn(
+            "TASK8C_NUMA_NODE=1 /usr/bin/python3", prepare
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 dada_db -k 00d2", prepare
+        )
+        self.assertIn(
+            "TASK8C_NUMA_NODE=0 /usr/bin/python3", prepare
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=0 dada_db -k 00d4", prepare
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=0 dada_db -k 00d6", prepare
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=0 "
+            '"$project/vdif_unpack_worker"',
+            start,
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=0 /usr/bin/taskset -c 30 "
+            '"$project/pipeline_worker"',
+            start,
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=0 /usr/bin/taskset -c 31",
+            start,
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 "
+            '"$project/rdma2dada"',
+            start,
+        )
+
+    def test_legacy_and_split_numa_placement_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            MODULE.RateRequest(
+                1.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="full",
+                receiver_poll_cpu=13,
+                worker_cpu_list="24,25,26,27,28,29",
+                gpu_worker_cpu=30,
+                sink_cpu_list="31",
+                numa_node=1,
+                ingress_numa_node=1,
+                processing_numa_node=0,
+            ).validate()
+
+    def test_split_numa_cli_is_visible_in_dry_run_contract(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            return_code = MODULE.main([
+                "--aggregate-gbps", "1",
+                "--duration-seconds", "30",
+                "--compute-consumer", "dbnull",
+                "--pipeline-stage", "full",
+                "--receiver-poll-cpu", "13",
+                "--worker-cpu-list", "24,25,26,27,28,29",
+                "--gpu-worker-cpu", "30",
+                "--sink-cpu-list", "31",
+                "--ingress-numa-node", "1",
+                "--processing-numa-node", "0",
+                "--dry-run",
+            ])
+
+        self.assertEqual(return_code, 0)
+        request = json.loads(stdout.getvalue())
+        self.assertIsNone(request["numa_node"])
+        self.assertEqual(request["ingress_numa_node"], 1)
+        self.assertEqual(request["processing_numa_node"], 0)
+
     def test_partial_or_overlapping_cpu_placement_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "supplied together"):
             MODULE.RateRequest(
@@ -1001,6 +1376,24 @@ class Task8cRatePointTest(unittest.TestCase):
             f"-k {plan.output_key} -b {plan.output_block_bytes} -a 4096 "
             f"-n {plan.output_ring_blocks}", prepare
         )
+        self.assertIn("check_ring_owner raw", prepare)
+        self.assertIn("check_ring_owner compute", prepare)
+        self.assertIn("check_ring_owner output", prepare)
+        self.assertIn('tail -n 80 "$run_dir/$name-ring.log"', prepare)
+
+    def test_receive_ring_prepare_reports_owner_log_before_failing(self):
+        plan = make_plan(
+            30.0, 30.0, compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+        prepare = MODULE.build_qths_bundle(
+            plan, "/tmp/task8c-receive-ring-diagnostic"
+        )["prepare.sh"]
+        self.assertIn("check_ring_owner raw", prepare)
+        self.assertNotIn("check_ring_owner compute", prepare)
+        self.assertNotIn("check_ring_owner output", prepare)
+        self.assertIn('echo "$name ring owner exited during prepare"', prepare)
+        self.assertIn('tail -n 80 "$run_dir/$name-ring.log"', prepare)
 
     def test_dbnull_consumes_one_complete_output_transfer_zero_copy(self):
         plan = make_plan(1.0, 30.0, compute_consumer="dbnull")
@@ -1078,6 +1471,165 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertIn('touch "$run_dir/pipeline.ready"', bundle["start.sh"])
         self.assertNotIn("compute_key", plan.as_dict())
         self.assertNotIn("compute_block_bytes", plan.as_dict())
+
+    def test_gpu_stage_uses_only_compute_and_output_rings(self):
+        plan = make_plan(
+            30.0,
+            10.0,
+            compute_consumer="dbnull",
+            pipeline_stage="gpu",
+        )
+
+        bundle = MODULE.build_qths_bundle(
+            plan,
+            "/tmp/task8c-gpu-only",
+            dada_junkdb_path="/home/user/psrdada/bin/dada_junkdb",
+        )
+
+        self.assertNotIn("raw-ring", bundle["prepare.sh"])
+        self.assertIn("compute-ring", bundle["prepare.sh"])
+        self.assertIn("output-ring", bundle["prepare.sh"])
+        self.assertNotIn("rdma2dada", bundle["start.sh"])
+        self.assertNotIn("vdif_unpack_worker", bundle["start.sh"])
+        self.assertNotIn("capture_nic_counters", bundle["start.sh"])
+        self.assertIn("pipeline_worker", bundle["start.sh"])
+        self.assertIn(
+            '--metrics-json "$run_dir/pipeline-worker-metrics.json"',
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            "/home/user/psrdada/bin/dada_junkdb", bundle["start.sh"]
+        )
+        junk = MODULE.derive_gpu_junk_input(plan)
+        self.assertIn(f"-R {junk.megabytes_per_second}", bundle["start.sh"])
+        self.assertIn(f"-b {junk.total_bytes}", bundle["start.sh"])
+        self.assertIn(f"-t {junk.duration_seconds}", bundle["start.sh"])
+        self.assertIn('"$run_dir/gpu-input.header"', bundle["start.sh"])
+        self.assertIn("input-writer.pid", bundle["start.sh"])
+        self.assertIn("gpu-input.header", bundle)
+        self.assertNotIn("input.dada", bundle["prepare.sh"])
+        self.assertNotIn("raw_key", plan.as_dict())
+        self.assertIn("compute_key", plan.as_dict())
+        self.assertIn("output_key", plan.as_dict())
+
+    def test_gpu_stage_pins_worker_and_sink_from_profile_fields(self):
+        plan = dataclasses.replace(
+            make_plan(
+                12.5, 10.0, compute_consumer="dbnull",
+                pipeline_stage="gpu",
+            ),
+            gpu_worker_cpu=21,
+            sink_cpu_list="20",
+            numa_node=1,
+        )
+        plan.source  # ensure the fixture retains a valid resolved contract
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-gpu-placement")
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 21 "
+            '"$project/pipeline_worker"',
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            "/usr/bin/numactl --membind=1 /usr/bin/taskset -c 20 dada_dbnull",
+            bundle["start.sh"],
+        )
+        self.assertIn("TASK8C_NUMA_NODE=1", bundle["prepare.sh"])
+
+    def test_gpu_stage_builds_exact_junkdb_input_header(self):
+        plan = make_plan(
+            30.0, 10.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-gpu-header")
+        junk = MODULE.derive_gpu_junk_input(plan)
+        header = bundle["gpu-input.header"]
+        self.assertEqual(len(header), 4096)
+        text = header.rstrip(b"\0").decode("ascii")
+        self.assertIn(f"FILE_SIZE {junk.total_bytes}\n", text)
+        self.assertIn(f"TRANSFER_SIZE {junk.total_bytes}\n", text)
+        self.assertIn(f"BYTES_PER_SECOND {junk.bytes_per_second}\n", text)
+        self.assertIn("DATA_STAGE UNPACKED\n", text)
+        self.assertIn("ORDER ATFP\n", text)
+
+    def test_gpu_junk_input_rounds_up_each_second_for_any_target_rate(self):
+        plan = make_plan(
+            30.0, 1.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        junk = MODULE.derive_gpu_junk_input(plan)
+        target_bytes_per_second = 30_000_000_000 // 8
+        self.assertEqual(
+            junk.blocks_per_second,
+            math.ceil(target_bytes_per_second / plan.compute_block_bytes),
+        )
+        self.assertEqual(
+            junk.bytes_per_second,
+            junk.blocks_per_second * plan.compute_block_bytes,
+        )
+        self.assertGreaterEqual(junk.bytes_per_second, target_bytes_per_second)
+        self.assertEqual(junk.block_count, junk.blocks_per_second)
+
+    def test_gpu_result_reports_block_aligned_pressure_not_zero_senders(self):
+        plan = make_plan(
+            12.5, 3.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        result = {"plan": plan.as_dict(), "senders": []}
+        self.assertEqual(
+            MODULE._actual_result_payload_gbps(result),
+            plan.as_dict()["gpu_input"]["actual_payload_gbps"],
+        )
+
+    def test_gpu_statistics_require_every_configured_input_and_output_block(self):
+        plan = make_plan(
+            2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        junk = MODULE.derive_gpu_junk_input(plan)
+        statistics = {
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "blocks": junk.block_count,
+                    "input_bytes": junk.total_bytes,
+                    "output_bytes": junk.block_count * plan.output_block_bytes,
+                    "transfer_elapsed_ns": 2_000_000_000,
+                    "input_payload_gbps": junk.total_bytes * 8 / 2_000_000_000,
+                },
+            },
+            "output": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+        MODULE._validate_statistics(statistics, plan, "")
+        statistics["gpu"]["metrics"]["blocks"] -= 1
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("gpu-statistics", raised.exception.argv)
+
+    def test_process_supervisor_persists_lifecycle_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            script = root / "supervise.py"
+            exit_path = root / "pipeline-worker.exit"
+            script.write_text(MODULE.build_process_supervisor())
+            completed = subprocess.run(
+                [sys.executable, str(script), str(exit_path), "/bin/sh", "-c", "exit 0"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            ledger = json.loads(
+                (root / "pipeline-worker.process.json").read_text()
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(ledger["role"], "pipeline-worker")
+        self.assertEqual(ledger["argv"], ["/bin/sh", "-c", "exit 0"])
+        self.assertGreater(ledger["pid"], 0)
+        self.assertEqual(ledger["state"], "EXITED")
+        self.assertEqual(ledger["returncode"], 0)
+        self.assertIsNotNone(ledger["started_utc"])
+        self.assertIsNotNone(ledger["ended_utc"])
 
     def test_receive_stage_passes_explicit_rdma_queue_parameters(self):
         plan = dataclasses.replace(
@@ -1280,7 +1832,9 @@ class Task8cRatePointTest(unittest.TestCase):
             "repost_batches=7, min_posted_wrs=900, "
             "poll_batch_high_watermark=32, "
             "completion_to_repost_ns_total=1234, "
-            "completion_to_repost_ns_max=80\n"
+            "completion_to_repost_ns_max=80, "
+            "drain_duration_ns=1000042000, "
+            "completions_after_stop=17, exit_reason=DRAIN_DEADLINE\n"
         )
         parsed = MODULE._parse_receiver_statistics(receiver)
         self.assertEqual(parsed["zeroed"], 1)
@@ -1289,6 +1843,9 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(
             parsed["direct"]["poll_batch_high_watermark"], 32
         )
+        self.assertEqual(parsed["direct"]["drain_duration_ns"], 1000042000)
+        self.assertEqual(parsed["direct"]["completions_after_stop"], 17)
+        self.assertEqual(parsed["direct"]["exit_reason"], "DRAIN_DEADLINE")
 
     def test_unpack_stage_dbnull_statistics_do_not_require_gpu_marker(self):
         plan = make_plan(
@@ -1787,7 +2344,7 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertTrue(statistics["gpu"]["completed"])
         MODULE._validate_statistics(statistics, plan, "65667071")
-        statistics["compute"]["exit_code"] = 1
+        statistics["output"]["exit_code"] = 1
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
@@ -1816,7 +2373,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 "fully_missing_groups": 0,
                 "missing_station": 1,
             },
-            "compute": {
+            "output": {
                 "consumer": "dada_dbnull",
                 "exit_code": 0,
                 "zero_copy": True,
@@ -1894,6 +2451,7 @@ class Task8cRatePointTest(unittest.TestCase):
                 "qths1:dada_db",
                 "qths1:dada_dbdisk",
                 "qths1:ethtool",
+                "qths1:pipeline_worker",
                 "qths1:rdma2dada",
                 "qths1:vdif_unpack_worker",
                 "qtpulsar1:ethtool",
@@ -2074,7 +2632,7 @@ class Task8cRatePointTest(unittest.TestCase):
             "/home/user/psrdada/bin/dada_db -k 00d2", prepare_script
         )
         self.assertIn(
-            "/home/user/psrdada/bin/dada_dbdisk -k 00d4", start_script
+            "/home/user/psrdada/bin/dada_dbdisk -k 00d6", start_script
         )
         self.assertIn(
             "/home/user/psrdada/bin/dada_db -d -k 00d2", cleanup_script
@@ -2127,6 +2685,102 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(state["state"], "CLEANED")
         self.assertEqual(state["test_result"], "PASS")
         self.assertEqual(saved["cleanup"]["rings_destroyed"], ["00d2", "00d4"])
+
+    def test_state_history_preserves_every_controller_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = MODULE.RatePointController(
+                FakeBackend(), pathlib.Path(directory), run_id="state-history"
+            )
+            controller.run(make_plan(1.0, 10.0))
+            history = [
+                json.loads(line)
+                for line in (
+                    pathlib.Path(directory)
+                    / "state-history"
+                    / "state-history.jsonl"
+                ).read_text().splitlines()
+            ]
+        self.assertEqual(
+            [entry["state"] for entry in history],
+            [
+                "PREPARE", "CONFIG_READY", "RINGS_READY", "PIPELINE_READY",
+                "SENDERS_WAITING", "SENDERS_RUNNING", "COLLECTING", "PASS",
+                "CLEANED",
+            ],
+        )
+        self.assertTrue(all("timestamp_utc" in entry for entry in history))
+
+    def test_manifest_records_controller_launcher_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = MODULE.RatePointController(
+                FakeBackend(), pathlib.Path(directory), run_id="launcher-identity"
+            )
+            controller.run(make_plan(1.0, 10.0))
+            manifest = json.loads(
+                (
+                    pathlib.Path(directory)
+                    / "launcher-identity"
+                    / "manifest.json"
+                ).read_text()
+            )
+        self.assertEqual(manifest["launcher"]["argv"], MODULE.sys.argv)
+        self.assertEqual(manifest["launcher"]["pid"], MODULE.os.getpid())
+        self.assertEqual(manifest["launcher"]["pgid"], MODULE.os.getpgrp())
+
+    def test_gpu_only_controller_skips_network_senders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = GpuOnlyFakeBackend()
+            plan = make_plan(
+                30.0, 10.0, compute_consumer="dbnull",
+                pipeline_stage="gpu",
+            )
+            controller = MODULE.RatePointController(
+                backend, pathlib.Path(directory), run_id="gpu-only"
+            )
+
+            result = controller.run(plan)
+
+        self.assertEqual(result["TEST_RESULT"], "PASS")
+        self.assertEqual(result["senders"], [])
+        self.assertNotIn("SENDERS_WAITING", backend.calls)
+        self.assertNotIn("SENDERS_RUNNING", backend.calls)
+        self.assertEqual(
+            result["cleanup"]["rings_destroyed"], ["00d4", "00d6"]
+        )
+
+    def test_gpu_only_backend_preflight_has_no_network_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "suite" / "measured-01"
+            run_dir.mkdir(parents=True)
+            transport = LocalArtifactCheckingTransport()
+            backend = MODULE.SshBackend(
+                transport=transport,
+                project_root=root,
+                known_hosts=root / "known-hosts",
+                qths_binary_dir=root / "build-release",
+            )
+            plan = make_plan(
+                30.0, 10.0, compute_consumer="dbnull",
+                pipeline_stage="gpu",
+            )
+
+            preparation = backend.prepare(plan, run_dir)
+            evidence = backend.prepare_configs(plan, run_dir, preparation)
+
+        invoked_hosts = [
+            call[2][8] for call in transport.calls
+            if call[0] == "run" and call[2][0] == "ssh"
+            and len(call[2]) > 8
+        ]
+        self.assertNotIn("qtpulsar1", invoked_hosts)
+        self.assertNotIn("qtpulsar2", invoked_hosts)
+        self.assertEqual(evidence["sender_endpoints"], [])
+        self.assertIsNone(evidence["receiver_preflight"])
+        self.assertIn("qths1:pipeline_worker", evidence["binary_sha"])
+        self.assertIn("qths1:dada_junkdb", evidence["binary_sha"])
+        self.assertNotIn("qths1:rdma2dada", evidence["binary_sha"])
+        self.assertNotIn("qths1:ethtool", evidence["binary_sha"])
 
     def test_failure_keeps_command_diagnostics_after_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2241,12 +2895,31 @@ class Task8cRatePointTest(unittest.TestCase):
             for call in transport.calls
             if call[0] == "run" and call[1] == "CLEANUP"
         ]
-        self.assertEqual(cleanup["rings_destroyed"], ["00d2", "00d4"])
+        self.assertEqual(
+            cleanup["rings_destroyed"], ["00d2", "00d4", "00d6"]
+        )
         self.assertTrue(cleanup["capability_removed"])
         self.assertTrue(
             any("/tmp/task8c-partial/cleanup.sh" in command for command in cleanup_commands)
         )
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
+
+    def test_receive_pipeline_start_resolves_only_raw_ring_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            plan = make_plan(30.0, 30.0, pipeline_stage="receive")
+            ring_plan = json.loads(json.dumps(plan.ring_plan))
+            del ring_plan["rings"]["output"]
+            plan = dataclasses.replace(plan, ring_plan=ring_plan)
+            backend = MODULE.SshBackend(
+                transport=RecordingTransport(),
+                project_root=root,
+                known_hosts=root / "known-hosts",
+            )
+            backend.remote_run_dir = "/tmp/task8c-receive-only"
+            readiness = backend.start_pipeline(plan, root)
+        self.assertEqual(readiness["rings"], ["00d2"])
+        self.assertTrue(readiness["capability_added"])
 
     def test_cleanup_nonzero_exit_is_persisted_as_cleanup_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2278,7 +2951,7 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(cleanup["CLEANUP_RESULT"], "PASS")
         self.assertEqual(cleanup["errors"], [])
         self.assertEqual(len(cleanup["diagnostic_errors"]), 1)
-        self.assertIn("compute-summary.json", cleanup["diagnostic_errors"][0])
+        self.assertIn("output-summary.json", cleanup["diagnostic_errors"][0])
 
     def test_second_sender_start_failure_terminates_first_sender(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2318,6 +2991,59 @@ class Task8cRatePointTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
         self.assertTrue(running.terminated)
+
+    def test_wait_without_started_sender_runtime_writes_no_evidence_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backend = MODULE.SshBackend(transport=RecordingTransport())
+            backend.local_run_dir = root
+            running = PolledProcess(None)
+            failed = PolledProcess(7, "SEND_ERROR: source stream unavailable")
+            with self.assertRaises(MODULE.StageError):
+                backend.wait_senders(
+                    make_plan(1.0, 10.0), [running, failed]
+                )
+            self.assertFalse((root / "sender-processes.json").exists())
+
+    def test_nonzero_sender_exit_persists_host_command_pid_and_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            packet_dir = root / "config" / "packet_formats"
+            packet_dir.mkdir(parents=True)
+            (packet_dir / "frontend.example-v1.json").write_text(
+                json.dumps({"schema_version": 1, "format_id": "project-vdif-v1"})
+            )
+            run_dir = root / "suite" / "warmup-01"
+            run_dir.mkdir(parents=True)
+            transport = NonzeroSenderTransport()
+            backend = MODULE.SshBackend(
+                transport=transport,
+                project_root=root,
+                known_hosts=root / "known-hosts",
+                sender_binary_dir=root / "sender-release",
+            )
+            backend.local_run_dir = run_dir
+            backend.remote_run_dir = "/tmp/task8c-sender-evidence"
+            backend.preparation = {"start_utc": "2030-01-01-00:06:00"}
+            plan = make_plan(0.1, 10.0)
+            backend._write_bundle(plan, backend.preparation["start_utc"])
+            processes = backend.start_senders(plan, run_dir)
+            with self.assertRaises(MODULE.StageError) as raised:
+                backend.wait_senders(plan, processes)
+            evidence = json.loads(
+                (run_dir / "sender-processes.json").read_text()
+            )
+        self.assertEqual(raised.exception.exit_code, 255)
+        self.assertEqual(raised.exception.classification, "HARNESS_FAIL")
+        self.assertEqual(raised.exception.argv, evidence[0]["argv"])
+        self.assertEqual(evidence[0]["host"], "qtpulsar1")
+        self.assertEqual(evidence[0]["station_id"], 101)
+        self.assertEqual(evidence[0]["pid"], 4101)
+        self.assertEqual(evidence[0]["returncode"], 255)
+        self.assertEqual(evidence[0]["state"], "EXITED")
+        self.assertIn("connection closed", evidence[0]["output"])
+        self.assertTrue(evidence[0]["output_path"].endswith("sender101.log"))
+        self.assertEqual(evidence[1]["state"], "TERMINATED_BY_PEER_FAILURE")
 
     def test_sender_bind_collision_is_environment_blocker_and_aborts_peer(self):
         failed = PolledProcess(
@@ -2455,7 +3181,10 @@ class Task8cRatePointTest(unittest.TestCase):
             },
             "sample_hex": "65667071",
         }
-        statistics = MODULE.parse_qths_statistics(receiver, worker, compute)
+        plan = dataclasses.replace(plan, pipeline_stage="unpack")
+        statistics = MODULE.parse_qths_statistics(
+            receiver, worker, compute, expect_pipeline_worker=False
+        )
         MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(statistics["receiver"]["accepted"], records)
         self.assertEqual(statistics["unpack"]["complete_groups"], plan.group_count)
@@ -2467,7 +3196,7 @@ class Task8cRatePointTest(unittest.TestCase):
         plan = make_plan(0.1, 10.0)
         backend = FakeBackend()
         statistics = backend.collect(plan, pathlib.Path("unused"))
-        statistics["compute"]["CONFIG_ID"] = "c" * 64
+        statistics["output"]["CONFIG_ID"] = "c" * 64
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
@@ -2557,16 +3286,20 @@ class Task8cRatePointTest(unittest.TestCase):
                         "/tmp/observation.json",
                         "--config-compiler",
                         "/tmp/observation_config_compile",
+                        "--experiment-name",
+                        "bootstrap-full-v1",
                         "--execute",
                     ]
                 )
             finally:
                 MODULE.SshBackend = original
                 MODULE.compile_rate_plan = original_compile
-            results = list(pathlib.Path(directory).glob("*/result.json"))
+            results = list(
+                pathlib.Path(directory).glob("*/runs/measured-01.json")
+            )
             self.assertEqual(len(results), 1)
             self.assertRegex(
-                results[0].parent.name,
+                results[0].parents[1].name,
                 r"^full-1Gbps-10s-\d{8}T\d{6}Z$",
             )
             result = json.loads(results[0].read_text())
@@ -2600,6 +3333,8 @@ class Task8cRatePointTest(unittest.TestCase):
                         "/tmp/observation.json",
                         "--config-compiler",
                         "/tmp/observation_config_compile",
+                        "--experiment-name",
+                        "bootstrap-full-v1",
                         "--preflight-only",
                     ]
                 )
@@ -2645,6 +3380,8 @@ class Task8cRatePointTest(unittest.TestCase):
                         "/tmp/observation.json",
                         "--config-compiler",
                         "/tmp/observation_config_compile",
+                        "--experiment-name",
+                        "bootstrap-full-v1",
                         "--execute",
                     ]
                 )
@@ -2683,6 +3420,8 @@ class Task8cRatePointTest(unittest.TestCase):
                         "/tmp/observation.json",
                         "--config-compiler",
                         "/tmp/observation_config_compile",
+                        "--experiment-name",
+                        "bootstrap-full-v1",
                         "--execute",
                     ]
                 )
@@ -2750,10 +3489,16 @@ class Task8cRatePointTest(unittest.TestCase):
                 suite_id="acceptance",
             )
             result_files = sorted(
-                (pathlib.Path(directory) / "acceptance").glob("*/result.json")
+                (pathlib.Path(directory) / "acceptance" / "runs").glob("*.json")
+            )
+            evidence_files = sorted(
+                (pathlib.Path(directory) / "acceptance" / "runs").glob(
+                    "*.evidence.log"
+                )
             )
         self.assertEqual(len(created), 4)
         self.assertEqual(len(result_files), 4)
+        self.assertEqual(len(evidence_files), 4)
         self.assertEqual(summary["TEST_RESULT"], "PASS")
         self.assertEqual(summary["warmup_count"], 1)
         self.assertEqual(summary["measured_count"], 3)
@@ -2790,8 +3535,8 @@ class Task8cRatePointTest(unittest.TestCase):
                 suite_id="failed-warmup",
             )
             result_files = sorted(
-                (pathlib.Path(directory) / "failed-warmup").glob(
-                    "*/result.json"
+                (pathlib.Path(directory) / "failed-warmup" / "runs").glob(
+                    "*.json"
                 )
             )
 
@@ -2801,6 +3546,194 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(len(summary["runs"]), 1)
         self.assertEqual(summary["runs"][0]["role"], "warmup")
         self.assertEqual(summary["runs"][0]["CLEANUP_RESULT"], "PASS")
+
+    def test_compact_suite_run_keeps_json_and_raw_evidence_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            run_dir = suite_root / "measured-01"
+            (run_dir / "observation-artifacts").mkdir(parents=True)
+            (run_dir / "qths").mkdir()
+            (run_dir / "bundle").mkdir()
+            (run_dir / "observation.json").write_text(
+                '{"observation":{"observation_id":"test"}}\n'
+            )
+            (run_dir / "observation-artifacts" / "resolved_observation.json").write_text(
+                '{"config_id":"abc"}\n'
+            )
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "run_id": "measured-01",
+                "launcher": {"argv": ["controller"], "pid": 10},
+                "preparation": {"start_utc": "2026-08-21-00:00:00"},
+                "config": {"binary_sha": {"qths1:pipeline_worker": "abc"}},
+            }))
+            (run_dir / "state-history.jsonl").write_text(
+                '{"state":"PREPARE"}\n{"state":"CLEANED"}\n'
+            )
+            (run_dir / "sender-processes.json").write_text(json.dumps([
+                {"role": "sender", "argv": ["fpga_sender_sim"], "returncode": 0}
+            ]))
+            (run_dir / "qths" / "receiver.log").write_text(
+                "progress that should be dropped\n"
+                "Receive summary: accepted=10, wrong_length=0, published=10\n"
+            )
+            (run_dir / "bundle" / "temporary.sh").write_text("temporary\n")
+            result = {
+                "TEST_RESULT": "PASS",
+                "run_id": "measured-01",
+                "statistics": {"receiver": {"accepted": 10}},
+                "cleanup": {"CLEANUP_RESULT": "PASS"},
+            }
+            (run_dir / "result.json").write_text(json.dumps(result))
+
+            compact = MODULE.compact_suite_run(suite_root, "measured-01", result)
+
+            run_json = suite_root / "runs" / "measured-01.json"
+            evidence = suite_root / "runs" / "measured-01.evidence.log"
+            saved = json.loads(run_json.read_text())
+            self.assertFalse(run_dir.exists())
+            self.assertTrue((suite_root / "observation.json").is_file())
+            self.assertTrue((suite_root / "resolved_observation.json").is_file())
+            self.assertTrue((suite_root / "preflight.json").is_file())
+            self.assertEqual(saved["stages"][0]["state"], "PREPARE")
+            self.assertEqual(saved["processes"][1]["role"], "sender")
+            self.assertIn("Receive summary: accepted=10", evidence.read_text())
+            self.assertNotIn("progress that should be dropped", evidence.read_text())
+            self.assertEqual(
+                compact["evidence_sha256"],
+                hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            )
+
+    def test_suite_identity_ignores_compiler_temporary_source_path_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            suite_root.mkdir()
+            result = {
+                "plan": {
+                    "resolved_plan": {
+                        "config_id": "abc",
+                        "geometry_id": "def",
+                    }
+                }
+            }
+            for run_name, source_path in (
+                ("warmup-01", "/tmp/compiler-warmup/config-4.json"),
+                ("measured-01", "/tmp/compiler-measured/config-4.json"),
+            ):
+                run_dir = suite_root / run_name
+                artifacts = run_dir / "observation-artifacts"
+                artifacts.mkdir(parents=True)
+                (artifacts / "resolved_observation.json").write_text(
+                    json.dumps({
+                        "config_id": "abc",
+                        "geometry_id": "def",
+                        "source_path": source_path,
+                        "resolved": {"raw_block_bytes": 52838400},
+                    })
+                )
+                MODULE._copy_suite_identity(run_dir, suite_root, result)
+
+            saved = json.loads(
+                (suite_root / "resolved_observation.json").read_text()
+            )
+            self.assertEqual(
+                saved["source_path"], "/tmp/compiler-warmup/config-4.json"
+            )
+
+    def test_suite_identity_rejects_real_resolved_configuration_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            suite_root.mkdir()
+            result = {"plan": {"resolved_plan": {}}}
+            for run_name, block_bytes in (
+                ("warmup-01", 52838400),
+                ("measured-01", 52838401),
+            ):
+                run_dir = suite_root / run_name
+                artifacts = run_dir / "observation-artifacts"
+                artifacts.mkdir(parents=True)
+                (artifacts / "resolved_observation.json").write_text(
+                    json.dumps({
+                        "config_id": "abc",
+                        "geometry_id": "def",
+                        "source_path": f"/tmp/{run_name}/config.json",
+                        "resolved": {"raw_block_bytes": block_bytes},
+                    })
+                )
+                if run_name == "warmup-01":
+                    MODULE._copy_suite_identity(run_dir, suite_root, result)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "suite configuration identity changed"
+                    ):
+                        MODULE._copy_suite_identity(run_dir, suite_root, result)
+
+    def test_compact_failed_run_keeps_first_failure_debug_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            run_dir = suite_root / "warmup-01"
+            run_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text("{}\n")
+            (run_dir / "state-history.jsonl").write_text(
+                '{"state":"FAIL"}\n'
+            )
+            result = {
+                "TEST_RESULT": "PRODUCT_FAIL",
+                "run_id": "warmup-01",
+                "failure": {
+                    "stage": "COLLECTING",
+                    "argv": ["validate", "pipeline-statistics"],
+                    "exit_code": 1,
+                    "stdout": "receiver summary evidence",
+                    "stderr": "count mismatch",
+                },
+                "cleanup": {"CLEANUP_RESULT": "PASS", "rings_destroyed": ["00d2"]},
+            }
+            (run_dir / "result.json").write_text(json.dumps(result))
+
+            MODULE.compact_suite_run(suite_root, "warmup-01", result)
+
+            debug = suite_root / "debug" / "warmup-01"
+            self.assertTrue((debug / "failed-command.json").is_file())
+            self.assertEqual(
+                (debug / "failed-process.log").read_text(),
+                "receiver summary evidence\ncount mismatch\n",
+            )
+            self.assertTrue((debug / "resource-snapshot.json").is_file())
+
+    def test_pass_compaction_fails_closed_on_incomplete_process_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            run_dir = suite_root / "measured-01"
+            run_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "plan": {
+                    "pipeline_stage": "gpu",
+                    "config_id": "a" * 64,
+                    "nant": 2,
+                },
+                "config": {"binary_sha": {"qths1:pipeline_worker": "b" * 64}},
+            }))
+            result = {
+                "TEST_RESULT": "PASS",
+                "run_id": "measured-01",
+                "cleanup": {"CLEANUP_RESULT": "PASS"},
+            }
+
+            compact = MODULE.compact_suite_run(
+                suite_root, "measured-01", result
+            )
+
+            self.assertEqual(compact["TEST_RESULT"], "HARNESS_FAIL")
+            self.assertEqual(
+                compact["failure"]["stage"], "ARTIFACT_COMPACTION"
+            )
+            self.assertIn(
+                "missing required role", compact["failure"]["stderr"]
+            )
+            self.assertTrue(
+                (suite_root / "debug" / "measured-01" /
+                 "failed-command.json").is_file()
+            )
 
     def test_repeated_runs_share_the_suite_observation_identity(self):
         suite = pathlib.Path("/results/full-30Gbps-30s")

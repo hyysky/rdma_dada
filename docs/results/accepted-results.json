@@ -1,4 +1,89 @@
 {
-  "schema_version": 1,
-  "results": []
+  "results": [
+    {
+      "catalog_entry": {
+        "actual_payload_gbps": null,
+        "cleanup_result": "PASS",
+        "configuration": {
+          "gpu_worker_cpu": 21,
+          "numa_node": 1,
+          "receiver_poll_batch": 32,
+          "receiver_poll_cpu": 13,
+          "receiver_wr_num": 1024,
+          "reorder_horizon_groups": 96000,
+          "rings": {
+            "compute": {
+              "block_bytes": 52428800,
+              "blocks": 8
+            },
+            "output": {
+              "block_bytes": 819200,
+              "blocks": 8
+            },
+            "raw": {
+              "block_bytes": 52838400,
+              "blocks": 16
+            }
+          },
+          "sink_cpu_list": "20",
+          "unpack_start_delay_seconds": 0,
+          "window_groups": null,
+          "worker_cpu_list": "14,15,16,17,18,19"
+        },
+        "duration_seconds": 30.0,
+        "first_failure": {
+          "classification": "PERFORMANCE_FAIL",
+          "exit_code": 1,
+          "message": "[{\"actual\": 5210623, \"expected\": 27252908, \"field\": \"receiver.accepted\"}, {\"actual\": 5210623, \"expected\": 27252908, \"field\": \"receiver.published\"}, {\"actual\": 5210623, \"expected\": 27252908, \"field\": \"unpack.records\"}, {\"actual\": 5210623, \"expected\": 27252908, \"field\": \"unpack.accepted\"}, {\"actual\": 2404099, \"expected\": 13626454, \"field\": \"unpack.complete_groups\"}, {\"actual\": 11222355, \"expected\": 0, \"field\": \"unpack.incomplete_groups\"}, {\"actual\": 10819930, \"expected\": 0, \"field\": \"unpack.fully_missing_groups\"}, {\"actual\": 22042285, \"expected\": 0, \"field\": \"unpack.missing_station\"}]",
+          "run_id": "measured-01",
+          "stage": "COLLECTING"
+        },
+        "identity": {
+          "baseline_profile_id": null,
+          "baseline_profile_sha256": null,
+          "binary_sha256": {
+            "qths1:dada_db": "61b1a6a92f8f45b07fc760868aee59f683511ffa331ba80b62306466a7d5e1a4",
+            "qths1:dada_dbnull": "fbe083b4fdc775e0b3e4513c1c150a1e73e7475164beef83487823b8ba13bcbc",
+            "qths1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qths1:pipeline_worker": "ccc24e81912ac1fe9a2b37fd953732ae108eaee8ada96d79243fc1cd9139a961",
+            "qths1:rdma2dada": "6da446797ae5accd1eacb7a19a75849aba5fc5730749916dea99e1130a1fd9e9",
+            "qths1:vdif_unpack_worker": "085fa2715a09a8fec91b77fcec4441ff11a12a411688d82ecb2eeaf3e2b9e34c",
+            "qtpulsar1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar1:fpga_sender_sim": "0cb7d57fbd0c0f3739f859ded3a84e85033d6677c70fc68780e74c4afff2ab30",
+            "qtpulsar2:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar2:fpga_sender_sim": "0cb7d57fbd0c0f3739f859ded3a84e85033d6677c70fc68780e74c4afff2ab30"
+          },
+          "config_id": "fbebc09b41ee0498bd95c04bbd1ff0326ec75452e4be949a81c3182256c605a3",
+          "geometry_id": "d7eeac670f1de89c4ed4c15e0aa14937f02691a751b551f0762077d40ff78fa4",
+          "source_manifest_sha256": "4665336b7a03a76269f9d33da638069ebb147532fd130e581b24a924bd33158a"
+        },
+        "measured_count": 1,
+        "modules": [
+          "rdma2dada",
+          "vdif_unpack_worker",
+          "pipeline_worker",
+          "dada_dbnull"
+        ],
+        "result_path": "suites/full-30Gbps-30s-20260827T042304Z",
+        "started_utc": "2026-08-27T04:23:10.194190Z",
+        "suite_id": "full-30Gbps-30s-20260827T042304Z",
+        "suite_manifest_sha256": "a9561d49819a3f033a215d5f61a9d8ff759bf4f93e19a83d5a52db94a3269cba",
+        "summary_sha256": "16307858d2883e97a8f0f1d7c52b57aa73de33e52fdbee143b38213bbab29946",
+        "target_payload_gbps": 30.0,
+        "test_result": "PERFORMANCE_FAIL",
+        "test_topology": "full",
+        "warmup_count": 0
+      },
+      "origin": {
+        "imported_utc": "2026-08-27T05:00:41Z",
+        "remote_suite_root": "/home/user/wy/task8c-power-results/full-30Gbps-30s-20260827T042304Z",
+        "schema_version": 1,
+        "source_host": "HF",
+        "source_manifest_sha256": "4665336b7a03a76269f9d33da638069ebb147532fd130e581b24a924bd33158a",
+        "suite_id": "full-30Gbps-30s-20260827T042304Z"
+      },
+      "promoted_utc": "2026-08-27T05:00:41Z"
+    }
+  ],
+  "schema_version": 1
 }

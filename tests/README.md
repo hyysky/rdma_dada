@@ -47,7 +47,7 @@ ctest --test-dir build-linux --output-on-failure
 
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
-| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类、幂次日志限频，以及 zero/one/batch/partial raw tail 的完整-record 发布判定 | `BUILD_TESTING=ON` |
+| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类、1 秒 drain/4096 次空轮询计时门控/期间 WR 重投递，以及 zero/one/batch/partial raw tail 的完整-record 发布判定 | `BUILD_TESTING=ON` |
 | `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_config_test` | `vdif_unpack_config_test.cpp` | 校验 ring key、Station ID→A 映射、两 block payload-only 窗口几何、profile 冲突、内存上限与溢出错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、观测 timeline 原样传播、按 `EXPECTED_GROUPS` 计算 `TRANSFER_SIZE`、未知字段保留、block-scoped ATFP/无包头几何及输入冲突不发布输出 | `BUILD_TESTING=ON` |
@@ -62,14 +62,20 @@ ctest --test-dir build-linux --output-on-failure
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
-| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证控制器只消费统一 observation/compiler artifacts，并覆盖 preflight-only、配置/二进制 SHA、有限 observation stop、进程 supervisor 信号转发/退出码、计数守恒、CONFIG_ID/GEOMETRY_ID、双 sender、ATFP/dbdisk/dbnull、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用 `dada_junkdb` 按任意目标 payload 速率向上取整为整 compute blocks/s，严格核对逐 block 输入/输出；并覆盖基线漂移、preflight、进程账本、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 `A=469,F=4,P=1,B=350` 的 Observation JSON 与确定性 FPAB2 int8 NPY 权重 | 找到 Python 3；不连接远端服务器 |
+| `task8c_profiles_test` | `task8c_profiles_test.py` | 验证 passing profile 严格 schema、原文件 SHA、默认填充、显式覆盖和逐字段 drift | 找到 Python 3 |
+| `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
+| `task8c_catalog_test` | `task8c_catalog_test.py` | 验证 compact suite 的严格 manifest/路径检查、原子导入、确定性 JSON/CSV Catalog、选择性查询和显式证据提升 | 找到 Python 3；不访问网络或 Git |
+| `generate_source_manifest_test` | `generate_source_manifest_test.py` | 验证不依赖 Git 的确定性源码 manifest allowlist、排序与排除规则 | 找到 Python 3 |
+| `pipeline_worker_metrics_test` | `pipeline_worker_metrics_test.cpp` | 验证 GPU worker block/byte/service/output-wait/CUDA timing 聚合、均值与原子 JSON 落盘 | `BUILD_TESTING=ON` |
 | `atfp_throughput_campaign_test` | `atfp_throughput_campaign_test.py` | 验证物理线速换算、1–40 Gbps 固定扫描、0.5 Gbps 二分、正式 CLI 和 source SHA 门禁 | 找到 Python 3；不连接远端服务器 |
 | `observation_config_test` | `observation_config_test.cpp` | 校验统一观测 JSON、精确皮秒时长、Station/A 轴顺序、metadata、ring/receiver 参数、相对路径、算法顺序及严格缺失/未知字段拒绝 | `BUILD_TESTING=ON` |
 | `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置、wire profile 和 `[F,P,A,B,2]` 权重精确派生 ingest 及 Beamform/Power/Stokes/Integration 的 block/output-ring 几何，并校验溢出、整除和权重 F/P/A 边界 | `BUILD_TESTING=ON` |
 | `beamform_weight_metadata_test` | `beamform_weight_metadata_test.cpp` | 校验 NPY v1/v2、C-order、`|i1`/`<i2`、严格 `[F,P,A,B,2]`、B/NBEAM 推导及 payload/trailing byte 检查 | `BUILD_TESTING=ON` |
 | `config_identity_test` | `config_identity_test.cpp` | 校验标准 SHA256、配置规范化、路径无关的 CONFIG_ID/GEOMETRY_ID、权重内容摘要、resolved plan 往返，以及派生几何、最终输出契约和 ID 篡改拒绝 | `BUILD_TESTING=ON` |
-| `observation_artifacts_test` | `observation_artifacts_test.cpp` | 校验统一观测配置调用生产 header transform 生成 RAW、UNPACKED、CONVERTED、BEAMFORMED、最终产品 header，校验 manifest/resolved/ring/report 内容及单个 output ring 几何 | `BUILD_TESTING=ON` |
-| `observation_config_compile_test` | `observation_config_compile_test.py` | 验证 compiler preflight、无输出副作用、原子 artifact 目录、SHA256 manifest、无覆盖和无效配置拒绝 | 找到 Python 3 |
+| `observation_artifacts_test` | `observation_artifacts_test.cpp` | 校验统一观测配置生成全部 stage header/manifest/ring/report，并精确验证 Beamform/Power/Stokes/Integration 的 20% GPU deadline、逐级及 H2D+D2H 合计吞吐、buffer/权重显存与溢出拒绝 | `BUILD_TESTING=ON` |
+| `observation_config_compile_test` | `observation_config_compile_test.py` | 验证 compiler preflight、`--budget-payload-gbps` 双速率来源、无输出副作用、原子 artifact 目录、SHA256 manifest、无覆盖和无效配置拒绝 | 找到 Python 3 |
 | `pipeline_config_test` | `pipeline_config_test.cpp` | 解析严格 JSON 配置，校验 record/block/file/rate 几何、溢出和 DADA header 派生值 | `BUILD_TESTING=ON` |
 | `packet_format_config_test` | `packet_format_config_test.cpp` | 加载 schema-v2、固定 32-byte/8-word Project VDIF wire profile，逐字段校验 bit layout、TFP axis、HEADER/DERIVED/LOOKUP 引用，并拒绝 schema-v1 `payload_bytes`、观测轴常量和 downstream `output_order` | `BUILD_TESTING=ON` |
 | `packet_format_inspect_test` | `packet_format_inspect_test.py` | 检查 profile inspect 的 32-byte、TWOS_COMPLEMENT、IQ 和 axis 输出，并确认未知字段、旧 signed 字段和 64-byte header 被拒绝 | 找到 Python 3 |
@@ -272,9 +278,13 @@ python3 -u scripts/task8c_rate_point.py \
 `--config-compiler` 产生并校验 resolved plan、ring plan、DADA headers、validation report
 和 manifest，不再生成 `pipeline.json`、`packet.json`、`worker.json`。
 
-每次运行产生 `manifest.json`、`state.json`、`result.json` 和分组件日志；suite 目录的
-`summary.json` 汇总三次实测速率的 median/minimum/maximum/spread。只有四次运行清理均
-完成、三次 measured 均为 `PASS` 且 summary 为 `PASS`，该速率点才通过。
+suite 根目录只保留 `observation.json`、`resolved_observation.json`、`preflight.json`、
+`summary.json` 和 `MANIFEST.sha256`。每轮在 `runs/` 下保留一个包含进程参数、状态、
+统计、结果与清理的 `<run-id>.json`，以及一个只含原始summary/EOD/error/cleanup行的
+`<run-id>.evidence.log`；失败轮额外保留首错的 `debug/<run-id>/`。bundle、PID/ready、
+重复配置和完整progress日志在收口后删除。`summary.json` 汇总三次实测速率的
+median/minimum/maximum/spread。只有四次运行清理均完成、三次 measured 均为 `PASS`
+且 summary 为 `PASS`，该速率点才通过。
 如果 warm-up 或任一 measured run 的测试结果或清理结果失败，suite 会立即停止，且不会
 创建后续 run 的进程、ring 或结果目录。
 任一 Station 无法启动或提前异常退出时，控制器会立即终止另一 Station，并停止
@@ -306,6 +316,85 @@ python3 -u scripts/task8c_rate_point.py \
 `--pipeline-stage unpack` 只创建 raw/compute ring，并执行
 `dada_dbnull -k 00d4 -s -z -q`；不创建 output ring，不启动 `pipeline_worker` 或 GPU。
 测试要求 EOD 后退出码为 0，并严格核对 sender、receiver 和 unpack 的全部计数。
+
+控制器的阶段边界固定为：
+
+| `--pipeline-stage` | ring | 进程 |
+| --- | --- | --- |
+| `receive` | raw | 双 Station sender → `rdma2dada` → sink |
+| `unpack` | raw、compute | 双 Station sender → `rdma2dada` → `vdif_unpack_worker` → sink |
+| `gpu` | compute、output | `dada_junkdb` 定速整 block producer → `pipeline_worker` → sink；不连接 sender、不启动 RDMA、不设置 `CAP_NET_RAW` |
+| `full` | raw、compute、output | 双 Station sender → `rdma2dada` → `vdif_unpack_worker` → `pipeline_worker` → sink |
+
+GPU 独立正确性入口示例：
+
+```bash
+python3 -u scripts/task8c_rate_point.py \
+  --aggregate-gbps 12.5 \
+  --duration-seconds 10 \
+  --compute-consumer dbnull \
+  --pipeline-stage gpu \
+  --gpu-worker-cpu 21 \
+  --sink-cpu-list 20 \
+  --numa-node 1 \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --qths-binary-dir /home/user/wy/rdma_dada/build-release \
+  --observation-config config/testing/atfp-throughput-observation.json \
+  --config-compiler /home/user/wy/rdma_dada/build-release/observation_config_compile \
+  --experiment-name bootstrap-gpu-v1 \
+  --result-root /home/user/wy/gpu-stage-results \
+  --execute
+```
+
+`aggregate-gbps` 可取任意正目标值，不固定为 30。第一版要求 duration 为整数秒，控制器
+计算 `ceil(target_Bps / compute_block_bytes)` 个 block/s，再得到实际注入 B/s 和总 block
+数；实际速率会略高于或等于目标值，并同时写入 plan/result。GPU-only 用它验证持续
+block 压力和 backpressure，但 `dada_junkdb` 不是网络包级平滑 pacing；最终实时结论仍
+必须由 `full` 阶段按 passing profile、warm-up+3 验收。profile 文件只能由已保留的远程
+PASS 证据生成；仓库尚无 GPU accepted profile 时，只允许显式
+`--experiment-name bootstrap-gpu-v1`，不能伪造示例 profile 后直接正式验收。
+bootstrap 与后续 accepted GPU profile 都必须显式设置 `--gpu-worker-cpu`、
+`--sink-cpu-list` 和 `--numa-node`；profile 会在创建 ring 前恢复并核对这些值。
+
+生产几何 GPU 压力使用约 `A=500,F=4,P=1,B=350` 的 Observation、ATFP block 和 FPAB
+权重。正式约 30 Gbps fixture 可取 `A=469,F=4`，并把 `A=500,F=4` 记录为约 32 Gbps
+压力点。该测试真实执行相应的 Convert/Beamform/产品和 H2D/D2H，但输入来自
+`dada_junkdb`，所以只验收 GPU 计算资源和 compute/output ring 稳态。现有双 Station
+sender 继续用于 receive/unpack aggregate-rate 测试；两类结果不得合并成
+“500-Station full PASS”。
+
+### 紧凑结果 Catalog
+
+远端测试收口后，只把 compact suite 导入本地被 Git 忽略的 `test-results/`：
+
+```bash
+python3 scripts/task8c_catalog.py import \
+  --results-root test-results \
+  --source-dir /absolute/path/to/compact-suite \
+  --source-host qths1 \
+  --remote-suite-root /home/user/wy/task8c-results/<suite-id> \
+  --source-manifest-sha256 <development-source-manifest-sha256>
+
+python3 scripts/task8c_catalog.py verify --results-root test-results
+python3 scripts/task8c_catalog.py query \
+  --results-root test-results --topology gpu --result PASS --latest 3 \
+  --format json
+```
+
+五个子命令为 `import`、`rebuild`、`verify`、`query` 和 `promote`。suite
+目录是不可变权威证据；`catalog.json` 和 `catalog.csv` 都是可重建索引，禁止人工填写。
+`query --format paths` 输出被选 suite 的本地绝对路径。“总结成文”默认只读取查询选中的
+`summary.json`、`preflight.json` 和 `runs/*.json`；只有失败定位或原始行审计才读取
+`*.evidence.log`。
+
+只有用户明确选定的证据才能通过 `promote` 写入
+`docs/results/accepted-results.json`。这里的“accepted evidence”可以是可复现的失败边界，
+不等价于产品 PASS；命令不会执行 Git 提交或推送。
+
+NUMA 分区回归验证 `--ingress-numa-node` 只约束 raw ring 与 `rdma2dada`，
+`--processing-numa-node` 约束 unpack、compute/output ring、GPU worker 和 sink。
+旧的 `--numa-node` 仍表示所有阶段同节点，但禁止与两个新参数混用。
 
 ### 配置检查工具测试
 
