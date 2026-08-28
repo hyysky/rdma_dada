@@ -137,6 +137,8 @@ class RateRequest:
     unpack_start_delay_seconds: int = 0
     station_id: int | None = None
     sender_source_port: int | None = None
+    sender_source_port_101: int | None = None
+    sender_source_port_102: int | None = None
     baseline_profile_path: str | None = None
     baseline_profile_sha256: str | None = None
     experiment_name: str | None = None
@@ -184,17 +186,32 @@ class RateRequest:
                 raise ValueError("station_id must be 101 or 102")
             if not 1 <= self.sender_source_port <= 65535:
                 raise ValueError("sender_source_port must be in 1..65535")
+        fixed_source_ports = (
+            self.sender_source_port_101,
+            self.sender_source_port_102,
+        )
+        if (fixed_source_ports[0] is None) != (fixed_source_ports[1] is None):
+            raise ValueError("Station source ports must be supplied together")
+        if fixed_source_ports[0] is not None:
+            if self.station_id is not None or self.pipeline_stage == "gpu":
+                raise ValueError(
+                    "two-Station source ports require a network multi-Station stage"
+                )
+            if not all(1 <= int(port) <= 65535 for port in fixed_source_ports):
+                raise ValueError("Station source ports must be in 1..65535")
+            if fixed_source_ports[0] == fixed_source_ports[1]:
+                raise ValueError("Station source ports must be distinct")
         if (
             type(self.unpack_start_delay_seconds) is not int
             or self.unpack_start_delay_seconds < 0
         ):
             raise ValueError("unpack_start_delay_seconds must be a nonnegative integer")
         if self.unpack_start_delay_seconds and (
-            self.pipeline_stage not in ("receive", "unpack")
+            self.pipeline_stage not in ("receive", "unpack", "full")
             or self.compute_consumer != "dbnull"
         ):
             raise ValueError(
-                "unpack_start_delay_seconds requires receive or unpack stage "
+                "unpack_start_delay_seconds requires receive, unpack or full stage "
                 "with dbnull"
             )
         if self.worker_cpu_list is not None:
@@ -329,7 +346,11 @@ class RatePlan:
     unpack_start_delay_seconds: int = 0
     preparation_groups: int = 0
     packets_per_second: int = 0
+    missing_wait_ms: float = 200.0
+    station_skew_reserve_ms: float = 200.0
     sender_source_port: int | None = None
+    sender_source_port_101: int | None = None
+    sender_source_port_102: int | None = None
     profile_evidence: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
@@ -959,7 +980,11 @@ def compile_rate_plan(
         unpack_start_delay_seconds=request.unpack_start_delay_seconds,
         preparation_groups=preparation_groups,
         packets_per_second=packets_per_second,
+        missing_wait_ms=request.missing_wait_ms,
+        station_skew_reserve_ms=request.station_skew_reserve_ms,
         sender_source_port=request.sender_source_port,
+        sender_source_port_101=request.sender_source_port_101,
+        sender_source_port_102=request.sender_source_port_102,
     )
     profile_evidence: dict[str, Any]
     if request.baseline_profile_path is not None:
@@ -972,7 +997,14 @@ def compile_rate_plan(
                 "CONFIG_PREFLIGHT", ["load-profile", request.baseline_profile_path],
                 1, "", str(error), "HARNESS_FAIL"
             ) from error
-        if profile.target_host != "qths1" or profile.pipeline_stage != request.pipeline_stage:
+        profile_stage_compatible = (
+            profile.pipeline_stage == request.pipeline_stage
+            or (
+                request.pipeline_stage == "full"
+                and profile.pipeline_stage == "unpack"
+            )
+        )
+        if profile.target_host != "qths1" or not profile_stage_compatible:
             raise StageError(
                 "CONFIG_PREFLIGHT", ["validate-profile", str(profile.path)], 1,
                 "", "baseline profile host or pipeline stage does not match request",
@@ -1054,6 +1086,12 @@ class SenderSpec:
 
 def sender_specs_for_plan(plan: RatePlan, run_identity: str) -> list[SenderSpec]:
     first_port, second_port = derive_sender_source_ports(run_identity)
+    if (
+        plan.sender_source_port_101 is not None
+        and plan.sender_source_port_102 is not None
+    ):
+        first_port = plan.sender_source_port_101
+        second_port = plan.sender_source_port_102
     topology = {
         101: ("qtpulsar1", "174.0.1.100", first_port,
               "sender101.json", "101.json", "sender101.log"),
@@ -3152,10 +3190,25 @@ def _validate_sender(
 def _validate_statistics(
     statistics: dict[str, Any], plan: RatePlan, expected_sample_prefix: str
 ) -> None:
+    source_json = plan.resolved_plan.get("source_json", "")
+    try:
+        source_document = json.loads(source_json)
+    except (TypeError, json.JSONDecodeError):
+        source_document = {}
+    cuda_pipeline = source_document.get("processing", {}).get(
+        "cuda_pipeline", {}
+    )
+    expected_execution_mode = cuda_pipeline.get(
+        "mode", "SYNCHRONOUS_DIRECT"
+    )
+    expected_inflight_blocks = int(cuda_pipeline.get("inflight_blocks", 1))
+
     if plan.pipeline_stage == "gpu":
         junk = derive_gpu_junk_input(plan)
         required = {
             ("gpu", "completed"): True,
+            ("gpu", "metrics", "execution_mode"): expected_execution_mode,
+            ("gpu", "metrics", "inflight_blocks"): expected_inflight_blocks,
             ("gpu", "metrics", "blocks"): junk.block_count,
             ("gpu", "metrics", "input_bytes"): junk.total_bytes,
             ("gpu", "metrics", "output_bytes"): (
@@ -3181,7 +3234,67 @@ def _validate_statistics(
                     "actual": actual,
                 })
         gpu_metrics = statistics.get("gpu", {}).get("metrics", {})
-        for name in ("transfer_elapsed_ns", "input_payload_gbps"):
+        if expected_execution_mode == "STAGED_PIPELINE":
+            staged_required = {
+                "submitted_blocks": junk.block_count,
+                "completed_blocks": junk.block_count,
+                "published_blocks": junk.block_count,
+                "input_staging_bytes": 0,
+                "input_staging_copy_ns_total": 0,
+                "input_staging_copy_ns_max": 0,
+                "input_ring_cuda_registered": True,
+                "registered_ring_blocks": plan.compute_ring_blocks,
+                "registered_ring_bytes": (
+                    plan.compute_ring_blocks * plan.compute_block_bytes
+                ),
+                "output_staging_bytes": (
+                    junk.block_count * plan.output_block_bytes
+                ),
+            }
+            for name, expected in staged_required.items():
+                actual = (
+                    gpu_metrics.get(name)
+                    if isinstance(gpu_metrics, dict) else None
+                )
+                if actual != expected:
+                    mismatches.append({
+                        "field": f"gpu.metrics.{name}",
+                        "expected": expected,
+                        "actual": actual,
+                    })
+            registration_ns = (
+                gpu_metrics.get("input_ring_registration_ns")
+                if isinstance(gpu_metrics, dict) else None
+            )
+            if (
+                not isinstance(registration_ns, int)
+                or registration_ns <= 0
+            ):
+                mismatches.append({
+                    "field": "gpu.metrics.input_ring_registration_ns",
+                    "expected": "> 0",
+                    "actual": registration_ns,
+                })
+            max_inflight = (
+                gpu_metrics.get("max_inflight")
+                if isinstance(gpu_metrics, dict) else None
+            )
+            if (
+                not isinstance(max_inflight, int)
+                or max_inflight < 1
+                or max_inflight > expected_inflight_blocks
+            ):
+                mismatches.append({
+                    "field": "gpu.metrics.max_inflight",
+                    "expected": f"1..{expected_inflight_blocks}",
+                    "actual": max_inflight,
+                })
+        rate_fields = (
+            ("active_elapsed_ns", "active_input_payload_gbps")
+            if expected_execution_mode == "STAGED_PIPELINE"
+            else ("transfer_elapsed_ns", "input_payload_gbps")
+        )
+        for name in rate_fields:
             actual = gpu_metrics.get(name) if isinstance(gpu_metrics, dict) else None
             if not isinstance(actual, (int, float)) or actual <= 0:
                 mismatches.append({
@@ -3242,6 +3355,12 @@ def _validate_statistics(
         )
         if plan.uses_pipeline_worker:
             required[("gpu", "completed")] = True
+            required[("gpu", "metrics", "execution_mode")] = (
+                expected_execution_mode
+            )
+            required[("gpu", "metrics", "inflight_blocks")] = (
+                expected_inflight_blocks
+            )
     elif plan.pipeline_stage != "receive":
         if plan.uses_pipeline_worker:
             groups_per_block = plan.records_per_block // plan.nant
@@ -3288,12 +3407,84 @@ def _validate_statistics(
                 ),
                 "actual": {"accepted": accepted, "published": published},
             })
-    for (section, key), expected in required.items():
-        actual = statistics.get(section, {}).get(key)
+    for path, expected in required.items():
+        actual: Any = statistics
+        for name in path:
+            actual = actual.get(name) if isinstance(actual, dict) else None
         if actual != expected:
             mismatches.append(
-                {"field": f"{section}.{key}", "expected": expected, "actual": actual}
+                {"field": ".".join(path), "expected": expected,
+                 "actual": actual}
             )
+    if plan.uses_pipeline_worker and expected_execution_mode == "STAGED_PIPELINE":
+        groups_per_block = plan.records_per_block // plan.nant
+        expected_blocks = (
+            plan.group_count + groups_per_block - 1
+        ) // groups_per_block
+        if (plan.output_block_bytes * plan.group_count) % groups_per_block:
+            raise StageError(
+                "COLLECTING", ["validate", "pipeline-statistics"], 1, "",
+                "resolved output bytes are not integral for the final "
+                "partial compute block", "HARNESS_FAIL",
+            )
+        expected_output_bytes = (
+            plan.output_block_bytes * plan.group_count // groups_per_block
+        )
+        metrics = statistics.get("gpu", {}).get("metrics", {})
+        staged_required = {
+            "blocks": expected_blocks,
+            "submitted_blocks": expected_blocks,
+            "completed_blocks": expected_blocks,
+            "published_blocks": expected_blocks,
+            "input_staging_bytes": 0,
+            "input_staging_copy_ns_total": 0,
+            "input_staging_copy_ns_max": 0,
+            "input_ring_cuda_registered": True,
+            "registered_ring_blocks": plan.compute_ring_blocks,
+            "registered_ring_bytes": (
+                plan.compute_ring_blocks * plan.compute_block_bytes
+            ),
+            "output_staging_bytes": expected_output_bytes,
+        }
+        for key, expected in staged_required.items():
+            actual = metrics.get(key) if isinstance(metrics, dict) else None
+            if actual != expected:
+                mismatches.append({
+                    "field": f"gpu.metrics.{key}",
+                    "expected": expected,
+                    "actual": actual,
+                })
+        registration_ns = (
+            metrics.get("input_ring_registration_ns")
+            if isinstance(metrics, dict) else None
+        )
+        if not isinstance(registration_ns, int) or registration_ns <= 0:
+            mismatches.append({
+                "field": "gpu.metrics.input_ring_registration_ns",
+                "expected": "> 0",
+                "actual": registration_ns,
+            })
+        max_inflight = (
+            metrics.get("max_inflight") if isinstance(metrics, dict) else None
+        )
+        if (
+            not isinstance(max_inflight, int)
+            or max_inflight < 1
+            or max_inflight > expected_inflight_blocks
+        ):
+            mismatches.append({
+                "field": "gpu.metrics.max_inflight",
+                "expected": f"1..{expected_inflight_blocks}",
+                "actual": max_inflight,
+            })
+        for key in ("active_elapsed_ns", "active_input_payload_gbps"):
+            actual = metrics.get(key) if isinstance(metrics, dict) else None
+            if not isinstance(actual, (int, float)) or actual <= 0:
+                mismatches.append({
+                    "field": f"gpu.metrics.{key}",
+                    "expected": "> 0",
+                    "actual": actual,
+                })
     if mismatches:
         performance_fields = {
             "receiver.accepted",
@@ -4097,8 +4288,12 @@ def _compact_evidence(run_dir: pathlib.Path, result: dict[str, Any]) -> str:
             source_lines = path.read_text(errors="replace").splitlines()
         except OSError:
             continue
+        keep_complete_failure_log = (
+            result.get("TEST_RESULT") != "PASS"
+            and path.name == "pipeline-worker.log"
+        )
         for line in source_lines:
-            if _EVIDENCE_LINE.search(line):
+            if line and (keep_complete_failure_log or _EVIDENCE_LINE.search(line)):
                 lines.append(f"[{relative}] {line}")
     for relative_name in (
         "qths/pipeline-worker-metrics.json",
@@ -4391,19 +4586,22 @@ def run_rate_request_sequence(
 
 def _actual_result_payload_gbps(result: dict[str, Any]) -> float:
     """Return the measured/configured pressure rate for the selected input."""
+    plan = result.get("plan", {})
+    pipeline_stage = (
+        plan.get("pipeline_stage") if isinstance(plan, dict) else None
+    )
+    senders = result.get("senders", [])
+    if pipeline_stage != "gpu" and senders:
+        return sum(float(sender["actual_payload_gbps"]) for sender in senders)
     metrics = result.get("statistics", {}).get("gpu", {}).get("metrics", {})
     if isinstance(metrics, dict) and float(
-        metrics.get("input_payload_gbps", 0.0)
+        metrics.get("active_input_payload_gbps", 0.0)
     ) > 0.0:
-        return float(metrics["input_payload_gbps"])
-    plan = result.get("plan", {})
+        return float(metrics["active_input_payload_gbps"])
     gpu_input = plan.get("gpu_input", {}) if isinstance(plan, dict) else {}
     if isinstance(gpu_input, dict) and "actual_payload_gbps" in gpu_input:
         return float(gpu_input["actual_payload_gbps"])
-    return sum(
-        float(sender["actual_payload_gbps"])
-        for sender in result.get("senders", [])
-    )
+    return sum(float(sender["actual_payload_gbps"]) for sender in senders)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -4480,6 +4678,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="source UDP port for an explicitly selected Station",
     )
     parser.add_argument(
+        "--sender-source-port-101",
+        type=int,
+        help="fixed UDP source port for Station 101 in multi-Station runs",
+    )
+    parser.add_argument(
+        "--sender-source-port-102",
+        type=int,
+        help="fixed UDP source port for Station 102 in multi-Station runs",
+    )
+    parser.add_argument(
         "--unpack-missing-per-second",
         action="store_true",
         help="enable opt-in VDIF missing-packet counts by expected second",
@@ -4490,7 +4698,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "start sender this many whole VDIF/actual seconds before the "
-            "formal acceptance timeline (receive/unpack with dbnull)"
+            "formal acceptance timeline (receive/unpack/full with dbnull)"
         ),
     )
     parser.add_argument("--result-root", type=pathlib.Path, default=pathlib.Path("/tmp/task8c-results"))
@@ -4569,6 +4777,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             ("receiver_poll_batch", args.receiver_poll_batch),
             ("receiver_wr_num", args.receiver_wr_num),
             ("unpack_start_delay_seconds", args.unpack_start_delay_seconds),
+            ("sender_source_port_101", args.sender_source_port_101),
+            ("sender_source_port_102", args.sender_source_port_102),
         )
         if value is not None
     }
@@ -4600,6 +4810,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         ),
         station_id=args.station_id,
         sender_source_port=args.sender_source_port,
+        sender_source_port_101=args.sender_source_port_101,
+        sender_source_port_102=args.sender_source_port_102,
         experiment_name=args.experiment_name,
     )
     if args.baseline_profile is not None:
@@ -4608,7 +4820,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         except ValueError as error:
             print(str(error), file=sys.stderr)
             return 2
-        if profile.target_host != "qths1" or profile.pipeline_stage != request.pipeline_stage:
+        profile_stage_compatible = (
+            profile.pipeline_stage == request.pipeline_stage
+            or (
+                request.pipeline_stage == "full"
+                and profile.pipeline_stage == "unpack"
+            )
+        )
+        if profile.target_host != "qths1" or not profile_stage_compatible:
             print(
                 "baseline profile host or pipeline stage does not match request",
                 file=sys.stderr,

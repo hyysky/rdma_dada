@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "observation": {
+    "observation_id": "atfp-throughput-campaign",
+    "utc_start": "2026-08-10-00:00:00",
+    "duration_seconds": "30.000128",
+    "station_ids": [101, 102],
+    "first_channel_id": 100,
+    "nchan": 2,
+    "npol": 1,
+    "sample_interval_ps": 1000000
+  },
+  "metadata": {
+    "telescope": "CA",
+    "bandwidth_hz": 300000000,
+    "center_frequency_hz": 1250000000
+  },
+  "wire": {
+    "profile": "../packet_formats/frontend.example-v1.json",
+    "samples_per_packet": 1024
+  },
+  "blocks": {
+    "groups_per_block": 6400,
+    "raw_ring_blocks": 16,
+    "compute_ring_blocks": 8,
+    "window_blocks": 4
+  },
+  "rings": {
+    "raw_key": "0x00d2",
+    "compute_key": "0x00d4",
+    "output_key": "0x00d6"
+  },
+  "storage": {
+    "enabled": false,
+    "blocks_per_file": 0,
+    "direct_io": false
+  },
+  "receiver": {
+    "device": "mlx5_0",
+    "destination_mac": "98:03:9b:aa:99:d8",
+    "destination_ip": "174.0.1.111",
+    "destination_port": 1000
+  },
+  "processing": {
+    "backend": "CUDA",
+    "cuda_device": 0,
+    "run_once": true,
+    "cuda_pipeline": {
+      "mode": "STAGED_PIPELINE",
+      "inflight_blocks": 3
+    },
+    "conversion": {
+      "scale": "0.0078125"
+    },
+    "output": {
+      "sample_format": "AUTO"
+    },
+    "modules": [
+      {
+        "type": "beamform",
+        "weights_file": "../../tests/data/beamform_cuda_weights_f2_p1_a2_b2_i8.npy",
+        "weights_order": "FPAB2",
+        "weights_id": "atfp-throughput-f2-p1-a2-b2-i8-v1",
+        "weights_scale": "0.5",
+        "compute_mode": "FP32"
+      },
+      {
+        "type": "power"
+      },
+      {
+        "type": "integrate",
+        "length": 128,
+        "operation": "MEAN"
+      }
+    ]
+  }
+}

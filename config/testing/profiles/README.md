@@ -13,13 +13,20 @@ NUMA placement. A legacy profile may use one `numa_node`; split placement uses
 `ingress_numa_node` for the raw ring/receiver and `processing_numa_node` for
 unpack, compute/output rings, GPU worker and sink. Receive/unpack profiles must
 record receiver, coordinator, parser, writer and sink placement plus queue
-geometry. Scheduler-default placement is not an accepted baseline.
+geometry, the preparation interval and both Station source ports.
+Scheduler-default placement or suite-derived source ports are not an accepted
+baseline.
+
+The accepted qths1 ingress/unpack baseline is
+`qths1-unpack-30gbps-60s-v1.json`. A `full` run may inherit this `unpack`
+profile to keep the receiver/raw/unpack seam unchanged while adding GPU and
+output-ring roles. Changes to inherited fields remain named experiments.
 
 When no accepted profile exists, the only allowed formal bootstrap name is
 `bootstrap-<pipeline-stage>-v1`. A bootstrap run is a candidate only. It becomes
 an accepted profile after the remote result, process ledger, cleanup state, raw
 evidence SHA256, and suite manifest all validate.
 
-No qths1 profile is checked in yet because HF is currently unavailable. The
-first recovery action is read-only extraction from the retained passing result,
-followed by local profile creation and review.
+The accepted profile was extracted from the retained warm-up plus three
+measured PASS suite named in its `source_result`; it was not reconstructed from
+a chat summary.

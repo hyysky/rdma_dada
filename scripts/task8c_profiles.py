@@ -35,6 +35,8 @@ _RUNTIME_FIELDS = {
     "unpack_start_delay_seconds",
     "missing_wait_ms",
     "station_skew_reserve_ms",
+    "sender_source_port_101",
+    "sender_source_port_102",
 }
 _GEOMETRY_FIELDS = {
     "target_payload_gbps",
@@ -83,6 +85,7 @@ _REQUIRED_RUNTIME = {
     },
     "unpack": {
         "receiver_poll_cpu", "worker_cpu_list", "sink_cpu_list",
+        "sender_source_port_101", "sender_source_port_102",
         "receiver_poll_batch", "receiver_wr_num",
         "unpack_start_delay_seconds", "missing_wait_ms",
         "station_skew_reserve_ms",
@@ -91,7 +94,9 @@ _REQUIRED_RUNTIME = {
     "full": {
         "receiver_poll_cpu", "worker_cpu_list", "gpu_worker_cpu",
         "sink_cpu_list", "receiver_poll_batch",
-        "receiver_wr_num", "missing_wait_ms", "station_skew_reserve_ms",
+        "receiver_wr_num", "unpack_start_delay_seconds",
+        "sender_source_port_101", "sender_source_port_102",
+        "missing_wait_ms", "station_skew_reserve_ms",
     },
 }
 
@@ -134,6 +139,11 @@ def _validate_runtime(stage: str, runtime: object) -> dict[str, object]:
     unknown = set(runtime) - _RUNTIME_FIELDS
     if unknown:
         raise ValueError(f"profile runtime has unknown fields: {sorted(unknown)}")
+    if (
+        ("sender_source_port_101" in runtime)
+        != ("sender_source_port_102" in runtime)
+    ):
+        raise ValueError("profile source ports must be supplied together")
     missing = _REQUIRED_RUNTIME[stage] - set(runtime)
     if missing:
         raise ValueError(f"profile runtime is missing fields: {sorted(missing)}")
@@ -166,9 +176,22 @@ def _validate_runtime(stage: str, runtime: object) -> dict[str, object]:
         "receiver_poll_batch",
         "receiver_wr_num",
         "unpack_start_delay_seconds",
+        "sender_source_port_101",
+        "sender_source_port_102",
     ):
         if name in runtime and (not _is_int(runtime[name]) or int(runtime[name]) < 0):
             raise ValueError(f"profile runtime field {name} must be a nonnegative integer")
+    source_ports = (
+        runtime.get("sender_source_port_101"),
+        runtime.get("sender_source_port_102"),
+    )
+    if (source_ports[0] is None) != (source_ports[1] is None):
+        raise ValueError("profile source ports must be supplied together")
+    if source_ports[0] is not None:
+        if not all(1 <= int(port) <= 65535 for port in source_ports):
+            raise ValueError("profile source ports must be in 1..65535")
+        if source_ports[0] == source_ports[1]:
+            raise ValueError("profile source ports must be distinct")
     for name in ("receiver_poll_batch", "receiver_wr_num"):
         if name in runtime and int(runtime[name]) == 0:
             raise ValueError(f"profile runtime field {name} must be positive")

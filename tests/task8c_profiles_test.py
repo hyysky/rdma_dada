@@ -28,6 +28,8 @@ def valid_profile():
             "receiver_poll_cpu": 13,
             "worker_cpu_list": "14,15,16,17,18,19",
             "sink_cpu_list": "20",
+            "sender_source_port_101": 45871,
+            "sender_source_port_102": 55871,
             "numa_node": 1,
             "receiver_poll_batch": 32,
             "receiver_wr_num": 1024,
@@ -96,6 +98,8 @@ class FakeRequest:
     worker_cpu_list: str | None = None
     gpu_worker_cpu: int | None = None
     sink_cpu_list: str | None = None
+    sender_source_port_101: int | None = None
+    sender_source_port_102: int | None = None
     numa_node: int | None = None
     ingress_numa_node: int | None = None
     processing_numa_node: int | None = None
@@ -120,6 +124,8 @@ class FakePlan:
     worker_cpu_list: str = "14,15,16,17,18,19"
     gpu_worker_cpu: int | None = None
     sink_cpu_list: str = "20"
+    sender_source_port_101: int = 45871
+    sender_source_port_102: int = 55871
     numa_node: int = 1
     ingress_numa_node: int | None = None
     processing_numa_node: int | None = None
@@ -146,6 +152,19 @@ class Task8cProfilesTest(unittest.TestCase):
         self.assertEqual(profile.pipeline_stage, "unpack")
         self.assertEqual(profile.sha256, expected_sha)
         self.assertEqual(profile.runtime["receiver_poll_cpu"], 13)
+
+    def test_checked_in_unpack_profile_locks_authoritative_pass(self):
+        profile = profiles.load_profile(
+            ROOT / "config" / "testing" / "profiles"
+            / "qths1-unpack-30gbps-60s-v1.json"
+        )
+
+        self.assertEqual(profile.pipeline_stage, "unpack")
+        self.assertEqual(profile.runtime["unpack_start_delay_seconds"], 1)
+        self.assertEqual(profile.runtime["sender_source_port_101"], 45871)
+        self.assertEqual(profile.runtime["sender_source_port_102"], 55871)
+        self.assertEqual(profile.geometry["target_payload_gbps"], 30.0)
+        self.assertEqual(profile.geometry["duration_seconds"], 60.0)
 
     def test_load_profile_rejects_unknown_top_level_field(self):
         value = valid_profile()
@@ -198,6 +217,8 @@ class Task8cProfilesTest(unittest.TestCase):
         self.assertEqual(resolved.receiver_poll_cpu, 12)
         self.assertEqual(resolved.worker_cpu_list, "14,15,16,17,18,19")
         self.assertEqual(resolved.sink_cpu_list, "20")
+        self.assertEqual(resolved.sender_source_port_101, 45871)
+        self.assertEqual(resolved.sender_source_port_102, 55871)
         self.assertEqual(resolved.numa_node, 1)
         self.assertEqual(resolved.unpack_start_delay_seconds, 1)
 
@@ -231,6 +252,21 @@ class Task8cProfilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = profiles.load_profile(self.write_profile(directory))
         self.assertEqual(profiles.compare_profile(FakePlan(), profile), [])
+
+    def test_profile_rejects_only_one_station_source_port(self):
+        value = valid_profile()
+        del value["runtime"]["sender_source_port_102"]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "source ports must be supplied together"):
+                profiles.load_profile(self.write_profile(directory, value))
+
+    def test_unpack_profile_requires_fixed_station_source_ports(self):
+        value = valid_profile()
+        del value["runtime"]["sender_source_port_101"]
+        del value["runtime"]["sender_source_port_102"]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "missing fields"):
+                profiles.load_profile(self.write_profile(directory, value))
 
 
 if __name__ == "__main__":

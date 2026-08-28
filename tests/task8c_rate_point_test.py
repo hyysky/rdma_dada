@@ -32,6 +32,8 @@ def make_plan(
     raw_ring_blocks=8,
     compute_ring_blocks=8,
     pipeline_stage="full",
+    cuda_pipeline_mode=None,
+    cuda_inflight_blocks=1,
 ):
     per_station = aggregate_gbps / 2.0
     group_count = math.ceil(
@@ -69,6 +71,11 @@ def make_plan(
             "output": {"sample_format": "AUTO"},
         },
     }
+    if cuda_pipeline_mode is not None:
+        source["processing"]["cuda_pipeline"] = {
+            "mode": cuda_pipeline_mode,
+            "inflight_blocks": cuda_inflight_blocks,
+        }
     resolved = {
         "schema_version": 1,
         "config_id": "a" * 64,
@@ -283,7 +290,13 @@ class FakeBackend:
                     "CONFIG_ID": plan.config_id,
                     "GEOMETRY_ID": plan.geometry_id,
                 },
-                "gpu": {"completed": True},
+                "gpu": {
+                    "completed": True,
+                    "metrics": {
+                        "execution_mode": "SYNCHRONOUS_DIRECT",
+                        "inflight_blocks": 1,
+                    },
+                },
             })
         else:
             statistics["compute"] = {
@@ -331,6 +344,8 @@ class GpuOnlyFakeBackend(FakeBackend):
                 "gpu": {
                     "completed": True,
                     "metrics": {
+                        "execution_mode": "SYNCHRONOUS_DIRECT",
+                        "inflight_blocks": 1,
                         "blocks": junk.block_count,
                         "input_bytes": junk.total_bytes,
                         "output_bytes": (
@@ -742,7 +757,7 @@ class Task8cRatePointTest(unittest.TestCase):
             15141,
         )
 
-    def test_start_delay_accepts_receive_or_unpack_dbnull(self):
+    def test_start_delay_accepts_receive_unpack_or_full_dbnull(self):
         MODULE.RateRequest(
             15.0,
             30.0,
@@ -759,12 +774,19 @@ class Task8cRatePointTest(unittest.TestCase):
             sender_source_port=41001,
             unpack_start_delay_seconds=1,
         ).validate()
+        MODULE.RateRequest(
+            15.0,
+            30.0,
+            compute_consumer="dbnull",
+            pipeline_stage="full",
+            unpack_start_delay_seconds=1,
+        ).validate()
         with self.assertRaisesRegex(ValueError, "unpack_start_delay_seconds"):
             MODULE.RateRequest(
                 15.0,
                 30.0,
                 compute_consumer="dbnull",
-                pipeline_stage="full",
+                pipeline_stage="gpu",
                 unpack_start_delay_seconds=1,
             ).validate()
 
@@ -831,7 +853,7 @@ class Task8cRatePointTest(unittest.TestCase):
                         "from_artifact_directory",
                         side_effect=[bootstrap, final],
                     ):
-                MODULE.compile_rate_plan(
+                compiled = MODULE.compile_rate_plan(
                     MODULE.RateRequest(
                         15.0,
                         30.0,
@@ -848,6 +870,8 @@ class Task8cRatePointTest(unittest.TestCase):
 
             rendered = json.loads((root / "run" / "observation.json").read_text())
             self.assertEqual(rendered["blocks"]["window_blocks"], 17)
+            self.assertEqual(compiled.missing_wait_ms, 200.0)
+            self.assertEqual(compiled.station_skew_reserve_ms, 200.0)
 
     def test_compile_unpack_plan_removes_gpu_processing_before_compiler(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -941,6 +965,8 @@ class Task8cRatePointTest(unittest.TestCase):
                     "receiver_poll_cpu": 13,
                     "worker_cpu_list": "14,15,16,17,18,19",
                     "sink_cpu_list": "20",
+                    "sender_source_port_101": 45871,
+                    "sender_source_port_102": 55871,
                     "numa_node": 1,
                     "receiver_poll_batch": 32,
                     "receiver_wr_num": 1024,
@@ -978,6 +1004,57 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(request["worker_cpu_list"], "14,15,16,17,18,19")
         self.assertEqual(request["sink_cpu_list"], "20")
         self.assertEqual(request["baseline_profile_sha256"], expected_profile_sha)
+
+    def test_full_stage_can_inherit_accepted_unpack_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = pathlib.Path(directory) / "unpack-profile.json"
+            profile_path.write_text(json.dumps({
+                "schema_version": 1,
+                "profile_id": "qths1-unpack-30gbps-v1",
+                "target_host": "qths1",
+                "pipeline_stage": "unpack",
+                "source_result": "/results/unpack-pass",
+                "runtime": {
+                    "receiver_poll_cpu": 13,
+                    "worker_cpu_list": "14,15,16,17,18,19",
+                    "sink_cpu_list": "20",
+                    "sender_source_port_101": 45871,
+                    "sender_source_port_102": 55871,
+                    "numa_node": 1,
+                    "receiver_poll_batch": 32,
+                    "receiver_wr_num": 1024,
+                    "unpack_start_delay_seconds": 1,
+                    "missing_wait_ms": 200.0,
+                    "station_skew_reserve_ms": 200.0,
+                },
+                "geometry": {
+                    "target_payload_gbps": 30.0,
+                    "duration_seconds": 60.0,
+                    "raw_block_bytes": 52838400,
+                    "raw_ring_blocks": 16,
+                    "compute_block_bytes": 52428800,
+                    "compute_ring_blocks": 8,
+                    "window_blocks": 31,
+                    "reorder_horizon_groups": 96000,
+                },
+            }) + "\n")
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                return_code = MODULE.main([
+                    "--aggregate-gbps", "30",
+                    "--duration-seconds", "60",
+                    "--compute-consumer", "dbnull",
+                    "--pipeline-stage", "full",
+                    "--gpu-worker-cpu", "21",
+                    "--baseline-profile", str(profile_path),
+                    "--dry-run",
+                ])
+
+        self.assertEqual(return_code, 0)
+        request = json.loads(stdout.getvalue())
+        self.assertEqual(request["unpack_start_delay_seconds"], 1)
+        self.assertEqual(request["sender_source_port_101"], 45871)
+        self.assertEqual(request["sender_source_port_102"], 55871)
+        self.assertEqual(request["worker_cpu_list"], "14,15,16,17,18,19")
 
     def test_formal_entry_rejects_missing_baseline_without_bootstrap_name(self):
         with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
@@ -1586,6 +1663,8 @@ class Task8cRatePointTest(unittest.TestCase):
             "gpu": {
                 "completed": True,
                 "metrics": {
+                    "execution_mode": "SYNCHRONOUS_DIRECT",
+                    "inflight_blocks": 1,
                     "blocks": junk.block_count,
                     "input_bytes": junk.total_bytes,
                     "output_bytes": junk.block_count * plan.output_block_bytes,
@@ -1605,6 +1684,82 @@ class Task8cRatePointTest(unittest.TestCase):
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "")
         self.assertIn("gpu-statistics", raised.exception.argv)
+
+    def test_staged_gpu_statistics_require_closed_ordered_lifecycle(self):
+        plan = make_plan(
+            2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu",
+            cuda_pipeline_mode="STAGED_PIPELINE", cuda_inflight_blocks=3,
+        )
+        junk = MODULE.derive_gpu_junk_input(plan)
+        output_bytes = junk.block_count * plan.output_block_bytes
+        statistics = {
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "execution_mode": "STAGED_PIPELINE",
+                    "inflight_blocks": 3,
+                    "blocks": junk.block_count,
+                    "submitted_blocks": junk.block_count,
+                    "completed_blocks": junk.block_count,
+                    "published_blocks": junk.block_count,
+                    "max_inflight": 3,
+                    "input_bytes": junk.total_bytes,
+                    "output_bytes": output_bytes,
+                    "input_staging_bytes": 0,
+                    "input_staging_copy_ns_total": 0,
+                    "input_staging_copy_ns_max": 0,
+                    "input_ring_cuda_registered": True,
+                    "registered_ring_blocks": plan.compute_ring_blocks,
+                    "registered_ring_bytes": (
+                        plan.compute_ring_blocks * plan.compute_block_bytes
+                    ),
+                    "input_ring_registration_ns": 75_000_000,
+                    "output_staging_bytes": output_bytes,
+                    "active_elapsed_ns": 2_000_000_000,
+                    "active_input_payload_gbps": (
+                        junk.total_bytes * 8 / 2_000_000_000
+                    ),
+                    "transfer_elapsed_ns": 2_000_000_000,
+                    "input_payload_gbps": (
+                        junk.total_bytes * 8 / 2_000_000_000
+                    ),
+                },
+            },
+            "output": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+        MODULE._validate_statistics(statistics, plan, "")
+        statistics["gpu"]["metrics"]["published_blocks"] -= 1
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("published_blocks", raised.exception.stderr)
+        statistics["gpu"]["metrics"]["published_blocks"] += 1
+        del statistics["gpu"]["metrics"]["active_elapsed_ns"]
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("active_elapsed_ns", raised.exception.stderr)
+
+    def test_full_result_rate_uses_sender_wire_rate_not_gpu_elapsed(self):
+        result = {
+            "plan": {"pipeline_stage": "full"},
+            "statistics": {
+                "gpu": {"metrics": {
+                    "active_input_payload_gbps": 29.5,
+                    "input_payload_gbps": 4.9,
+                }}
+            },
+            "senders": [
+                {"actual_payload_gbps": 14.9999999},
+                {"actual_payload_gbps": 14.9999998},
+            ],
+        }
+        self.assertAlmostEqual(
+            MODULE._actual_result_payload_gbps(result), 29.9999997
+        )
 
     def test_process_supervisor_persists_lifecycle_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2115,6 +2270,20 @@ class Task8cRatePointTest(unittest.TestCase):
 
         self.assertEqual(ports, [ports[0], ports[0], ports[0]])
 
+    def test_sender_specs_use_explicit_two_station_source_ports(self):
+        plan = dataclasses.replace(
+            make_plan(30.0, 60.0, pipeline_stage="full"),
+            sender_source_port_101=45871,
+            sender_source_port_102=55871,
+        )
+
+        specs = MODULE.sender_specs_for_plan(plan, "another-suite")
+
+        self.assertEqual(
+            [(spec.station_id, spec.source_port) for spec in specs],
+            [(101, 45871), (102, 55871)],
+        )
+
     def test_qths_bundle_uses_exact_pid_files_and_no_wildcard_kill(self):
         plan = make_plan(1.0, 10.0)
         bundle = MODULE.build_qths_bundle(
@@ -2343,11 +2512,94 @@ class Task8cRatePointTest(unittest.TestCase):
             "pipeline transfer completed\n",
         )
         self.assertTrue(statistics["gpu"]["completed"])
+        statistics["gpu"]["metrics"] = {
+            "execution_mode": "SYNCHRONOUS_DIRECT",
+            "inflight_blocks": 1,
+        }
         MODULE._validate_statistics(statistics, plan, "65667071")
         statistics["output"]["exit_code"] = 1
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "65667071")
         self.assertEqual(raised.exception.classification, "PRODUCT_FAIL")
+
+    def test_staged_full_statistics_use_partial_tail_block_bytes(self):
+        plan = make_plan(
+            1.0, 10.0, compute_consumer="dbnull", pipeline_stage="full",
+            cuda_pipeline_mode="STAGED_PIPELINE", cuda_inflight_blocks=3,
+        )
+        records = plan.group_count * plan.nant
+        groups_per_block = plan.records_per_block // plan.nant
+        blocks = (plan.group_count + groups_per_block - 1) // groups_per_block
+        input_bytes = plan.group_count * plan.payload_bytes * plan.nant
+        self.assertEqual(
+            (plan.output_block_bytes * plan.group_count) % groups_per_block,
+            0,
+        )
+        output_bytes = (
+            plan.output_block_bytes * plan.group_count // groups_per_block
+        )
+        statistics = {
+            "receiver": {
+                "accepted": records,
+                "published": records,
+                "wrong_length": 0,
+                "cq_errors": 0,
+            },
+            "unpack": {
+                "records": records,
+                "accepted": records,
+                "bad_header": 0,
+                "invalid_data": 0,
+                "unknown_station": 0,
+                "duplicate": 0,
+                "late": 0,
+                "out_of_range": 0,
+                "complete_groups": plan.group_count,
+                "incomplete_groups": 0,
+                "fully_missing_groups": 0,
+                "missing_station": 0,
+            },
+            "output": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "execution_mode": "STAGED_PIPELINE",
+                    "inflight_blocks": 3,
+                    "blocks": blocks,
+                    "submitted_blocks": blocks,
+                    "completed_blocks": blocks,
+                    "published_blocks": blocks,
+                    "max_inflight": 3,
+                    "input_bytes": input_bytes,
+                    "output_bytes": output_bytes,
+                    "input_staging_bytes": 0,
+                    "input_staging_copy_ns_total": 0,
+                    "input_staging_copy_ns_max": 0,
+                    "input_ring_cuda_registered": True,
+                    "registered_ring_blocks": plan.compute_ring_blocks,
+                    "registered_ring_bytes": (
+                        plan.compute_ring_blocks * plan.compute_block_bytes
+                    ),
+                    "input_ring_registration_ns": 75_000_000,
+                    "output_staging_bytes": output_bytes,
+                    "active_elapsed_ns": 10_000_000_000,
+                    "active_input_payload_gbps": (
+                        input_bytes * 8 / 10_000_000_000
+                    ),
+                },
+            },
+        }
+        MODULE._validate_statistics(statistics, plan, "65667071")
+
+        statistics["gpu"]["metrics"]["input_staging_bytes"] = input_bytes
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "65667071")
+        self.assertIn("input_staging_bytes", raised.exception.stderr)
 
     def test_dbnull_count_deficit_is_a_performance_failure(self):
         plan = make_plan(5.0, 30.0, compute_consumer="dbnull")
@@ -2379,7 +2631,13 @@ class Task8cRatePointTest(unittest.TestCase):
                 "zero_copy": True,
                 "single_transfer": True,
             },
-            "gpu": {"completed": True},
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "execution_mode": "SYNCHRONOUS_DIRECT",
+                    "inflight_blocks": 1,
+                },
+            },
         }
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "65667071")
@@ -3576,9 +3834,13 @@ class Task8cRatePointTest(unittest.TestCase):
                 "progress that should be dropped\n"
                 "Receive summary: accepted=10, wrong_length=0, published=10\n"
             )
+            (run_dir / "qths" / "pipeline-worker.log").write_text(
+                "cannot configure staged GPU pipeline: pinned allocation failed\n"
+                "ERR: Error calling open function\n"
+            )
             (run_dir / "bundle" / "temporary.sh").write_text("temporary\n")
             result = {
-                "TEST_RESULT": "PASS",
+                "TEST_RESULT": "HARNESS_FAIL",
                 "run_id": "measured-01",
                 "statistics": {"receiver": {"accepted": 10}},
                 "cleanup": {"CLEANUP_RESULT": "PASS"},
@@ -3597,6 +3859,10 @@ class Task8cRatePointTest(unittest.TestCase):
             self.assertEqual(saved["stages"][0]["state"], "PREPARE")
             self.assertEqual(saved["processes"][1]["role"], "sender")
             self.assertIn("Receive summary: accepted=10", evidence.read_text())
+            self.assertIn(
+                "cannot configure staged GPU pipeline: pinned allocation failed",
+                evidence.read_text(),
+            )
             self.assertNotIn("progress that should be dropped", evidence.read_text())
             self.assertEqual(
                 compact["evidence_sha256"],

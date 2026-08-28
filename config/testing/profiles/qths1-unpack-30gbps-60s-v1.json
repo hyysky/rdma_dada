@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "profile_id": "qths1-unpack-30gbps-60s-v1",
+  "target_host": "qths1",
+  "pipeline_stage": "unpack",
+  "source_result": "/home/user/wy/task8c-unpack-results/unpack-30Gbps-60s-20260826-r3",
+  "runtime": {
+    "receiver_poll_cpu": 13,
+    "worker_cpu_list": "14,15,16,17,18,19",
+    "sink_cpu_list": "20",
+    "sender_source_port_101": 45871,
+    "sender_source_port_102": 55871,
+    "numa_node": 1,
+    "receiver_poll_batch": 32,
+    "receiver_wr_num": 1024,
+    "unpack_start_delay_seconds": 1,
+    "missing_wait_ms": 200.0,
+    "station_skew_reserve_ms": 200.0
+  },
+  "geometry": {
+    "target_payload_gbps": 30.0,
+    "duration_seconds": 60.0,
+    "raw_block_bytes": 52838400,
+    "raw_ring_blocks": 16,
+    "compute_block_bytes": 52428800,
+    "compute_ring_blocks": 8,
+    "window_blocks": 31,
+    "reorder_horizon_groups": 96000
+  }
+}
