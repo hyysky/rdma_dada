@@ -95,6 +95,10 @@ Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
     "backend": "CUDA",
     "cuda_device": 0,
     "run_once": true,
+    "cuda_pipeline": {
+      "mode": "STAGED_PIPELINE",
+      "inflight_blocks": 3
+    },
     "conversion": {"scale": "0.0078125"},
     "modules": [
       {"type": "beamform", "weights_file": "weights/beamform.npy",
@@ -107,6 +111,20 @@ Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
   }
 }
 ```
+
+`processing.cuda_pipeline.mode` 可选：
+
+- `SYNCHRONOUS_DIRECT`：单 stream 基线，`inflight_blocks` 必须为 1；输入
+  ring 直接 H2D，D2H 直接写 output ring。
+- `STAGED_PIPELINE`：1–4 个有界 slot，每个 slot 独占 non-blocking CUDA
+  stream、pinned output staging 和 device 中间 buffer；worker 在 transfer 生命周期
+  用 `dada_cuda_dbregister` 注册 compute ring，H2D 直接读取 ring block；reader 按 block
+  序号提交，单 writer 严格按序写 output ring，因此 CUDA 完成乱序不会造成
+  ring block 乱序。
+
+省略 `cuda_pipeline` 时保持兼容基线 `SYNCHRONOUS_DIRECT/1`。staged 模式的
+slot wait、writer wait、完成乱序、ring 注册、显存和 pinned output 预算均写入 worker
+metrics JSON；兼容字段 `input_staging_bytes` 在直注册路径必须为 0。
 
 `conversion.scale` 必须显式配置为正有限十进制字符串，不由 CI8 自动推导。
 第一版 `output.sample_format` 只允许 `AUTO`：Beamform-only 自动为 `CF32`，Power、
@@ -178,10 +196,13 @@ transfer。`SIGINT`/`SIGTERM` 会请求在当前 PSRDADA 操作返回后停止�
 - 独立的 ATFP integer input、converted TFPA、module scratch 和 final output device
   buffer 不允许 alias。`HostToDeviceModule`、转换/算法 kernel 和
   `DeviceToHostModule` 都提交到同一 stream；两个传输模块不申请 buffer，也不自行同步。
-- 提交 output ring block、释放 input block 前执行 `cudaStreamSynchronize()`，保证生命周期
-  正确。
-- 尚未实现双 buffer/event，因此当前版本没有跨 block overlap；后续优化不改变模块接口和
-  header/block 契约。
+- `SYNCHRONOUS_DIRECT/1` 在提交 output ring block、释放 input block 前执行
+  `cudaStreamSynchronize()`，保留为未优化对照路径。
+- `STAGED_PIPELINE/N` 在 transfer 开始时注册整个 compute ring；每个 slot 使用独立
+  non-blocking stream、device buffers、pinned output 和完成事件。H2D 直接读取当前
+  compute-ring block，输入 lease 保留到该 slot 的 H2D 完成；单一 writer 等待下一
+  sequence 的完成事件，再复制并提交 output ring block，因此跨 block overlap 不改变
+  header、block 或有序发布契约。
 
 ## GPU block deadline 与容量预检
 
@@ -190,7 +211,7 @@ Observation 自身推导的 payload 速率；吞吐测试必须显式传入目�
 
 ```bash
 ./build-linux/observation_config_compile \
-  config/testing/atfp-throughput-observation.json run/full-30g \
+  config/testing/atfp-throughput-observation-staged.json run/full-30g \
   --budget-payload-gbps 30
 ```
 
@@ -206,16 +227,16 @@ block 到达间隔 13,981,013 ns。保留 20% 余量后，单 stream 整链 dead
 419,430,400 B、output 6,553,600 B，合计 1,271,398,400 B。ring 容量只提供突发
 缓冲时间，不计入显存，也不能弥补下游稳态服务率不足。
 
-服务器 full-chain 功能诊断已在 1 Gbps 精确闭合。单次 30 Gbps 诊断中 GPU 处理 2,130
+服务器 full-chain 功能诊断已在 1 Gbps 精确闭合。早期单次 30 Gbps 诊断中 GPU 处理 2,130
 个 block，平均 service time 为 16.243 ms，超过 13.981 ms 的 block 到达间隔和
 11.185 ms 的安全 deadline；平均 H2D/算法/D2H 分别约 12.077/3.873/0.260 ms，output
-wait 平均约 0.0013 ms。Power+积分已消除原有 D2H/output 扩张，但当前单 stream、逐 block
-同步路径仍不能持续 30 Gbps；该结果不是正式重复性能验收。
+wait 平均约 0.0013 ms。该结果定位了旧 pageable-ring/逐 block 同步路径的性能问题。
+compute-ring CUDA 直注册和三 slot staged pipeline 实现后，双 Station 小几何 full-chain
+已通过 30 Gbps、60 秒、1 warm-up + 3 measured 正式门禁。
 
-下一组 GPU-only 压力不再使用上述 `A=2,B=2` 小几何判断 CUDA 核心能力，而使用接近
-目标观测的 `A≈500,F=4,P=1,B≈350`。数据由 `dada_junkdb` 以完整 ATFP block 注入，权重
-必须是匹配的 FPAB 矩阵，因此实际 GEMM、输出扩张、显存和传输量均按生产几何发生。
-`A=469,F=4` 用作约 30 Gbps 基线，`A=500,F=4` 用作 32 Gbps 压力点。该测试不经过
-Station-ID 聚合，不能替代多 Station sender 驱动的 full-stage 验收。
+GPU-only 生产几何压力暂缓。恢复时需使用 repository-owned 严格 header/完整-block pacing
+writer 和匹配的 `A≈500,F=4,P=1,B≈350` FPAB 权重；现有 `dada_junkdb` 路径不作为
+正式验收入口。该测试不经过 Station-ID 聚合，也不能替代多 Station sender 驱动的
+full-stage 验收。
 
 macOS 只构建并测试 worker core；PSRDADA/CUDA 可执行文件需要在 Linux 服务器构建。

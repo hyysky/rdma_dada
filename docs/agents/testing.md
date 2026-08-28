@@ -218,6 +218,27 @@ without an explicit GPU-worker CPU. Rebuilding binaries updates recorded
 binary identities but does not
 reset the runtime profile to unpinned or single-thread defaults.
 
+Network baselines also pin the two Station source ports. The controller must
+not derive different ports from a new suite name when a passing profile
+supplies them. A `full` topology may inherit an accepted `unpack` profile so
+receiver CPU/NUMA placement, unpack thread roles, queue geometry, raw/compute
+rings, window/reorder geometry, source ports and preparation interval remain
+unchanged while GPU/output settings are added. This is profile inheritance,
+not a new acceptance run for `rdma2dada + unpack`.
+
+GPU worker performance profiles also pin the Observation
+`processing.cuda_pipeline` contract. `SYNCHRONOUS_DIRECT/1` is the retained
+unoptimized comparison path. `STAGED_PIPELINE/N` uses exactly `N` bounded
+slots (1–4), each with its own non-blocking CUDA stream, pinned output staging
+and device buffers. The compute ring is registered once per transfer, and each
+input lease remains valid until its H2D event completes. A comparable staged run records execution mode,
+slot count, submitted/completed/published block closure, maximum inflight,
+completion reorder count, slot/writer wait, ring-registration identity/time,
+zero input-staging bytes, CUDA H2D/algorithm/D2H time and planned device/pinned
+bytes. The output ring passes
+only when the single writer publishes every block in logical sequence;
+out-of-order CUDA completion does not permit PSRDADA block reordering.
+
 Split-socket tests record `ingress_numa_node` separately from
 `processing_numa_node`. The ingress node owns the raw ring and `rdma2dada`;
 the processing node owns `vdif_unpack_worker`, compute/output rings,
@@ -398,6 +419,12 @@ with `config/testing/atfp-throughput-campaign.json` and
 `config/testing/atfp-throughput-observation.json`. The path is UDP input, raw
 ring, ATFP unpack, compute ring, CUDA conversion/transpose and beamform, output
 ring, then `dada_dbnull -s -z -q`.
+
+The historical throughput observation remains the
+`SYNCHRONOUS_DIRECT/1` comparison baseline. Multi-stream experiments use
+`config/testing/atfp-throughput-observation-staged.json`, whose only intended
+execution-policy difference is `STAGED_PIPELINE/3`; do not overwrite the
+baseline file or compare runs with unrecorded geometry/placement differences.
 
 The target is physical untagged-IPv4 Ethernet line rate. Fixed points are 1,
 5, 10, 20, 30, 35 and 40 Gbps. Every point runs one 30-second warm-up and three

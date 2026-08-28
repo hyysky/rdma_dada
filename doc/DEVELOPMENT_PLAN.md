@@ -1,6 +1,6 @@
 # Pipeline development plan
 
-更新日期：2026-08-27
+更新日期：2026-08-28
 
 本文记录当前里程碑、进入条件和开发顺序。模块轴、数值及 header 契约以
 [`ALGORITHM_MODULE_CONTRACTS.md`](ALGORITHM_MODULE_CONTRACTS.md) 为准；实时性能要求和
@@ -17,13 +17,15 @@
 - fused ATFP/CI8→TFPA/CF32 conversion 与显式 scale；
 - H2D/D2H、Beamform、Power、Stokes、Time Integration 的 CPU/CUDA 实现；
 - 单 compute ring→单 output ring 的 Resolved-Plan-driven `pipeline_worker`；
-- module/CUDA 数值、PSRDADA 生命周期、header/geometry/EOD 的重复集成测试。
-- 四阶段版本化控制器，以及 GPU-only 3/3 与 0.1 Gbps full-stage
-  1 warm-up + 3 measured 的服务器正确性验收。
+- module/CUDA 数值、PSRDADA 生命周期、header/geometry/EOD 的重复集成测试；
+- 四阶段版本化控制器，以及 0.1 Gbps full-stage 正确性验收；
+- compute-ring CUDA 直接注册、三 slot staged pipeline、有序单 writer 和 active throughput
+  指标；
+- 双 Station 小几何 30 Gbps full-stage、60 秒、1 warm-up + 3 measured 正式门禁。
 
-性能边界仍不完整：用户决定 receive/unpack 暂以 30 Gbps payload 按满足推进；这有
-unpack-only 单次精确闭合证据，但重复门禁仍有少量 receiver/NIC admission deficit。
-完整 GPU pipeline 尚未运行速率验收。
+receive-only、receive+unpack 与双 Station 小几何完整 GPU pipeline 均已完成 30 Gbps、
+60 秒、1 warm-up + 3 measured 的正式重复门禁。GPU-only 生产几何压力暂缓，当前结果
+不外推到约 500 Station、多 GPU 或额外 headroom。
 
 ## 所有模块的输入输出门禁
 
@@ -42,7 +44,7 @@ unpack-only 单次精确闭合证据，但重复门禁仍有少量 receiver/NIC 
 新增 JSON 参数时，必须同步 schema/parser、example/compiler、resolved plan、header
 transform、检查工具和边界测试；可推导值不重复配置。
 
-## Milestone 1：ingest/unpack 稳态门禁（阶段性延期）
+## Milestone 1：ingest/unpack 稳态门禁（已完成）
 
 目标：把直接接收与并行 unpack 从单次探索结果提升为可重复的 30 Gbps 稳态证据。
 
@@ -56,8 +58,11 @@ transform、检查工具和边界测试；可推导值不重复配置。
 完成标准：每次 measured 都精确闭合、clean EOD/cleanup，无持续 ring full，且所有
 machine-readable artifacts 可由版本化 runner 重现。
 
-2026-08-20 决策：为推进整链开发，当前暂按 30 Gbps receive/unpack 满足处理；上述正式
-完成标准没有降低，后续发布稳定速率结论前仍需补做。
+2026-08-26 验收结果：receive-only 与 receive+unpack 均以固定 source port、CPU/NUMA、
+queue、ring/window 和 preparation profile 完成 1 warm-up + 3 measured。receive-only
+结果根为 `/home/user/wy/task8c-drain-results/drain-receive-30Gbps-60s-20260826-r2`；
+unpack 结果根为 `/home/user/wy/task8c-unpack-results/unpack-30Gbps-60s-20260826-r3`。
+后续 GPU/full 测试继承该 profile；ingest/unpack 未变化时不从头重复此门禁。
 
 ## 论文第3章模块验证闭环（待执行）
 
@@ -73,8 +78,8 @@ headroom 属于第4章，不作为第3章门禁。
    时按当前契约重跑，不从对话摘要重造证据；
 3. 补充 unpack parse/copy/raw-block critical-path service time、进程 CPU/NUMA、ring pressure、
    writer wait/HWM 等结构化指标；
-4. 先完成 receive admission 正式门禁，再执行 unpack 的 warm-up + 3 measured；30 Gbps
-   若不能重复通过，则保留为未通过探索点，并建立一个较低的可重复正式基线；
+4. 复用已经通过的 30 Gbps receive/unpack 正式 suite；只有实现、profile 或硬件边界变化
+   时才重跑，并明确记录 profile diff；
 5. 在同一正式基线下仅改变 parse/copy worker 数量，比较 1/2/4 workers。该结果只称为
    worker-count scaling，不冒充 serial/reference speedup；
 6. 论文总结只读取 suite 的 `preflight.json`、`summary.json` 和 `runs/*.json`，每个结论
@@ -85,9 +90,8 @@ Stokes 的论文与工程门禁固定为 `AA`、`BB`、`AB_REAL`、`AB_IMAG` 四
 
 详细执行计划见
 [`../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md`](../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md)。
-HF 恢复前不启动或安排任何远程测试。
 
-## Milestone 2：完整 GPU pipeline 验收（当前）
+## Milestone 2：完整 GPU pipeline 基线验收（已完成）
 
 目标：验证真实边界 `UDP -> raw -> unpack -> compute -> GPU worker -> output -> dbnull`。
 
@@ -103,10 +107,11 @@ HF 恢复前不启动或安排任何远程测试。
 Beamform → Power → Integrate(K=128, MEAN)，整链 deadline 为 11.184810 ms；每 block 的
 时间采样由 6,553,600 降到 51,200，最终 output block 为 819,200 B，计划/建议空闲显存为
 577,536,064/693,043,277 B。RTX 3090 fresh Release 构建、预算字段和相关 CUDA 回归已
-通过；1 Gbps full-chain 精确闭合。30 Gbps 单次诊断的平均 service/H2D/算法/D2H 为
-16.243/12.077/3.873/0.260 ms，超过 13.981 ms 到达间隔，因此下一步应优先解决 H2D 与
-逐 block 同步，再评估多 stream/inflight block。小几何主要用于数据流验证，不能代表目标
-Beamform 矩阵的 CUDA 核心利用率。
+通过。早期 30 Gbps 单次诊断的平均 service/H2D/算法/D2H 为
+16.243/12.077/3.873/0.260 ms，暴露 pageable ring H2D 与逐 block 同步问题。当前实现已用
+`dada_cuda_dbregister` 注册 compute ring，由三 slot staged pipeline 直接 H2D，并按 active
+区间记录吞吐；双 Station 小几何 30 Gbps、60 秒、1 warm-up + 3 measured 已正式通过。
+小几何主要用于数据流基线，不能代表目标 Beamform 矩阵的 CUDA 核心利用率。
 
 第一步 NUMA 优化已完成控制器开发：`ingress_numa_node` 绑定 raw ring 和
 `rdma2dada`，`processing_numa_node` 绑定 unpack、compute/output ring、GPU worker 和 sink。
@@ -114,28 +119,29 @@ Beamform 矩阵的 CUDA 核心利用率。
 禁止与分区参数混用。服务器验收必须与全 NUMA1 基线保持其余速率、几何、线程和二进制
 身份一致，分别比较 receiver/unpack 闭合、H2D、算法、D2H、总 service 和清理结果。
 
-当前先拆分验证范围：
+GPU-only 生产几何压力当前暂缓。恢复时仍按以下边界执行：
 
 1. 网络侧保持现有双 Station sender，继续承担 `receive`/`unpack` 的约 30 Gbps payload
    吞吐验证；不把两个 Station 解释为约 500 个阵元。
-2. GPU 侧使用 `dada_junkdb -> compute ring -> pipeline_worker -> output ring -> dbnull`，
-   采用接近生产的 `A≈500,F=4,P=1,B≈350` ATFP/FPAB 几何。`A=469,F=4` 约为
-   30.016 Gbps，`A=500,F=4` 为 32 Gbps 压力点。
+2. GPU 侧先完成 repository-owned、严格 header、完整-block 平滑 pacing 的输入 writer，
+   再采用接近生产的 `A≈500,F=4,P=1,B≈350` ATFP/FPAB 几何；现有 `dada_junkdb`
+   路径不作为正式验收入口。
 3. GPU-only 必须使用匹配权重和真实输出几何，记录 H2D、转换、Beamform、可选产品、D2H、
    output wait、显存和逐 block 闭合；合成填充值只影响科学数值，不降低计算/传输负载。
 4. 该结果称为“生产几何 GPU 压力”，不是“500-Station 完整链验收”。后者仍需多 Station
    sender 或合法 raw-VDIF 生成器，把 Station-ID→A、时间对齐、unpack 和 GPU 放入同一链。
 
-0.1 Gbps full-stage 已完成 1 warm-up + 3 measured，每轮双 Station、receiver、unpack、GPU、
-output header/EOD 和 cleanup 精确闭合。下一门禁先完成上述生产几何 GPU-only 阶梯，再依据
-证据决定 multi-stream；完整链目标速率在具备 500-Station 输入能力后补做。
+低速 full-stage 和 30 Gbps、60 秒 full-stage 均已完成重复门禁。多 stream 已实现为
+1--4 个有界 staged slots；当前正式基线使用 staged/3、compute-ring CUDA 直注册和有序
+output writer。accepted unpack profile、固定 source port、CPU/NUMA、1 秒 preparation、
+ring/window 均已复用，未重新把 unchanged ingest/unpack 当新模块测试。
 
-随后：
+GPU-only 恢复后的任务：
 
 1. 对生产几何 GPU-only 做小速率 known-data/geometry correctness 连续三次；
 2. 以 dbnull drain output ring，执行 1/5/10/.../30/32 Gbps 的 warm-up+3 阶梯；
-3. 先完成全 NUMA1 与 ingress=1/processing=0 的匹配比较，再比较单 stream 和后续
-   `inflight_blocks` 模式，按 H2D/GPU/D2H/output-wait 证据定位瓶颈；
+3. 比较 `SYNCHRONOUS_DIRECT/1` 与 `STAGED_PIPELINE/3`，按 H2D/GPU/D2H、slot/writer wait、
+   max inflight 和顺序发布证据定位瓶颈；split-NUMA 仅作为独立命名实验；
 4. 多 Station 输入就绪后，重复 `full` 阶段并核对全部 Station、block、header 和 EOD；
 5. 只有 `full` 的全部 measured 通过，才能称该 rate 为完整 pipeline 稳定速率。
 
@@ -182,7 +188,7 @@ capability。
 完成前述契约与整链基线后再：
 
 - 设计并实现 `dada2rdma` processed packetization 与网络发送；
-- 按完整链证据决定是否引入 pinned memory、双 buffer、CUDA event/multi-stream overlap；
+- 按完整链证据继续优化 compute-ring CUDA 注册、pinned output、CUDA event/multi-stream overlap；
 - 再评估 GPUDirect 或其他进程边界；
 - 对 Time Integration 和其他 kernel 做证据驱动优化。
 

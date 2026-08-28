@@ -3,9 +3,11 @@
 该项目正在重构为独立的 PSRDADA ring-connected 实时天线阵列处理 pipeline。当前已实现
 统一 Observation/Resolved Plan、RoCE v2 ingest、Project VDIF TFP→ATFP 解包、GPU 上的
 ATFP→TFPA 转换，以及 Beamform、Power/Stokes、Time Integration 组成的双 ring
-`pipeline_worker`。功能、数值和 PSRDADA/CUDA 集成已经通过对应服务器验收；当前将
-30 Gbps 作为 receive/unpack 阶段性规划基线，但正式重复门禁已延期。完整 GPU 整链的
-持续吞吐尚未验收。
+`pipeline_worker`。功能、数值和 PSRDADA/CUDA 集成已经通过对应服务器验收；
+`rdma2dada` receive-only 和 `rdma2dada + vdif_unpack_worker` 已分别完成 30 Gbps、
+60 秒、1 warm-up + 3 measured 的正式重复门禁。当前双 Station 小几何完整链也已完成
+30 Gbps、60 秒、1 warm-up + 3 measured 的正式重复门禁；该结果不代表约 500 Station
+生产矩阵、多 GPU 扩展或 20% 实测 headroom 已验收。
 
 各应用、算法、配置、测试和后续工作的统一状态见
 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
@@ -155,22 +157,26 @@ full 则在现有 sender→`rdma2dada`→unpack 链后复用同一个 `pipeline_
   CUDA kernel。独立 CUDA correctness、GPU 数值组合链和 Resolved Plan 驱动的
   PSRDADA/CUDA ring integration 已在目标服务器通过；整链持续性能仍需继续验证。
 - `host_to_device`、`device_to_host` 已实现为无 buffer 所有权的异步 CUDA 传输
-  模块，并已接入 worker；当前 PSRDADA ring block 仍按普通 host 内存处理。
+  模块，并已接入 worker。CUDA worker 在 transfer 生命周期内用 `dada_cuda_dbregister`
+  注册整个 compute ring，H2D 直接读取当前 ring block，不再执行 ring→pinned input copy；
+  输出侧仍使用每 slot 的 pinned staging，并由单 writer 按序写 output ring。
 - 观测流程固定为解析重排后执行 Beamform，再选择 Power 或 Stokes，最后按需执行
   time integration。当前 worker 已实现 `beamform`、`beamform+power`、
   `beamform+stokes`，以及后两条链的可选积分；整数复数转 CF32 已作为固定前缀接入
   worker。VDIF 解包已改为 payload-only ATFP 输出并通过功能验收，通用模块 registry
   仍待实现。
-- 当前 CUDA worker 使用单条 non-blocking stream，但在提交每个输出 ring block 前
-  同步；双 buffer/event 的跨 block H2D/计算/D2H overlap 尚未实现。
-- GPU 资源测试将先保持双 Station sender 不变，使用 `dada_junkdb` 向 compute ring 注入
-  `A≈500,F=4,P=1,B≈350` 的生产几何 block。该路径用于验证真实 GPU 矩阵、显存和传输
-  能力，不代表约 500 Station 的网络整链；后者仍需多 Station sender 或合法 raw-VDIF
-  generator。
+- CUDA worker 保留 `SYNCHRONOUS_DIRECT/1` 对照路径，并已实现 1--4 个有界 slot 的
+  `STAGED_PIPELINE`：每个 slot 独占 output pinned staging、device buffers、non-blocking
+  stream 和完成事件，输入直接来自已注册的 compute ring；单 writer 按 block sequence
+  发布 output ring。模块/CUDA 门禁、1 Gbps 重复正确性和双 Station 小几何 30 Gbps、
+  60 秒完整链重复门禁均已通过。
+- GPU-only 压力路径暂缓。现有 `dada_junkdb` 路径和计划中的版本化压力 writer 不作为
+  当前完成项，也不影响已经通过的 full-chain 验收；恢复该工作时需重新确认严格 header、
+  block pacing 和生产几何契约。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
   unpack 采用 coordinator、固定 parser worker pool 和单 compute writer，并支持显式线程
-  affinity。30 Gbps payload 在 unpack-only 的 30/60 秒探索 run 中精确闭合，但两组重复
-  测试仍出现 251/700 包的 receiver/NIC admission 缺口；35 Gbps 未通过。项目当前暂按
-  30 Gbps receive/unpack 满足推进，正式 warm-up+3 门禁延期；完整 GPU pipeline 速率和
-  低错误率测试仍未完成。
+  affinity。receive-only 与 unpack 已使用固定 CPU/NUMA、source port、ring/window 和
+  1 秒 preparation 配置，分别通过 30 Gbps、60 秒、1 warm-up + 3 measured；35 Gbps
+  尚未通过。完整链当前通过的是双 Station 小几何 30 Gbps 基线；低错误率、生产规模
+  Station/A/B 几何和额外 headroom 仍未完成。
 - `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。

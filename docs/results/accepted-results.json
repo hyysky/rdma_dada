@@ -83,6 +83,90 @@
         "suite_id": "full-30Gbps-30s-20260827T042304Z"
       },
       "promoted_utc": "2026-08-27T05:00:41Z"
+    },
+    {
+      "catalog_entry": {
+        "actual_payload_gbps": {
+          "maximum": 29.999992294,
+          "median": 29.99999229,
+          "minimum": 29.999992289
+        },
+        "cleanup_result": "PASS",
+        "configuration": {
+          "gpu_worker_cpu": 21,
+          "ingress_numa_node": null,
+          "numa_node": 1,
+          "processing_numa_node": null,
+          "receiver_poll_batch": 32,
+          "receiver_poll_cpu": 13,
+          "receiver_wr_num": 1024,
+          "reorder_horizon_groups": 96000,
+          "rings": {
+            "compute": {
+              "block_bytes": 52428800,
+              "blocks": 8
+            },
+            "output": {
+              "block_bytes": 819200,
+              "blocks": 8
+            },
+            "raw": {
+              "block_bytes": 52838400,
+              "blocks": 16
+            }
+          },
+          "sink_cpu_list": "20",
+          "unpack_start_delay_seconds": 1,
+          "window_groups": null,
+          "worker_cpu_list": "14,15,16,17,18,19"
+        },
+        "duration_seconds": 60.0,
+        "first_failure": null,
+        "identity": {
+          "baseline_profile_id": "qths1-unpack-30gbps-60s-v1",
+          "baseline_profile_sha256": "14f6220e26b2f76227db66e4169a768fa282d87ed1d4e4b0178e0f3bfda89b46",
+          "binary_sha256": {
+            "qths1:dada_db": "61b1a6a92f8f45b07fc760868aee59f683511ffa331ba80b62306466a7d5e1a4",
+            "qths1:dada_dbnull": "fbe083b4fdc775e0b3e4513c1c150a1e73e7475164beef83487823b8ba13bcbc",
+            "qths1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qths1:pipeline_worker": "d70f0c0b3491fe165d0ed18ad7df49e74be0e93b40ebf32ae249ff55bffa89dc",
+            "qths1:rdma2dada": "6e5ed697c95dd528c56e2fa17fcdb1728640ffdd2c2f41140f01aeddb90472aa",
+            "qths1:vdif_unpack_worker": "30009b97263e801d94f277e9129ec089199146718af08539818a30ced5387e59",
+            "qtpulsar1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar1:fpga_sender_sim": "0cb7d57fbd0c0f3739f859ded3a84e85033d6677c70fc68780e74c4afff2ab30",
+            "qtpulsar2:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar2:fpga_sender_sim": "0cb7d57fbd0c0f3739f859ded3a84e85033d6677c70fc68780e74c4afff2ab30"
+          },
+          "config_id": "cd75c0291410198a2010be03446e0bf30746d29b12f02a7ebd6a834b5e92bac3",
+          "geometry_id": "d070f0ebe5d8e18d0a50ba430c825e9d164c1adf24a5bbe9a26792c7746a27b8",
+          "source_manifest_sha256": "f2c79dccb978fe9e1c01520f674ee1d053575cef21d22e492de9c2cffea7ee05"
+        },
+        "measured_count": 3,
+        "modules": [
+          "rdma2dada",
+          "vdif_unpack_worker",
+          "pipeline_worker",
+          "dada_dbnull"
+        ],
+        "result_path": "suites/full-30Gbps-60s-20260828T075032Z",
+        "started_utc": "2026-08-28T07:50:38.454527Z",
+        "suite_id": "full-30Gbps-60s-20260828T075032Z",
+        "suite_manifest_sha256": "1b9717cd637b4d55d07a0254696f2b753283bc52a4cd45b38143ffa824bc7b27",
+        "summary_sha256": "4d66215796daaa87b11b8ca86366c2aefaed70f90ac0a6acc0705185d536d919",
+        "target_payload_gbps": 30.0,
+        "test_result": "PASS",
+        "test_topology": "full",
+        "warmup_count": 1
+      },
+      "origin": {
+        "imported_utc": "2026-08-28T08:38:12Z",
+        "remote_suite_root": "/home/user/wy/task8c-active-elapsed-60s-results/full-30Gbps-60s-20260828T075032Z",
+        "schema_version": 1,
+        "source_host": "HF",
+        "source_manifest_sha256": "f2c79dccb978fe9e1c01520f674ee1d053575cef21d22e492de9c2cffea7ee05",
+        "suite_id": "full-30Gbps-60s-20260828T075032Z"
+      },
+      "promoted_utc": "2026-08-28T08:40:55Z"
     }
   ],
   "schema_version": 1

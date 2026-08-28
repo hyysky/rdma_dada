@@ -239,33 +239,27 @@ After every remote test suite, including FAIL, BLOCKED or INCOMPLETE:
 1. `GPU服务器代码测试` completes scoped remote cleanup independently of the
    product result.
 2. It compacts the suite using the existing result contract.
-3. It copies only the compact suite to a local temporary import directory.
-4. It verifies and imports the suite, rebuilds and verifies the catalog.
-5. It sends the complete normal callback to the originating development task.
-6. It also notifies the task named `总结成文` with this bounded payload:
+3. It retains the exact compact-suite path and manifest SHA256.
+4. It sends the complete callback to the originating development task:
 
 ```text
-CATALOG_IMPORT_RESULT=<PASS|FAIL>
 RESULT_NOTIFICATION=<PASS|FAIL>
-RESULT_CATALOG_NOTIFICATION=<PASS|FAIL>
 SUITE_ID=<suite-id>
 TEST_TOPOLOGY=<receive|unpack|gpu|full>
 TEST_RESULT=<result>
 CLEANUP_RESULT=<result>
-CATALOG_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/catalog.json
-LOCAL_SUITE_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/suites/<suite-id>
+REMOTE_SUITE_PATH=<absolute compact-suite path>
+SUITE_MANIFEST_SHA256=<sha256>
 ```
 
-Development notification, reporting notification, test result, cleanup result
-and catalog import status are independent. A failed catalog import records
-`CATALOG_IMPORT_RESULT=FAIL`; it does not overwrite the remote test result.
-The testing task records `RESULT_CATALOG_NOTIFICATION=FAIL` only when delivery
-to `总结成文` fails, and still returns the original result and import status to
-the development task.
+The development task verifies/transfers the compact suite, imports it, rebuilds
+and verifies the catalog, and records `CATALOG_IMPORT_RESULT` independently of
+the remote test and cleanup results. It alone maintains the test summary table
+and user-approved accepted-results index.
 
-The summary task does not automatically reread every result. It records the
-new suite ID and paths, then uses `query` only when the user requests a chapter,
-table, comparison or status update.
+The summary task receives no per-test notification. It uses `query` against the
+development-maintained catalog only when the user requests a chapter, table,
+comparison or status update.
 
 ## Selective Reading Workflow
 

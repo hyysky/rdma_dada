@@ -402,7 +402,7 @@ and run `git diff --check`.
 
 ---
 
-### Task 6: Register Tests and Document Dual Handoff
+### Task 6: Register Tests and Document Development-Owned Handoff
 
 **Files:**
 - Modify: `CMakeLists.txt`
@@ -412,7 +412,7 @@ and run `git diff --check`.
 - Modify: `config/testing/atfp-throughput-source-manifest.sha256`
 
 **Interfaces:**
-- Produces: registered `task8c_catalog_test` and exact operational contract for `GPU服务器代码测试` and `总结成文`.
+- Produces: registered `task8c_catalog_test` and exact operational contract in which `GPU服务器代码测试` reports to the development task and the development task maintains the catalog consumed on demand by `总结成文`.
 
 - [ ] **Step 1: Register CTest**
 
@@ -430,25 +430,23 @@ add_test(
 Document all five commands, local paths, immutable import, JSON/CSV derivation,
 query behavior, promotion boundary, and when evidence logs may be read.
 
-- [ ] **Step 3: Document dual notification payload**
+- [ ] **Step 3: Document the single test-result callback**
 
-After remote cleanup and compact import, notify development with the full
-result and notify `总结成文` with only:
+After remote cleanup and compaction, notify the development task with:
 
 ```text
-CATALOG_IMPORT_RESULT=<PASS|FAIL>
 RESULT_NOTIFICATION=<PASS|FAIL>
-RESULT_CATALOG_NOTIFICATION=<PASS|FAIL>
 SUITE_ID=<suite-id>
 TEST_TOPOLOGY=<receive|unpack|gpu|full>
 TEST_RESULT=<result>
 CLEANUP_RESULT=<result>
-CATALOG_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/catalog.json
-LOCAL_SUITE_PATH=/Users/ywang/WorkFile/code/rdma_dada/test-results/suites/<suite-id>
+REMOTE_SUITE_PATH=<absolute compact-suite path>
+SUITE_MANIFEST_SHA256=<sha256>
 ```
 
-Catalog import, development notification and summary notification are separate
-statuses; none overwrites remote test/cleanup status.
+The development task then imports/verifies the suite and records
+`CATALOG_IMPORT_RESULT` separately. `总结成文` reads the maintained catalog on
+demand and receives no per-test callback.
 
 - [ ] **Step 4: Update status and manifest**
 
@@ -544,17 +542,16 @@ the remote manifest, import locally, rebuild/verify, and query by exact suite
 ID. Confirm local summary/preflight/runs and evidence SHA agree with the remote
 result report.
 
-- [ ] **Step 5: Send both callbacks**
+- [ ] **Step 5: Send the development callback**
 
 Send the complete report to source task
-`019fbaf1-006f-7970-8566-5d3d51086698`. Resolve the current `总结成文` task and
-send the bounded catalog payload. Verify both tool responses identify the
-intended task; retry one failed delivery once and report notification failure
-independently if retry also fails.
+`019fbaf1-006f-7970-8566-5d3d51086698`. Verify the tool response identifies
+the intended task; retry one failed delivery once and report notification
+failure independently if retry also fails.
 
 - [ ] **Step 6: Verify cleanup and return status**
 
 Require no task-owned process/ring/capability or temporary import directory.
-Return `TEST_RESULT`, `CLEANUP_RESULT`, `RESULT_NOTIFICATION`, and
-`RESULT_CATALOG_NOTIFICATION` separately. If all requested gates pass, remind
-the user that changes are ready for commit; do not commit or push.
+Return `TEST_RESULT`, `CLEANUP_RESULT`, `RESULT_NOTIFICATION`,
+`REMOTE_SUITE_PATH` and `SUITE_MANIFEST_SHA256`. If all requested gates pass,
+remind the user that changes are ready for commit; do not commit or push.

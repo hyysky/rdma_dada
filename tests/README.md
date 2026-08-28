@@ -68,7 +68,7 @@ ctest --test-dir build-linux --output-on-failure
 | `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
 | `task8c_catalog_test` | `task8c_catalog_test.py` | 验证 compact suite 的严格 manifest/路径检查、原子导入、确定性 JSON/CSV Catalog、选择性查询和显式证据提升 | 找到 Python 3；不访问网络或 Git |
 | `generate_source_manifest_test` | `generate_source_manifest_test.py` | 验证不依赖 Git 的确定性源码 manifest allowlist、排序与排除规则 | 找到 Python 3 |
-| `pipeline_worker_metrics_test` | `pipeline_worker_metrics_test.cpp` | 验证 GPU worker block/byte/service/output-wait/CUDA timing 聚合、均值与原子 JSON 落盘 | `BUILD_TESTING=ON` |
+| `pipeline_worker_metrics_test` | `pipeline_worker_metrics_test.cpp` | 验证 GPU worker block/byte/service/output-wait/CUDA timing，以及 staged submitted/completed/published、inflight、乱序、slot/writer wait、staging copy 和内存预算聚合与原子 JSON 落盘 | `BUILD_TESTING=ON` |
 | `atfp_throughput_campaign_test` | `atfp_throughput_campaign_test.py` | 验证物理线速换算、1–40 Gbps 固定扫描、0.5 Gbps 二分、正式 CLI 和 source SHA 门禁 | 找到 Python 3；不连接远端服务器 |
 | `observation_config_test` | `observation_config_test.cpp` | 校验统一观测 JSON、精确皮秒时长、Station/A 轴顺序、metadata、ring/receiver 参数、相对路径、算法顺序及严格缺失/未知字段拒绝 | `BUILD_TESTING=ON` |
 | `resolved_observation_plan_test` | `resolved_observation_plan_test.cpp` | 从统一观测配置、wire profile 和 `[F,P,A,B,2]` 权重精确派生 ingest 及 Beamform/Power/Stokes/Integration 的 block/output-ring 几何，并校验溢出、整除和权重 F/P/A 边界 | `BUILD_TESTING=ON` |
@@ -99,6 +99,8 @@ ctest --test-dir build-linux --output-on-failure
 | `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
 | `pipeline_worker_cuda_chain_test` | `pipeline_worker_cuda_chain_test.cpp` | 在一条 non-blocking stream 上验证 H2D→ATFP 转置/转换→Beamform→Power→TimeIntegrate→D2H、独立 buffer、scratch/output 几何、header、sequence 和手算结果 | `USE_CUDA=ON` |
 | `pipeline_worker_cuda_products_test` | `pipeline_worker_cuda_products_test.cpp` | 使用非对称 `T=2,F=2,P=2,A=2,B=2` CI8 ATFP 输入，逐项验证 H2D→转换→Beamform-only/Power/Stokes→D2H 的轴顺序、header、size、sequence 和手算数值 | `USE_CUDA=ON` |
+| `gpu_block_pipeline_cuda_test` | `gpu_block_pipeline_cuda_test.cpp` | 对 staged slots=1/2/3/4 验证 pinned staging→多 non-blocking stream→Power+Integration→单 writer 严格按序发布、手算数值、生命周期/byte 计数闭合及 commit 失败传播 | `USE_CUDA=ON` |
+| `ordered_slot_scheduler_test` | `ordered_slot_scheduler_test.cpp` | 不依赖 CUDA 地验证有界 slot 压力、乱序完成/有序发布、slot 复用、stale lease 和首错截断 | `BUILD_TESTING=ON` |
 | `pipeline_worker_core_test` | `pipeline_worker_core_test.cpp` | 验证 worker JSON/ring key、ASCII header、block/scratch 规划，以及 Power/Stokes 后积分的 header 和手算数值 | `BUILD_TESTING=ON` |
 | `worker_resolved_plan_test` | `worker_resolved_plan_test.cpp` | 验证 worker 只从 Resolved Plan 获得 ring key、F/A/P/T、可配置 conversion scale、NPY B/NBEAM、Beamform-only/Power/Stokes/积分链和最终 block 几何，并拒绝 stale geometry 与变更后的权重 digest | `BUILD_TESTING=ON` |
 | `pipeline_worker_resolved_integration_test` | `pipeline_worker_resolved_integration.sh` | 从 Observation 编译 plan，使用每次运行独立的受控 ring key，运行 compute ring→CUDA worker→output ring，验证完整编译 header、Power+Integration 数值、EOD、错误 input header、ring capacity 门禁和定向清理 | Linux、`BUILD_RDMA_PIPELINE=ON`、`USE_CUDA=ON`、PSRDADA CLI；缺少时 skip 77 |
@@ -340,7 +342,7 @@ python3 -u scripts/task8c_rate_point.py \
   --warmup-runs 1 \
   --measured-runs 3 \
   --qths-binary-dir /home/user/wy/rdma_dada/build-release \
-  --observation-config config/testing/atfp-throughput-observation.json \
+  --observation-config config/testing/atfp-throughput-observation-staged.json \
   --config-compiler /home/user/wy/rdma_dada/build-release/observation_config_compile \
   --experiment-name bootstrap-gpu-v1 \
   --result-root /home/user/wy/gpu-stage-results \
