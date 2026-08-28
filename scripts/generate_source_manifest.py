@@ -26,7 +26,7 @@ SOURCE_DIRECTORIES = {
     "tests",
     "tools",
 }
-EXCLUDED_PARTS = {"__pycache__", "data", "tmp"}
+EXCLUDED_PARTS = {"__pycache__", "tmp"}
 EXCLUDED_NAMES = {".DS_Store"}
 
 

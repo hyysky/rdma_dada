@@ -76,6 +76,7 @@ venv/
 
 # Local academic manuscript workspace and its planning artifacts
 /paper/
+/agent-case-study/
 /.superpowers/sdd/
 
 # Repository-local test/render scratch (not the system /tmp directory)
@@ -90,3 +91,4 @@ venv/
 
 # Imported compact test evidence and generated local catalogs
 /test-results/
+/.staging/
