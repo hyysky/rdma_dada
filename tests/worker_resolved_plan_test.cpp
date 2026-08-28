@@ -175,6 +175,10 @@ int main(int argc, char** argv) {
                config.integration_enabled &&
                config.integration_length == 128U,
            "resolved module selection");
+    Expect(config.cuda_pipeline_mode ==
+               rdma_dada::CudaPipelineMode::kSynchronousDirect &&
+               config.cuda_inflight_blocks == 1U,
+           "worker receives the default CUDA pipeline contract");
     Expect(geometry.input_block_bytes == plan.compute_block_bytes &&
                geometry.converted_block_bytes == plan.converted_block_bytes &&
                geometry.beamformed_block_bytes ==
@@ -204,6 +208,10 @@ int main(int argc, char** argv) {
            "load worker from serialized resolved plan: " + error);
     Expect(loaded_geometry.output_block_bytes == plan.output_block_bytes,
            "serialized plan preserves worker output geometry");
+    Expect(loaded_config.cuda_pipeline_mode ==
+               rdma_dada::CudaPipelineMode::kSynchronousDirect &&
+               loaded_config.cuda_inflight_blocks == 1U,
+           "serialized plan preserves CUDA pipeline contract");
 
     {
         std::fstream changed(weights.c_str(),

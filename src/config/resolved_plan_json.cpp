@@ -167,6 +167,9 @@ std::string ObservationJson(const ObservationConfig& config,
            << "\"backend\":" << Quote(config.backend) << ','
            << "\"conversion\":{\"scale\":"
            << Quote(config.conversion_scale) << "},"
+           << "\"cuda_pipeline\":{\"inflight_blocks\":"
+           << config.cuda_inflight_blocks << ",\"mode\":"
+           << Quote(CudaPipelineModeName(config.cuda_pipeline_mode)) << "},"
            << "\"cuda_device\":" << config.cuda_device << ','
            << "\"modules\":" << ModulesJson(config.modules, include_paths)
            << ',' << "\"output\":{\"sample_format\":"

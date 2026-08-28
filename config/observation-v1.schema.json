@@ -152,6 +152,15 @@
         "backend": { "enum": ["CPU_REFERENCE", "CUDA"] },
         "cuda_device": { "type": "integer", "minimum": 0 },
         "run_once": { "type": "boolean" },
+        "cuda_pipeline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "inflight_blocks"],
+          "properties": {
+            "mode": { "enum": ["SYNCHRONOUS_DIRECT", "STAGED_PIPELINE"] },
+            "inflight_blocks": { "type": "integer", "minimum": 1, "maximum": 4 }
+          }
+        },
         "conversion": {
           "type": "object",
           "additionalProperties": false,

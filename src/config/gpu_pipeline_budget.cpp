@@ -124,6 +124,9 @@ bool ComputeForPayloadRate(const ResolvedObservationPlan& plan,
     }
 
     GpuPipelineBudget result = GpuPipelineBudget();
+    result.execution_mode = CudaPipelineModeName(
+        plan.source.cuda_pipeline_mode);
+    result.inflight_blocks = plan.source.cuda_inflight_blocks;
     result.deadline_reserve_percent = kInitialGpuDeadlineReservePercent;
     result.rate_source = rate_source;
     result.budget_target_payload_bits_per_second =
@@ -217,11 +220,29 @@ bool ComputeForPayloadRate(const ResolvedObservationPlan& plan,
         !CheckedAdd(device_buffers, result.device_scratch_bytes,
                     "device buffer bytes", &device_buffers, error) ||
         !CheckedAdd(device_buffers, result.device_output_bytes,
-                    "device buffer bytes", &device_buffers, error) ||
-        !CheckedAdd(device_buffers, result.device_weight_bytes,
+                    "device buffer bytes", &device_buffers, error)) {
+        return false;
+    }
+    result.device_bytes_per_slot = device_buffers;
+    const std::uint64_t slot_count =
+        plan.source.cuda_pipeline_mode ==
+                CudaPipelineMode::kStagedPipeline ?
+            plan.source.cuda_inflight_blocks : 1U;
+    if (!CheckedMultiply(result.device_bytes_per_slot, slot_count,
+                         "slot device bytes",
+                         &result.slot_device_bytes_total, error) ||
+        !CheckedAdd(result.slot_device_bytes_total, result.device_weight_bytes,
                     "planned device bytes", &result.planned_device_bytes,
                     error)) {
         return false;
+    }
+    if (plan.source.cuda_pipeline_mode == CudaPipelineMode::kStagedPipeline) {
+        if (!CheckedMultiply(plan.output_block_bytes, slot_count,
+                             "pinned output bytes",
+                             &result.pinned_output_bytes, error)) {
+            return false;
+        }
+        result.planned_pinned_host_bytes = result.pinned_output_bytes;
     }
     std::uint64_t memory_reserve = 0U;
     if (!CeilMultiplyDivide(result.planned_device_bytes,
@@ -306,6 +327,8 @@ bool ParsePayloadGigabitsPerSecond(const std::string& text,
 std::string SerializeGpuPipelineBudget(const GpuPipelineBudget& budget) {
     std::ostringstream output;
     output << '{'
+           << "\"execution_mode\":\"" << budget.execution_mode << "\","
+           << "\"inflight_blocks\":" << budget.inflight_blocks << ','
            << "\"deadline_reserve_percent\":"
            << budget.deadline_reserve_percent << ','
            << "\"observation_payload_bits_per_second\":"
@@ -344,11 +367,20 @@ std::string SerializeGpuPipelineBudget(const GpuPipelineBudget& budget) {
            << ',' << "\"device_output_bytes\":"
            << budget.device_output_bytes << ','
            << "\"device_weight_bytes\":" << budget.device_weight_bytes
+           << ',' << "\"device_bytes_per_slot\":"
+           << budget.device_bytes_per_slot
+           << ',' << "\"slot_device_bytes_total\":"
+           << budget.slot_device_bytes_total
            << ',' << "\"planned_device_bytes\":"
            << budget.planned_device_bytes << ','
            << "\"recommended_free_device_bytes\":"
            << budget.recommended_free_device_bytes << ','
            << "\"excludes_cuda_runtime_and_library_workspace\":true}"
+           << ',' << "\"pinned_host_memory\":{"
+           << "\"pinned_input_bytes\":" << budget.pinned_input_bytes << ','
+           << "\"pinned_output_bytes\":" << budget.pinned_output_bytes << ','
+           << "\"planned_pinned_host_bytes\":"
+           << budget.planned_pinned_host_bytes << '}'
            << '}';
     return output.str();
 }

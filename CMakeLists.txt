@@ -62,6 +62,7 @@ add_library(rdma_pipeline_core STATIC
     src/pipeline/ascii_metadata.cpp
     src/pipeline/group_block_writer.cpp
     src/pipeline/metadata.cpp
+    src/pipeline/ordered_slot_scheduler.cpp
     src/pipeline/worker_config.cpp)
 target_include_directories(rdma_pipeline_core
     PUBLIC
@@ -214,6 +215,7 @@ if(USE_CUDA)
 endif()
 
 add_library(rdma_pipeline_worker_core STATIC
+    src/pipeline/gpu_block_pipeline.cpp
     src/pipeline/module_chain.cpp
     src/pipeline/worker_metrics.cpp)
 target_include_directories(rdma_pipeline_worker_core
@@ -222,10 +224,17 @@ target_include_directories(rdma_pipeline_worker_core
 target_link_libraries(rdma_pipeline_worker_core
     PUBLIC
         rdma_pipeline_core
+        rdma_module_complex_convert
+        rdma_module_transfer
         rdma_module_beamform
         rdma_module_power
         rdma_module_stokes
         rdma_module_time_integrate)
+if(USE_CUDA)
+    target_compile_definitions(rdma_pipeline_worker_core PRIVATE
+        RDMA_DADA_HAVE_CUDA=1)
+    target_link_libraries(rdma_pipeline_worker_core PUBLIC CUDA::cudart)
+endif()
 target_link_libraries(rdma_observation_compiler PUBLIC
     rdma_module_complex_convert
     rdma_pipeline_worker_core)
@@ -320,6 +329,10 @@ if(BUILD_TESTING)
         rdma_pipeline_config)
     add_executable(pipeline_core_test tests/pipeline_core_test.cpp)
     target_link_libraries(pipeline_core_test PRIVATE rdma_pipeline_core)
+    add_executable(ordered_slot_scheduler_test
+        tests/ordered_slot_scheduler_test.cpp)
+    target_link_libraries(ordered_slot_scheduler_test PRIVATE
+        rdma_pipeline_core)
     add_executable(beamform_module_test tests/beamform_module_test.cpp)
     target_link_libraries(beamform_module_test PRIVATE rdma_module_beamform)
     add_executable(complex_convert_module_test
@@ -338,6 +351,10 @@ if(BUILD_TESTING)
         tests/pipeline_worker_core_test.cpp)
     target_link_libraries(pipeline_worker_core_test
         PRIVATE rdma_pipeline_worker_core)
+    add_executable(gpu_block_pipeline_interface_test
+        tests/gpu_block_pipeline_interface_test.cpp)
+    target_link_libraries(gpu_block_pipeline_interface_test PRIVATE
+        rdma_pipeline_worker_core)
     add_executable(pipeline_worker_metrics_test
         tests/pipeline_worker_metrics_test.cpp)
     target_link_libraries(pipeline_worker_metrics_test
@@ -392,6 +409,11 @@ if(BUILD_TESTING)
             rdma_pipeline_worker_core
             rdma_module_complex_convert
             rdma_module_transfer
+            CUDA::cudart)
+        add_executable(gpu_block_pipeline_cuda_test
+            tests/gpu_block_pipeline_cuda_test.cpp)
+        target_link_libraries(gpu_block_pipeline_cuda_test PRIVATE
+            rdma_pipeline_worker_core
             CUDA::cudart)
     endif()
     add_test(
@@ -544,6 +566,8 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/atfp_throughput_campaign_test.py)
     endif()
     add_test(NAME pipeline_core_test COMMAND pipeline_core_test)
+    add_test(NAME ordered_slot_scheduler_test
+        COMMAND ordered_slot_scheduler_test)
     add_test(NAME beamform_weight_metadata_test
         COMMAND beamform_weight_metadata_test)
     add_test(
@@ -561,6 +585,8 @@ if(BUILD_TESTING)
         COMMAND pipeline_worker_core_test
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/pipeline_worker.example.json
                 ${CMAKE_CURRENT_BINARY_DIR}/pipeline_worker_test_weights.npy)
+    add_test(NAME gpu_block_pipeline_interface_test
+        COMMAND gpu_block_pipeline_interface_test)
     add_test(NAME pipeline_worker_metrics_test COMMAND pipeline_worker_metrics_test)
     add_test(
         NAME worker_resolved_plan_test
@@ -596,6 +622,10 @@ if(BUILD_TESTING)
             COMMAND pipeline_worker_cuda_products_test
                     ${CMAKE_CURRENT_BINARY_DIR}/pipeline_worker_cuda_products_weights.npy)
         add_test(
+            NAME gpu_block_pipeline_cuda_test
+            COMMAND gpu_block_pipeline_cuda_test
+                    ${CMAKE_CURRENT_BINARY_DIR}/gpu_block_pipeline_cuda_weights.npy)
+        add_test(
             NAME complex_convert_cuda_help_test
             COMMAND complex_convert_cuda_test -h)
         add_test(NAME beamform_cuda_help_test COMMAND beamform_cuda_test -h)
@@ -623,6 +653,7 @@ if(BUILD_TESTING)
             transfer_cuda_roundtrip_test
             pipeline_worker_cuda_chain_test
             pipeline_worker_cuda_products_test
+            gpu_block_pipeline_cuda_test
             complex_convert_cuda_help_test
             beamform_cuda_help_test
             power_cuda_help_test

@@ -70,6 +70,36 @@ def main():
             "host_device_transfer_bytes_per_block"
         ] > 0
 
+        staged_config = root / "staged.json"
+        staged_document = json.loads(gpu_config.read_text())
+        staged_document["wire"]["profile"] = str(
+            (gpu_config.parent / staged_document["wire"]["profile"]).resolve()
+        )
+        staged_document["processing"]["modules"][0]["weights_file"] = str(
+            (gpu_config.parent / staged_document["processing"]["modules"][0]["weights_file"])
+            .resolve()
+        )
+        staged_document["processing"]["cuda_pipeline"] = {
+            "mode": "STAGED_PIPELINE",
+            "inflight_blocks": 3,
+        }
+        staged_config.write_text(json.dumps(staged_document))
+        staged_preflight = run([
+            str(binary), "--config", str(staged_config), "--preflight-only",
+        ])
+        assert staged_preflight.returncode == 0, staged_preflight.stderr
+        staged_budget = json.loads(staged_preflight.stdout)["gpu_pipeline_budget"]
+        assert staged_budget["execution_mode"] == "STAGED_PIPELINE"
+        assert staged_budget["inflight_blocks"] == 3
+        assert staged_budget["device_memory"]["slot_device_bytes_total"] == (
+            staged_budget["device_memory"]["device_bytes_per_slot"] * 3
+        )
+        assert staged_budget["pinned_host_memory"] == {
+            "pinned_input_bytes": 0,
+            "pinned_output_bytes": 2_457_600,
+            "planned_pinned_host_bytes": 2_457_600,
+        }
+
         fractional_budget = run([
             str(binary), "--config", str(gpu_config),
             "--budget-payload-gbps", "0.1", "--preflight-only",

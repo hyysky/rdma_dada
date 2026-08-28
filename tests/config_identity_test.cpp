@@ -126,6 +126,17 @@ int main(int argc, char** argv) {
                alternate.geometry_id == base.geometry_id,
            "whitespace, key order and source path do not affect IDs");
 
+    rdma_dada::ResolvedObservationPlan staged_changed = base;
+    staged_changed.source.cuda_pipeline_mode =
+        rdma_dada::CudaPipelineMode::kStagedPipeline;
+    staged_changed.source.cuda_inflight_blocks = 3U;
+    error.clear();
+    Expect(rdma_dada::ComputeObservationIdentities(&staged_changed, &error),
+           "staged pipeline identity: " + error);
+    Expect(staged_changed.config_id != base.config_id &&
+               staged_changed.geometry_id == base.geometry_id,
+           "CUDA execution mode changes CONFIG_ID but not GEOMETRY_ID");
+
     rdma_dada::ResolvedObservationPlan receiver_changed = base;
     receiver_changed.source.destination_port = 1001U;
     error.clear();

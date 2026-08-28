@@ -4,6 +4,7 @@
 #include "rdma_dada/config/observation_artifacts.h"
 #include "rdma_dada/config/resolved_plan_json.h"
 #include "rdma_dada/pipeline/ascii_metadata.h"
+#include "rdma_dada/pipeline/gpu_block_pipeline.h"
 #include "rdma_dada/pipeline/module_chain.h"
 #include "rdma_dada/pipeline/worker_config.h"
 #include "rdma_dada/pipeline/worker_metrics.h"
@@ -16,6 +17,7 @@
 
 #if defined(RDMA_DADA_HAVE_CUDA)
 #include <cuda_runtime_api.h>
+#include <dada_cuda.h>
 #endif
 
 #include <algorithm>
@@ -45,7 +47,11 @@ struct WorkerRuntime {
           scratch_block_capacity(0),
           output_block_capacity(0), output_block_open(false),
           input_ring_location(rdma_dada::pipeline::MemoryLocation::kHost),
-          metrics_transfer_started(false)
+          metrics_transfer_started(false), metrics_finalized(false),
+          staged_pipeline_active(false),
+          next_input_sequence(0U), input_cuda_registered(false),
+          registered_ring_blocks(0U), registered_ring_bytes(0U),
+          input_ring_registration_ns(0U)
 #if defined(RDMA_DADA_HAVE_CUDA)
           , stream(NULL), device_input(NULL), device_converted(NULL),
           device_scratch(NULL), device_output(NULL), event_start(NULL),
@@ -75,8 +81,16 @@ struct WorkerRuntime {
     rdma_dada::pipeline::MemoryLocation input_ring_location;
     std::string metrics_path;
     rdma_dada::pipeline::WorkerMetrics metrics;
+    rdma_dada::pipeline::GpuBlockPipeline gpu_pipeline;
     std::chrono::steady_clock::time_point metrics_transfer_start;
     bool metrics_transfer_started;
+    bool metrics_finalized;
+    bool staged_pipeline_active;
+    std::uint64_t next_input_sequence;
+    bool input_cuda_registered;
+    std::uint64_t registered_ring_blocks;
+    std::uint64_t registered_ring_bytes;
+    std::uint64_t input_ring_registration_ns;
     std::vector<std::uint8_t> host_scratch;
     std::vector<std::uint8_t> host_converted;
 #if defined(RDMA_DADA_HAVE_CUDA)
@@ -113,6 +127,57 @@ void SetFailure(WorkerRuntime* runtime, const std::string& message) {
 bool FitsSizeT(std::uint64_t value) {
     return value <= static_cast<std::uint64_t>(
                         std::numeric_limits<std::size_t>::max());
+}
+
+rdma_dada::pipeline::StageStatus AcquireOutputBlock(
+    WorkerRuntime* runtime, std::uint64_t,
+    std::uint8_t** data, std::uint64_t* capacity) {
+    if (!runtime || !data || !capacity) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "output block acquisition argument is null");
+    }
+    if (runtime->output_block_open) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "an output DADA block is already open");
+    }
+    std::uint64_t block_id = 0U;
+    char* block = ipcio_open_block_write(
+        runtime->output_hdu->data_block, &block_id);
+    if (!block) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "cannot acquire output DADA data block");
+    }
+    runtime->output_block_open = true;
+    *data = reinterpret_cast<std::uint8_t*>(block);
+    *capacity = runtime->output_block_capacity;
+    return rdma_dada::pipeline::StageStatus::Ok();
+}
+
+rdma_dada::pipeline::StageStatus CommitOutputBlock(
+    WorkerRuntime* runtime, std::uint64_t, std::uint64_t bytes) {
+    if (!runtime || !runtime->output_block_open) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "no output DADA block is open for commit");
+    }
+    if (ipcio_close_block_write(runtime->output_hdu->data_block, bytes) < 0) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "cannot commit output DADA data block");
+    }
+    runtime->output_block_open = false;
+    return rdma_dada::pipeline::StageStatus::Ok();
+}
+
+rdma_dada::pipeline::StageStatus AbortOutputBlock(
+    WorkerRuntime* runtime, std::uint64_t) {
+    if (!runtime || !runtime->output_block_open) {
+        return rdma_dada::pipeline::StageStatus::Ok();
+    }
+    if (ipcio_close_block_write(runtime->output_hdu->data_block, 0U) < 0) {
+        return rdma_dada::pipeline::StageStatus::Error(
+            "cannot abort output DADA data block");
+    }
+    runtime->output_block_open = false;
+    return rdma_dada::pipeline::StageStatus::Ok();
 }
 
 bool ValidateInputHeader(const rdma_dada::pipeline::Metadata& header,
@@ -243,6 +308,62 @@ bool CheckCuda(WorkerRuntime* runtime, cudaError_t result,
     SetFailure(runtime, operation + ": " + cudaGetErrorString(result));
     return false;
 }
+
+bool RegisterInputRingWithCuda(WorkerRuntime* runtime,
+                               dada_hdu_t* input_hdu) {
+    if (!runtime || !input_hdu ||
+        runtime->config.execution_backend != "CUDA") {
+        return true;
+    }
+    if (!CheckCuda(runtime, cudaSetDevice(runtime->config.cuda_device),
+                   "cudaSetDevice before input ring registration")) {
+        return false;
+    }
+    std::uint64_t block_count = 0U;
+    std::uint64_t block_bytes = 0U;
+    if (!dada_hdu_db_addresses(input_hdu, &block_count, &block_bytes) ||
+        block_count == 0U || block_bytes == 0U ||
+        block_count > std::numeric_limits<std::uint64_t>::max() /
+                          block_bytes) {
+        SetFailure(runtime, "cannot inspect input DADA ring for CUDA registration");
+        return false;
+    }
+    const WorkerClock::time_point start = WorkerClock::now();
+    if (dada_cuda_dbregister(input_hdu) < 0) {
+        SetFailure(runtime, "cannot register input DADA ring with CUDA");
+        return false;
+    }
+    runtime->input_cuda_registered = true;
+    runtime->registered_ring_blocks = block_count;
+    runtime->registered_ring_bytes = block_count * block_bytes;
+    runtime->input_ring_registration_ns =
+        ElapsedNs(start, WorkerClock::now());
+    multilog(runtime->log, LOG_INFO,
+             "registered input DADA ring with CUDA: blocks=%llu bytes=%llu "
+             "registration_ns=%llu\n",
+             static_cast<unsigned long long>(block_count),
+             static_cast<unsigned long long>(runtime->registered_ring_bytes),
+             static_cast<unsigned long long>(
+                 runtime->input_ring_registration_ns));
+    return true;
+}
+
+bool UnregisterInputRingFromCuda(WorkerRuntime* runtime,
+                                 dada_hdu_t* input_hdu) {
+    if (!runtime || !input_hdu || !runtime->input_cuda_registered) return true;
+    bool ok = CheckCuda(runtime, cudaSetDevice(runtime->config.cuda_device),
+                        "cudaSetDevice before input ring unregistration");
+    if (ok) {
+        ok = CheckCuda(runtime, cudaDeviceSynchronize(),
+                       "cudaDeviceSynchronize before input ring unregistration");
+    }
+    if (ok && dada_cuda_dbunregister(input_hdu) < 0) {
+        SetFailure(runtime, "cannot unregister input DADA ring from CUDA");
+        ok = false;
+    }
+    if (ok) runtime->input_cuda_registered = false;
+    return ok;
+}
 #endif
 
 void ReleaseExecutionBuffers(WorkerRuntime* runtime) {
@@ -274,6 +395,12 @@ void ReleaseExecutionBuffers(WorkerRuntime* runtime) {
 
 void AbortOpenTransfer(WorkerRuntime* runtime) {
     if (!runtime) return;
+    if (runtime->staged_pipeline_active) {
+        (void)runtime->gpu_pipeline.Abort(
+            runtime->error.empty() ? "transfer open aborted" : runtime->error);
+    }
+    (void)runtime->gpu_pipeline.Finish();
+    runtime->staged_pipeline_active = false;
     runtime->h2d.Finish();
     runtime->d2h.Finish();
     runtime->conversion.Finish();
@@ -376,9 +503,18 @@ int OpenTransfer(dada_client_t* client) {
     runtime->failed = false;
     runtime->error.clear();
     runtime->output_block_open = false;
+    runtime->staged_pipeline_active = false;
+    runtime->next_input_sequence = 0U;
     runtime->metrics.Reset();
+    if (runtime->input_cuda_registered) {
+        runtime->metrics.RecordInputRingRegistration(
+            runtime->registered_ring_blocks,
+            runtime->registered_ring_bytes,
+            runtime->input_ring_registration_ns);
+    }
     runtime->metrics_transfer_start = WorkerClock::now();
     runtime->metrics_transfer_started = true;
+    runtime->metrics_finalized = false;
 
     try {
         rdma_dada::pipeline::Metadata input_header;
@@ -568,6 +704,44 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
+        if (runtime->config.execution_backend == "CUDA" &&
+            runtime->config.cuda_pipeline_mode ==
+                rdma_dada::CudaPipelineMode::kStagedPipeline) {
+            rdma_dada::pipeline::OutputBlockFunctions output_functions;
+            output_functions.acquire =
+                [runtime](std::uint64_t sequence, std::uint8_t** output_data,
+                          std::uint64_t* capacity) {
+                    return AcquireOutputBlock(
+                        runtime, sequence, output_data, capacity);
+                };
+            output_functions.commit =
+                [runtime](std::uint64_t sequence, std::uint64_t bytes) {
+                    return CommitOutputBlock(runtime, sequence, bytes);
+                };
+            output_functions.abort =
+                [runtime](std::uint64_t sequence) {
+                    return AbortOutputBlock(runtime, sequence);
+                };
+            rdma_dada::pipeline::Metadata staged_output_header;
+            const rdma_dada::pipeline::StageStatus staged_status =
+                runtime->gpu_pipeline.Configure(
+                    runtime->config, runtime->geometry, input_header,
+                    output_functions, &staged_output_header);
+            if (!staged_status.ok()) {
+                SetFailure(runtime,
+                           "cannot configure staged GPU pipeline: " +
+                               staged_status.message());
+                AbortOpenTransfer(runtime);
+                return -1;
+            }
+            output_header = staged_output_header;
+            runtime->staged_pipeline_active = true;
+            runtime->gpu_pipeline.RecordInputRingRegistration(
+                runtime->registered_ring_blocks,
+                runtime->registered_ring_bytes,
+                runtime->input_ring_registration_ns);
+        }
+
         std::uint64_t transfer_size = 0;
         if (input_header.Has("TRANSFER_SIZE")) {
             if (!input_header.GetUint64("TRANSFER_SIZE", &transfer_size)) {
@@ -583,23 +757,30 @@ int OpenTransfer(dada_client_t* client) {
                     AbortOpenTransfer(runtime);
                     return -1;
                 }
-                const std::uint64_t transfer_ntime =
-                    transfer_size / runtime->geometry.input_frame_bytes;
-                if (transfer_ntime >
-                    std::numeric_limits<std::uint64_t>::max() /
-                        runtime->geometry.converted_frame_bytes) {
-                    SetFailure(runtime,
-                               "converted TRANSFER_SIZE overflows uint64");
-                    AbortOpenTransfer(runtime);
-                    return -1;
-                }
-                const std::uint64_t converted_transfer_size =
-                    transfer_ntime * runtime->geometry.converted_frame_bytes;
                 std::uint64_t transfer_scratch_bytes = 0;
                 std::uint64_t transfer_output_bytes = 0;
-                plan_status = runtime->chain.PlanBlock(
-                    converted_transfer_size, &transfer_scratch_bytes,
-                    &transfer_output_bytes);
+                if (runtime->staged_pipeline_active) {
+                    plan_status = runtime->gpu_pipeline.PlanBlock(
+                        transfer_size, &transfer_scratch_bytes,
+                        &transfer_output_bytes);
+                } else {
+                    const std::uint64_t transfer_ntime =
+                        transfer_size / runtime->geometry.input_frame_bytes;
+                    if (transfer_ntime >
+                        std::numeric_limits<std::uint64_t>::max() /
+                            runtime->geometry.converted_frame_bytes) {
+                        SetFailure(runtime,
+                                   "converted TRANSFER_SIZE overflows uint64");
+                        AbortOpenTransfer(runtime);
+                        return -1;
+                    }
+                    const std::uint64_t converted_transfer_size =
+                        transfer_ntime *
+                            runtime->geometry.converted_frame_bytes;
+                    plan_status = runtime->chain.PlanBlock(
+                        converted_transfer_size, &transfer_scratch_bytes,
+                        &transfer_output_bytes);
+                }
                 if (!plan_status.ok()) {
                     SetFailure(runtime,
                                "input TRANSFER_SIZE is incompatible with the "
@@ -607,6 +788,28 @@ int OpenTransfer(dada_client_t* client) {
                     AbortOpenTransfer(runtime);
                     return -1;
                 }
+            }
+        }
+
+        if (runtime->staged_pipeline_active) {
+            // The staged executor owns its own configured module instances.
+            // Release the temporary direct-path instances used above for
+            // common header/geometry validation so weights and CUDA backend
+            // state are not duplicated for the transfer lifetime.
+            const rdma_dada::pipeline::StageStatus old_chain =
+                runtime->chain.Finish();
+            const rdma_dada::pipeline::StageStatus old_conversion =
+                runtime->conversion.Finish();
+            const rdma_dada::pipeline::StageStatus old_h2d =
+                runtime->h2d.Finish();
+            const rdma_dada::pipeline::StageStatus old_d2h =
+                runtime->d2h.Finish();
+            if (!old_chain.ok() || !old_conversion.ok() ||
+                !old_h2d.ok() || !old_d2h.ok()) {
+                SetFailure(runtime,
+                           "cannot release temporary direct GPU modules");
+                AbortOpenTransfer(runtime);
+                return -1;
             }
         }
 
@@ -656,7 +859,8 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
-        if (!PrepareExecutionBuffers(runtime)) {
+        if (!runtime->staged_pipeline_active &&
+            !PrepareExecutionBuffers(runtime)) {
             AbortOpenTransfer(runtime);
             return -1;
         }
@@ -727,6 +931,22 @@ int64_t ProcessBlock(dada_client_t* client, void* data,
                    "input block does not contain complete ATFP CI8 frames");
         return -1;
     }
+    if (runtime->staged_pipeline_active) {
+        rdma_dada::pipeline::StageStatus status =
+            runtime->gpu_pipeline.SubmitBlock(
+            runtime->next_input_sequence,
+            static_cast<const std::uint8_t*>(data), data_size);
+        if (!status.ok()) {
+            SetFailure(runtime,
+                       "staged GPU block processing failed: " +
+                           status.message());
+            (void)runtime->gpu_pipeline.Abort(status.message());
+            return -1;
+        }
+        ++runtime->next_input_sequence;
+        return static_cast<int64_t>(data_size);
+    }
+
     const std::uint64_t actual_ntime =
         data_size / runtime->geometry.input_frame_bytes;
     if (actual_ntime >
@@ -950,6 +1170,15 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
         static_cast<WorkerRuntime*>(client ? client->context : NULL);
     if (!runtime) return -1;
     bool cleanup_failed = false;
+    if (runtime->staged_pipeline_active) {
+        const rdma_dada::pipeline::StageStatus drain_status =
+            runtime->gpu_pipeline.Drain();
+        if (!drain_status.ok()) {
+            SetFailure(runtime,
+                       "staged GPU drain failed: " + drain_status.message());
+            cleanup_failed = true;
+        }
+    }
     if (runtime->metrics_transfer_started) {
         runtime->metrics.SetTransferElapsedNs(ElapsedNs(
             runtime->metrics_transfer_start, WorkerClock::now()));
@@ -963,7 +1192,7 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
         runtime->output_block_open = false;
     }
 #if defined(RDMA_DADA_HAVE_CUDA)
-    if (runtime->stream &&
+    if (!runtime->staged_pipeline_active && runtime->stream &&
         cudaStreamSynchronize(runtime->stream) != cudaSuccess) {
         cleanup_failed = true;
     }
@@ -997,11 +1226,26 @@ int CloseTransfer(dada_client_t* client, std::uint64_t) {
                    "D2H finish failed: " + d2h_finish_status.message());
         cleanup_failed = true;
     }
+    if (runtime->staged_pipeline_active) {
+        const rdma_dada::pipeline::StageStatus gpu_finish_status =
+            runtime->gpu_pipeline.Finish();
+        if (!gpu_finish_status.ok() && !runtime->failed) {
+            SetFailure(runtime,
+                       "staged GPU finish failed: " +
+                           gpu_finish_status.message());
+            cleanup_failed = true;
+        }
+    }
     std::string metrics_error;
-    if (!runtime->metrics.WriteJson(runtime->metrics_path, &metrics_error)) {
+    const rdma_dada::pipeline::WorkerMetrics& final_metrics =
+        runtime->staged_pipeline_active ? runtime->gpu_pipeline.metrics() :
+                                          runtime->metrics;
+    runtime->metrics_finalized = true;
+    if (!final_metrics.WriteJson(runtime->metrics_path, &metrics_error)) {
         SetFailure(runtime, metrics_error);
         cleanup_failed = true;
     }
+    runtime->staged_pipeline_active = false;
     ReleaseExecutionBuffers(runtime);
     if (runtime->output_locked) {
         if (dada_hdu_unlock_write(runtime->output_hdu) < 0) {
@@ -1096,6 +1340,12 @@ int main(int argc, char** argv) {
         } else if (!runtime.failed) {
             input_locked = true;
         }
+#if defined(RDMA_DADA_HAVE_CUDA)
+        if (!runtime.failed &&
+            !RegisterInputRingWithCuda(&runtime, input_hdu)) {
+            result = EXIT_FAILURE;
+        }
+#endif
     }
 
     if (!runtime.failed) {
@@ -1142,7 +1392,11 @@ int main(int argc, char** argv) {
     }
 
     if (runtime.output_locked) AbortOpenTransfer(&runtime);
-    if (!runtime.metrics_path.empty()) {
+    // CloseTransfer writes the authoritative metrics source.  In staged mode
+    // that source belongs to GpuBlockPipeline, not runtime.metrics.  Only use
+    // the direct metrics object as a fallback when no transfer reached its
+    // close callback (for example, an input-open failure).
+    if (!runtime.metrics_path.empty() && !runtime.metrics_finalized) {
         if (runtime.metrics_transfer_started) {
             runtime.metrics.SetTransferElapsedNs(ElapsedNs(
                 runtime.metrics_transfer_start, WorkerClock::now()));
@@ -1158,6 +1412,11 @@ int main(int argc, char** argv) {
         result = EXIT_FAILURE;
     }
     if (client) dada_client_destroy(client);
+#if defined(RDMA_DADA_HAVE_CUDA)
+    if (!UnregisterInputRingFromCuda(&runtime, input_hdu)) {
+        result = EXIT_FAILURE;
+    }
+#endif
     if (output_connected && dada_hdu_disconnect(runtime.output_hdu) < 0) {
         result = EXIT_FAILURE;
     }

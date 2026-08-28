@@ -290,6 +290,48 @@ int main(int argc, char** argv) {
                    "20468750") != std::string::npos,
            "GPU budget reports total sequential H2D and D2H volume");
 
+    rdma_dada::ObservationConfig staged_source = processing_source;
+    staged_source.cuda_pipeline_mode =
+        rdma_dada::CudaPipelineMode::kStagedPipeline;
+    staged_source.cuda_inflight_blocks = 3U;
+    rdma_dada::ResolvedObservationPlan staged_plan;
+    error.clear();
+    Expect(rdma_dada::ResolveObservationPlan(
+               staged_source, artifacts.plan.wire, &staged_plan, &error) &&
+               rdma_dada::ComputeObservationIdentities(&staged_plan, &error),
+           "resolve staged GPU budget geometry: " + error);
+    rdma_dada::ObservationArtifacts staged_artifacts;
+    error.clear();
+    Expect(rdma_dada::BuildObservationArtifactsFromResolvedPlan(
+               staged_plan, &staged_artifacts, &error),
+           "build staged GPU budget: " + error);
+    Expect(staged_artifacts.validation_report_json.find(
+               "\"execution_mode\":\"STAGED_PIPELINE\"") !=
+               std::string::npos &&
+               staged_artifacts.validation_report_json.find(
+                   "\"inflight_blocks\":3") != std::string::npos,
+           "GPU budget records staged execution contract");
+    Expect(staged_artifacts.validation_report_json.find(
+               "\"device_bytes_per_slot\":117637120") !=
+               std::string::npos &&
+               staged_artifacts.validation_report_json.find(
+                   "\"slot_device_bytes_total\":352911360") !=
+               std::string::npos &&
+               staged_artifacts.validation_report_json.find(
+                   "\"planned_device_bytes\":352911552") !=
+               std::string::npos,
+           "staged GPU budget multiplies private device buffers by slots");
+    Expect(staged_artifacts.validation_report_json.find(
+               "\"pinned_input_bytes\":0") !=
+               std::string::npos &&
+               staged_artifacts.validation_report_json.find(
+                   "\"pinned_output_bytes\":589824") !=
+               std::string::npos &&
+               staged_artifacts.validation_report_json.find(
+                   "\"planned_pinned_host_bytes\":589824") !=
+               std::string::npos,
+           "staged GPU budget accounts only for output pinned slots");
+
     rdma_dada::ObservationArtifactOptions performance_options;
     performance_options.budget_target_payload_bits_per_second =
         UINT64_C(30000000000);

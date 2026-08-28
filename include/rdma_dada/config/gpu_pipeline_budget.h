@@ -10,6 +10,8 @@ namespace rdma_dada {
 const std::uint32_t kInitialGpuDeadlineReservePercent = 20U;
 
 struct GpuPipelineBudget {
+    std::string execution_mode;
+    std::uint32_t inflight_blocks;
     std::uint32_t deadline_reserve_percent;
     std::uint64_t observation_payload_bits_per_second;
     std::uint64_t budget_target_payload_bits_per_second;
@@ -33,8 +35,13 @@ struct GpuPipelineBudget {
     std::uint64_t device_scratch_bytes;
     std::uint64_t device_output_bytes;
     std::uint64_t device_weight_bytes;
+    std::uint64_t device_bytes_per_slot;
+    std::uint64_t slot_device_bytes_total;
     std::uint64_t planned_device_bytes;
     std::uint64_t recommended_free_device_bytes;
+    std::uint64_t pinned_input_bytes;
+    std::uint64_t pinned_output_bytes;
+    std::uint64_t planned_pinned_host_bytes;
 };
 
 bool ComputeGpuPipelineBudget(const ResolvedObservationPlan& plan,

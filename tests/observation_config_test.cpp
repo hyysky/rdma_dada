@@ -117,6 +117,10 @@ int main(int argc, char** argv) {
                "configured integer-to-CF32 scale");
         Expect(config.output_sample_format == "AUTO",
                "first-version output format policy");
+        Expect(config.cuda_pipeline_mode ==
+                   rdma_dada::CudaPipelineMode::kSynchronousDirect &&
+                   config.cuda_inflight_blocks == 1U,
+               "omitted CUDA pipeline defaults to synchronous direct/1");
         Expect(config.wire_profile_path.find("packet_formats/frontend.example-v1.json") !=
                    std::string::npos,
                "wire profile path is resolved relative to observation JSON");
@@ -124,6 +128,38 @@ int main(int argc, char** argv) {
 
     const std::string valid = ReadFile(argv[1]);
     rdma_dada::ObservationConfig ignored;
+
+    const std::string staged = ReplaceOnce(
+        valid, "\"conversion\": {",
+        "\"cuda_pipeline\": {\"mode\": \"STAGED_PIPELINE\", "
+        "\"inflight_blocks\": 3},\n    \"conversion\": {");
+    error.clear();
+    Expect(LoadText(staged, &ignored, &error),
+           "staged CUDA pipeline should load: " + error);
+    if (error.empty()) {
+        Expect(ignored.cuda_pipeline_mode ==
+                   rdma_dada::CudaPipelineMode::kStagedPipeline &&
+                   ignored.cuda_inflight_blocks == 3U,
+               "staged CUDA pipeline mode and slot count are parsed");
+    }
+
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(staged, "\"inflight_blocks\": 3",
+                                 "\"inflight_blocks\": 0"),
+                     &ignored, &error),
+           "staged CUDA pipeline rejects zero slots");
+    error.clear();
+    Expect(!LoadText(ReplaceOnce(staged, "\"inflight_blocks\": 3",
+                                 "\"inflight_blocks\": 5"),
+                     &ignored, &error),
+           "staged CUDA pipeline rejects more than four slots");
+
+    const std::string invalid_direct = ReplaceOnce(
+        staged, "\"mode\": \"STAGED_PIPELINE\", \"inflight_blocks\": 3",
+        "\"mode\": \"SYNCHRONOUS_DIRECT\", \"inflight_blocks\": 2");
+    error.clear();
+    Expect(!LoadText(invalid_direct, &ignored, &error),
+           "synchronous direct requires exactly one slot");
 
     error.clear();
     Expect(!LoadText(ReplaceOnce(valid, "\"schema_version\": 1",

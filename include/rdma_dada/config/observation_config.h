@@ -13,6 +13,13 @@ enum class ObservationModuleKind {
     kIntegrate
 };
 
+enum class CudaPipelineMode {
+    kSynchronousDirect,
+    kStagedPipeline
+};
+
+const char* CudaPipelineModeName(CudaPipelineMode mode);
+
 struct UtcDateTime {
     int year;
     int month;
@@ -74,6 +81,8 @@ struct ObservationConfig {
     std::string backend;
     int cuda_device;
     bool run_once;
+    CudaPipelineMode cuda_pipeline_mode;
+    std::uint32_t cuda_inflight_blocks;
     std::string conversion_scale;
     std::string output_sample_format;
     std::vector<ObservationModuleConfig> modules;

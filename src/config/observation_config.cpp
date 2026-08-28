@@ -50,6 +50,32 @@ bool RequireExactKeys(const json::Value::Object& object,
     return true;
 }
 
+bool RequireRequiredAndKnownKeys(
+    const json::Value::Object& object,
+    const char* const* required_keys, std::size_t required_count,
+    const char* const* known_keys, std::size_t known_count,
+    const std::string& path, std::string* error) {
+    for (std::size_t index = 0; index < required_count; ++index) {
+        if (object.count(required_keys[index]) == 0U) {
+            return Fail(path + " is missing required field: " +
+                        required_keys[index], error);
+        }
+    }
+    for (json::Value::Object::const_iterator item = object.begin();
+         item != object.end(); ++item) {
+        bool known = false;
+        for (std::size_t index = 0; index < known_count; ++index) {
+            if (item->first == known_keys[index]) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return Fail(path + " has unknown field: " + item->first,
+                                error);
+    }
+    return true;
+}
+
 const json::Value& Field(const json::Value::Object& object,
                          const std::string& key) {
     return object.find(key)->second;
@@ -176,6 +202,21 @@ bool IsMacAddress(const std::string& text) {
         }
     }
     return true;
+}
+
+bool ParseCudaPipelineMode(const std::string& text,
+                           CudaPipelineMode* mode,
+                           std::string* error) {
+    if (text == "SYNCHRONOUS_DIRECT") {
+        *mode = CudaPipelineMode::kSynchronousDirect;
+        return true;
+    }
+    if (text == "STAGED_PIPELINE") {
+        *mode = CudaPipelineMode::kStagedPipeline;
+        return true;
+    }
+    return Fail("processing.cuda_pipeline.mode must be "
+                "SYNCHRONOUS_DIRECT or STAGED_PIPELINE", error);
 }
 
 bool IsIpv4Address(const std::string& text) {
@@ -452,6 +493,7 @@ bool ParseObservationConfigText(const std::string& contents,
     const json::Value::Object *wire = NULL, *blocks = NULL, *rings = NULL;
     const json::Value::Object *storage = NULL, *receiver = NULL, *processing = NULL;
     const json::Value::Object *conversion = NULL, *output = NULL;
+    const json::Value::Object* cuda_pipeline = NULL;
     if (!RequireObject(Field(*root_object, "observation"), "observation",
                        &observation, error) ||
         !RequireObject(Field(*root_object, "metadata"), "metadata",
@@ -485,9 +527,16 @@ bool ParseObservationConfigText(const std::string& contents,
     static const char* const receiver_keys[] = {
         "device", "destination_mac", "destination_ip", "destination_port"
     };
-    static const char* const processing_keys[] = {
+    static const char* const processing_required_keys[] = {
         "backend", "cuda_device", "run_once", "conversion", "output",
         "modules"
+    };
+    static const char* const processing_known_keys[] = {
+        "backend", "cuda_device", "run_once", "cuda_pipeline",
+        "conversion", "output", "modules"
+    };
+    static const char* const cuda_pipeline_keys[] = {
+        "mode", "inflight_blocks"
     };
     static const char* const conversion_keys[] = {"scale"};
     static const char* const output_keys[] = {"sample_format"};
@@ -500,8 +549,9 @@ bool ParseObservationConfigText(const std::string& contents,
         !RequireExactKeys(*rings, ring_keys, 3U, "rings", error) ||
         !RequireExactKeys(*storage, storage_keys, 3U, "storage", error) ||
         !RequireExactKeys(*receiver, receiver_keys, 4U, "receiver", error) ||
-        !RequireExactKeys(*processing, processing_keys, 6U,
-                          "processing", error)) return false;
+        !RequireRequiredAndKnownKeys(
+            *processing, processing_required_keys, 6U,
+            processing_known_keys, 7U, "processing", error)) return false;
     if (!RequireObject(Field(*processing, "conversion"),
                        "processing.conversion", &conversion, error) ||
         !RequireObject(Field(*processing, "output"),
@@ -510,6 +560,26 @@ bool ParseObservationConfigText(const std::string& contents,
                           "processing.conversion", error) ||
         !RequireExactKeys(*output, output_keys, 1U,
                           "processing.output", error)) return false;
+
+    parsed.cuda_pipeline_mode = CudaPipelineMode::kSynchronousDirect;
+    parsed.cuda_inflight_blocks = 1U;
+    if (processing->count("cuda_pipeline") != 0U) {
+        if (!RequireObject(Field(*processing, "cuda_pipeline"),
+                           "processing.cuda_pipeline", &cuda_pipeline, error) ||
+            !RequireExactKeys(*cuda_pipeline, cuda_pipeline_keys, 2U,
+                              "processing.cuda_pipeline", error)) {
+            return false;
+        }
+        std::string mode;
+        if (!ReadString(*cuda_pipeline, "mode", "processing.cuda_pipeline",
+                        &mode, error) ||
+            !ReadUint32(*cuda_pipeline, "inflight_blocks",
+                        "processing.cuda_pipeline",
+                        &parsed.cuda_inflight_blocks, error) ||
+            !ParseCudaPipelineMode(mode, &parsed.cuda_pipeline_mode, error)) {
+            return false;
+        }
+    }
 
     std::uint64_t first_channel = 0;
     std::uint64_t destination_port = 0;
@@ -620,6 +690,19 @@ bool ParseObservationConfigText(const std::string& contents,
     if (parsed.backend != "CPU_REFERENCE" && parsed.backend != "CUDA") {
         return Fail("processing.backend must be CPU_REFERENCE or CUDA", error);
     }
+    if (parsed.cuda_pipeline_mode == CudaPipelineMode::kSynchronousDirect &&
+        parsed.cuda_inflight_blocks != 1U) {
+        return Fail("SYNCHRONOUS_DIRECT requires inflight_blocks=1", error);
+    }
+    if (parsed.cuda_pipeline_mode == CudaPipelineMode::kStagedPipeline &&
+        (parsed.cuda_inflight_blocks < 1U ||
+         parsed.cuda_inflight_blocks > 4U)) {
+        return Fail("STAGED_PIPELINE requires inflight_blocks in [1,4]", error);
+    }
+    if (parsed.cuda_pipeline_mode == CudaPipelineMode::kStagedPipeline &&
+        parsed.backend != "CUDA") {
+        return Fail("STAGED_PIPELINE requires processing.backend=CUDA", error);
+    }
     if (parsed.cuda_device < 0) {
         return Fail("processing.cuda_device must be non-negative", error);
     }
@@ -668,6 +751,16 @@ bool ParseObservationConfigText(const std::string& contents,
 
     *config = parsed;
     return true;
+}
+
+const char* CudaPipelineModeName(CudaPipelineMode mode) {
+    switch (mode) {
+        case CudaPipelineMode::kSynchronousDirect:
+            return "SYNCHRONOUS_DIRECT";
+        case CudaPipelineMode::kStagedPipeline:
+            return "STAGED_PIPELINE";
+    }
+    return "UNKNOWN";
 }
 
 bool LoadObservationConfig(const std::string& path,

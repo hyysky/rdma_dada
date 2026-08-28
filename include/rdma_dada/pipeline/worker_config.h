@@ -23,6 +23,8 @@ struct WorkerConfig {
     std::string execution_backend;
     int cuda_device;
     bool run_once;
+    CudaPipelineMode cuda_pipeline_mode;
+    std::uint32_t cuda_inflight_blocks;
 
     std::uint64_t nchan;
     std::uint64_t nant;

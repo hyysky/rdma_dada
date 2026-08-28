@@ -482,6 +482,8 @@ bool BuildWorkerConfigFromResolvedPlan(
     result.execution_backend = plan.source.backend;
     result.cuda_device = plan.source.cuda_device;
     result.run_once = plan.source.run_once;
+    result.cuda_pipeline_mode = plan.source.cuda_pipeline_mode;
+    result.cuda_inflight_blocks = plan.source.cuda_inflight_blocks;
     result.nchan = plan.source.nchan;
     result.nant = plan.nant;
     result.npol = plan.source.npol;
