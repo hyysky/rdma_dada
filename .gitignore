@@ -92,3 +92,4 @@ venv/
 # Imported compact test evidence and generated local catalogs
 /test-results/
 /.staging/
+/.worktrees/

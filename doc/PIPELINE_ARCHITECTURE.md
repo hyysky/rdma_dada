@@ -73,8 +73,8 @@ header or any output data is published.
 
 | Ring | Memory | Producer | Consumer(s) | Data meaning |
 | --- | --- | --- | --- | --- |
-| A | host/pinned host | RDMA2DADA | VDIF unpack | 32-byte Project VDIF header plus TFP payload records |
-| B | host/pinned host | VDIF unpack | configured worker and optional `dada_dbdisk` | unpacked/reordered samples without packet headers |
+| A | host | RDMA2DADA | VDIF unpack | 32-byte Project VDIF header plus TFP payload records |
+| B | host, CUDA-registered by the GPU worker | VDIF unpack | configured worker and optional `dada_dbdisk` | unpacked/reordered samples without packet headers |
 | C | CUDA device | configured worker | configured GPU worker | optional process boundary in GPU memory |
 | D | host/pinned host | configured worker | DADA2RDMA or optional storage | example processed product ring |
 
@@ -88,8 +88,10 @@ blocks (`dada_db -g GPU_ID`). PSRDADA requires persistence mode (`-w`) for a GPU
 ring, must be compiled with CUDA, and all producer/consumer processes must
 select a compatible CUDA device. Its header block remains host-accessible
 PSRDADA metadata; only data blocks live on the CUDA device. The current
-`pipeline_worker` v1 connects two host rings and performs H2D/D2H inside the
-process; it does not yet accept a CUDA ring endpoint.
+`pipeline_worker` connects two host rings and performs H2D/D2H inside the
+process. At startup it registers every compute-ring data block with CUDA, so
+H2D reads directly from the PSRDADA block without a separate pinned input
+staging copy. It does not yet accept a CUDA ring endpoint.
 
 ## Header propagation across A-D
 
@@ -151,23 +153,42 @@ EOD propagation.
 PSRDADA remains the authoritative implementation reference for header/data
 block lifecycle and transfer semantics.
 
-## Current worker v1
+## Current GPU worker
 
-The implemented worker binds its two HDUs by JSON hexadecimal keys. It accepts
-`CONVERTED/TFPA/CF32` host-ring input and supports three validated chains:
-Beamform, Beamform→Power, and Beamform→Stokes. The output header is published
-only after module, weight, frame, transfer and full-block geometry validation.
+The implemented `pipeline_worker` binds its compute and output HDUs from the
+Resolved Observation Plan. It accepts `UNPACKED/ATFP/CI8` host-ring input and
+supports fixed, compatibility-checked chains:
 
-The CUDA path uses explicit byte-preserving H2D and D2H modules on one
-worker-owned non-blocking stream, then synchronizes after D2H before committing
-each output block. Multi-stream event-driven overlap, the
-VDIF/unpack/convert front of the chain, time integration, arbitrary module
-registration and CUDA-ring endpoints are later phases.
+```text
+H2D + ATFP CI8→TFPA CF32 conversion/transpose
+  → Beamform
+  → Power OR coherency products (AA, BB, AB_REAL, AB_IMAG)
+  → optional TimeIntegrate (SUM or MEAN)
+  → D2H
+```
 
-Worker v1 computes ring data-block geometry before data flow starts. The JSON
-supplies F/A/P, UDP payload bytes, samples per UDP and the number of UDP packets
-contributed by each antenna to one block. Therefore
-`T=samples_per_udp*packets_per_antenna_per_block`; the input block is
-`F*A*P*T*sizeof(CF32)` and must be divisible by `udp_payload_bytes*A`. The
-actual input/output HDU capacities and input header F/A/P are checked against
-this plan before the output header is published.
+The output header is published only after input/output metadata, module,
+weight, frame, transfer and full-block geometry validation. Integration length
+must divide the block time-sample count. A finite input EOD terminates the
+transfer without treating the next transfer's `OBS_OFFSET` as another input
+header for the completed observation.
+
+`SYNCHRONOUS_DIRECT` retains the single-slot reference execution path.
+`STAGED_PIPELINE` supports a configured bounded number of in-flight slots; the
+accepted production profiles use three. Each slot owns a non-blocking CUDA
+stream, device input/converted/scratch/output buffers, pinned output staging,
+CUDA completion events, byte accounting and a block sequence number. The
+entire compute ring is registered with CUDA through PSRDADA at startup, so H2D
+copies directly from the acquired ring block and input staging-copy bytes are
+zero. Completed slots may become ready out of order, but one ordered publisher
+commits them to the output ring by block sequence, preserving PSRDADA order and
+backpressure semantics.
+
+The Resolved Plan computes every stage and ring data-block geometry before data
+flow starts. Actual HDU capacities and strict input metadata are checked
+against that plan. Production A=469 Power and coherency-product Full pipelines
+have both completed the nominal 30 Gb/s, 60 s, warm-up plus three-measured-run
+acceptance campaign. GPU-only saturation and a strict same-build
+`SYNCHRONOUS_DIRECT/1` versus `STAGED_PIPELINE/3` performance ablation remain
+separate optional characterization work; they are not prerequisites for the
+already completed Full acceptance.

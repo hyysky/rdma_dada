@@ -26,10 +26,15 @@ CUDA transfer modules and are used by `pipeline_worker`. Their standalone CUDA
 correctness tests have passed on the target server. The GPU worker now runs
 H2D→ATFP transpose/conversion→Beamform→Power/Stokes→optional TimeIntegrate→D2H.
 Beamform-only, Power and Stokes numerical products plus the Resolved
-Plan/PSRDADA/CUDA ring integration have passed server acceptance. Sustained
-full-pipeline throughput and operating headroom remain under test; isolated
-correctness does not establish real-time capability. Future algorithms should
-use the worker-owned execution stream by default.
+Plan/PSRDADA/CUDA ring integration have passed server acceptance. Production
+A=469 Full Power and coherency-product pipelines have also passed the nominal
+30 Gb/s, 60 s, warm-up plus three-measured-run campaign with count closure,
+EOD and cleanup. The coherency output contract is
+`AA,BB,AB_REAL,AB_IMAG`; I/Q/U/V are reference-derived validation quantities,
+not separately published arrays. Isolated GPU saturation/headroom and a strict
+same-build direct/1 versus staged/3 performance ablation remain outstanding;
+isolated correctness alone does not establish those limits. Future algorithms
+should use the worker-owned execution stream by default.
 
 The authoritative data layouts, module inputs/outputs, integration rules and
 worker invocation contract are documented in
