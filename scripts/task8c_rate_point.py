@@ -79,7 +79,7 @@ _PIPELINE_TOPOLOGIES = {
         True, True, False, True, True,
     ),
     "gpu": PipelineTopology(
-        "gpu", ("compute", "output"), "output", "junkdb",
+        "gpu", ("compute", "output"), "output", "pressure_writer",
         False, False, True, False, False,
     ),
     "full": PipelineTopology(
@@ -101,8 +101,8 @@ def pipeline_topology(stage: str) -> PipelineTopology:
 def required_process_roles(topology: PipelineTopology) -> tuple[str, ...]:
     """Return the complete PASS process ledger expected for one topology."""
     roles = [f"{ring}-ring" for ring in topology.rings]
-    if topology.input_kind == "junkdb":
-        roles.append("dada_junkdb")
+    if topology.input_kind == "pressure_writer":
+        roles.append("gpu_pressure_writer")
     if topology.uses_receiver:
         roles.append("rdma2dada")
     if topology.uses_unpack_worker:
@@ -339,6 +339,7 @@ class RatePlan:
     ring_plan: dict[str, Any]
     artifact_files: dict[str, bytes]
     pipeline_stage: str = "full"
+    gpu_pipeline_budget: dict[str, Any] = dataclasses.field(default_factory=dict)
     reorder_horizon_groups: int = 0
     worker_cpu_list: str | None = None
     gpu_worker_cpu: int | None = None
@@ -584,6 +585,11 @@ class RatePlan:
             ring_plan=rings,
             artifact_files=files,
             pipeline_stage=pipeline_stage,
+            gpu_pipeline_budget=(
+                report.get("gpu_pipeline_budget", {})
+                if isinstance(report.get("gpu_pipeline_budget", {}), dict)
+                else {}
+            ),
             worker_cpu_list=worker_cpu_list,
         )
 
@@ -618,17 +624,17 @@ class RatePlan:
                 "output_ring_blocks": self.output_ring_blocks,
                 "output_key": self.output_key,
             })
-            junk = derive_gpu_junk_input(self)
+            pressure = derive_gpu_pressure_input(self)
             result["gpu_input"] = {
                 "target_payload_gbps": self.aggregate_gbps,
-                "blocks_per_second": junk.blocks_per_second,
-                "block_count": junk.block_count,
-                "bytes_per_second": junk.bytes_per_second,
+                "blocks_per_second": pressure.blocks_per_second,
+                "block_count": pressure.block_count,
+                "bytes_per_second": pressure.bytes_per_second,
                 "actual_payload_gbps": (
-                    junk.bytes_per_second * 8 / 1_000_000_000
+                    pressure.bytes_per_second * 8 / 1_000_000_000
                 ),
-                "total_bytes": junk.total_bytes,
-                "duration_seconds": junk.duration_seconds,
+                "total_bytes": pressure.total_bytes,
+                "duration_seconds": pressure.duration_seconds,
             }
         elif self.pipeline_stage != "unpack" and "output" in self.ring_plan.get("rings", {}):
             result.update({
@@ -640,44 +646,18 @@ class RatePlan:
 
 
 @dataclasses.dataclass(frozen=True)
-class GpuJunkInputPlan:
+class GpuPressureInputPlan:
     blocks_per_second: int
     block_count: int
     total_bytes: int
     bytes_per_second: int
-    megabytes_per_second: str
     duration_seconds: int
-    input_header_bytes: bytes
 
 
-def _rewrite_ascii_header(header: bytes,
-                          updates: dict[str, int]) -> bytes:
-    if len(header) != 4096:
-        raise ValueError("unpacked header must be exactly 4096 bytes")
-    text = header.rstrip(b"\0").decode("ascii")
-    lines = []
-    seen = set()
-    for line in text.splitlines():
-        fields = line.split(None, 1)
-        if fields and fields[0] in updates:
-            key = fields[0]
-            lines.append(f"{key} {updates[key]}")
-            seen.add(key)
-        else:
-            lines.append(line)
-    for key in ("FILE_SIZE", "TRANSFER_SIZE", "BYTES_PER_SECOND"):
-        if key not in seen:
-            lines.append(f"{key} {updates[key]}")
-    encoded = ("\n".join(lines).rstrip("\n") + "\n").encode("ascii")
-    if len(encoded) > 4096:
-        raise ValueError("GPU input header exceeds 4096 bytes")
-    return encoded + bytes(4096 - len(encoded))
-
-
-def derive_gpu_junk_input(plan: RatePlan) -> GpuJunkInputPlan:
+def derive_gpu_pressure_input(plan: RatePlan) -> GpuPressureInputPlan:
     """Round the configured target up to whole compute blocks per second."""
     if not plan.duration_seconds.is_integer():
-        raise ValueError("GPU junk pressure duration must be whole seconds")
+        raise ValueError("GPU pressure duration must be whole seconds")
     duration = int(plan.duration_seconds)
     requested_rate = (
         decimal.Decimal(str(plan.aggregate_gbps))
@@ -690,19 +670,8 @@ def derive_gpu_junk_input(plan: RatePlan) -> GpuJunkInputPlan:
     block_count = blocks_per_second * duration
     total_bytes = block_count * plan.compute_block_bytes
     bytes_per_second = blocks_per_second * plan.compute_block_bytes
-    rate_mb = decimal.Decimal(bytes_per_second) / decimal.Decimal(1_000_000)
-    rate_text = format(rate_mb, "f").rstrip("0").rstrip(".")
-    header = _rewrite_ascii_header(
-        plan.artifact_files["unpacked.header"],
-        {
-            "FILE_SIZE": total_bytes,
-            "TRANSFER_SIZE": total_bytes,
-            "BYTES_PER_SECOND": bytes_per_second,
-        },
-    )
-    return GpuJunkInputPlan(
-        blocks_per_second, block_count, total_bytes, bytes_per_second,
-        rate_text, duration, header
+    return GpuPressureInputPlan(
+        blocks_per_second, block_count, total_bytes, bytes_per_second, duration
     )
 
 
@@ -1368,7 +1337,6 @@ def build_qths_bundle(
     dada_db_path: str = "dada_db",
     dbdisk_path: str = "dada_dbdisk",
     dbnull_path: str = "dada_dbnull",
-    dada_junkdb_path: str = "dada_junkdb",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
     ethtool_path: str = "ethtool",
 ) -> dict[str, str | bytes]:
@@ -1377,7 +1345,7 @@ def build_qths_bundle(
     if plan.pipeline_stage == "gpu":
         return _build_gpu_qths_bundle(
             plan, remote_run_dir, dada_db_path, dbdisk_path, dbnull_path,
-            dada_junkdb_path, qths_binary_dir,
+            qths_binary_dir,
         )
     receive_only = plan.pipeline_stage == "receive"
     full_gpu_pipeline = plan.uses_pipeline_worker
@@ -1808,12 +1776,11 @@ def _build_gpu_qths_bundle(
     dada_db_path: str,
     dbdisk_path: str,
     dbnull_path: str,
-    dada_junkdb_path: str,
     qths_binary_dir: str,
 ) -> dict[str, str | bytes]:
     """Build an isolated compute-ring -> GPU worker -> output-ring run."""
     supervise = build_process_supervisor()
-    junk = derive_gpu_junk_input(plan)
+    pressure = derive_gpu_pressure_input(plan)
     sink_directory = "$run_dir/output"
     processing_numa = plan.effective_processing_numa_node
     numa_env = (
@@ -1867,7 +1834,7 @@ echo $! >"$run_dir/pipeline-worker.pid"
 sleep 1
 kill -0 "$(cat "$run_dir/reader.pid")"
 kill -0 "$(cat "$run_dir/pipeline-worker.pid")"
-/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/input-writer.exit" {dada_junkdb_path} -k {plan.compute_key} -b {junk.total_bytes} -t {junk.duration_seconds} -R {junk.megabytes_per_second} -z "$run_dir/gpu-input.header" >"$run_dir/input-writer.log" 2>&1 &
+/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/input-writer.exit" "$project/gpu_pressure_writer" --key {plan.compute_key} --header "$run_dir/unpacked.header" --block-bytes {plan.compute_block_bytes} --block-count {pressure.block_count} --blocks-per-second {pressure.blocks_per_second} --metrics-json "$run_dir/gpu-pressure-writer-metrics.json" >"$run_dir/input-writer.log" 2>&1 &
 echo $! >"$run_dir/input-writer.pid"
 touch "$run_dir/pipeline.ready"
 '''
@@ -1936,7 +1903,6 @@ summary = {{"consumer": "dada_dbdisk", "exit_code": int((root / "reader.exit").r
     bundle: dict[str, str | bytes] = dict(plan.artifact_files)
     bundle.update({
         "supervise.py": supervise,
-        "gpu-input.header": junk.input_header_bytes,
         "prepare.sh": prepare,
         "start.sh": start,
         "finish.sh": finish,
@@ -2168,7 +2134,6 @@ class SshBackend:
             "dada_db": "dada_db",
             "dada_dbdisk": "dada_dbdisk",
             "dada_dbnull": "dada_dbnull",
-            "dada_junkdb": "dada_junkdb",
         }
         self._diagnostic_paths = {"ethtool": "ethtool"}
         self._sender_ethtool_paths: dict[str, str] = {}
@@ -2284,7 +2249,6 @@ class SshBackend:
             self._psrdada_paths["dada_db"],
             self._psrdada_paths["dada_dbdisk"],
             self._psrdada_paths["dada_dbnull"],
-            self._psrdada_paths["dada_junkdb"],
             str(self.qths_binary_dir),
             self._diagnostic_paths["ethtool"],
         ).items():
@@ -2361,8 +2325,6 @@ class SshBackend:
         required_psrdada_tools.append(
             "dada_dbnull" if plan.compute_consumer == "dbnull" else "dada_dbdisk"
         )
-        if plan.pipeline_stage == "gpu":
-            required_psrdada_tools.append("dada_junkdb")
         for tool in required_psrdada_tools:
             self._psrdada_paths[tool] = self._resolve_psrdada_tool(tool)
         if plan.topology.uses_receiver:
@@ -2479,6 +2441,12 @@ class SshBackend:
             binaries.insert(
                 2,
                 ("qths1", "pipeline_worker", self.qths_binary_dir / "pipeline_worker"),
+            )
+        if plan.pipeline_stage == "gpu":
+            binaries.insert(
+                2,
+                ("qths1", "gpu_pressure_writer",
+                 self.qths_binary_dir / "gpu_pressure_writer"),
             )
         binary_hashes = {}
         binary_paths = {}
@@ -2961,7 +2929,7 @@ class SshBackend:
             "rdma2dada": "receiver.process.json",
             "vdif_unpack_worker": "worker.process.json",
             "pipeline_worker": "pipeline-worker.process.json",
-            "dada_junkdb": "input-writer.process.json",
+            "gpu_pressure_writer": "input-writer.process.json",
             f"{plan.topology.consumer_ring}-consumer": "reader.process.json",
             "raw-ring": "raw-ring.process.json",
             "compute-ring": "compute-ring.process.json",
@@ -2975,6 +2943,7 @@ class SshBackend:
             artifact_names = [
                 "pipeline.ready", "pipeline-worker.log", "reader.log",
                 "reader.exit", "input-writer.log", "input-writer.exit",
+                "gpu-pressure-writer-metrics.json",
                 "pipeline-worker-metrics.json",
                 "output-summary.json", "MANIFEST.sha256",
                 "resolved_observation.json", "ring_plan.json",
@@ -2996,6 +2965,9 @@ class SshBackend:
                     "PRODUCT_FAIL",
                 )
             return {
+                "input_writer": json.loads(
+                    (qths_copy / "gpu-pressure-writer-metrics.json").read_text()
+                ),
                 "gpu": {
                     "completed": True,
                     "metrics": json.loads(
@@ -3320,15 +3292,24 @@ def _validate_statistics(
     expected_inflight_blocks = int(cuda_pipeline.get("inflight_blocks", 1))
 
     if plan.pipeline_stage == "gpu":
-        junk = derive_gpu_junk_input(plan)
+        pressure = derive_gpu_pressure_input(plan)
+        planned_writer_gbps = (
+            pressure.bytes_per_second * 8 / 1_000_000_000
+        )
         required = {
+            ("input_writer", "blocks_per_second"): pressure.blocks_per_second,
+            ("input_writer", "planned_blocks"): pressure.block_count,
+            ("input_writer", "published_blocks"): pressure.block_count,
+            ("input_writer", "block_bytes"): plan.compute_block_bytes,
+            ("input_writer", "published_bytes"): pressure.total_bytes,
+            ("input_writer", "eod_sent"): True,
             ("gpu", "completed"): True,
             ("gpu", "metrics", "execution_mode"): expected_execution_mode,
             ("gpu", "metrics", "inflight_blocks"): expected_inflight_blocks,
-            ("gpu", "metrics", "blocks"): junk.block_count,
-            ("gpu", "metrics", "input_bytes"): junk.total_bytes,
+            ("gpu", "metrics", "blocks"): pressure.block_count,
+            ("gpu", "metrics", "input_bytes"): pressure.total_bytes,
             ("gpu", "metrics", "output_bytes"): (
-                junk.block_count * plan.output_block_bytes
+                pressure.block_count * plan.output_block_bytes
             ),
             ("output", "exit_code"): 0,
         }
@@ -3349,12 +3330,44 @@ def _validate_statistics(
                     "expected": expected,
                     "actual": actual,
                 })
+        writer_metrics = statistics.get("input_writer", {})
+        actual_writer_gbps = (
+            writer_metrics.get("actual_payload_gbps")
+            if isinstance(writer_metrics, dict) else None
+        )
+        writer_elapsed_ns = (
+            writer_metrics.get("active_elapsed_ns")
+            if isinstance(writer_metrics, dict) else None
+        )
+        rate_error = (
+            abs(float(actual_writer_gbps) - planned_writer_gbps)
+            / planned_writer_gbps
+            if isinstance(actual_writer_gbps, (int, float))
+            and actual_writer_gbps > 0.0 else float("inf")
+        )
+        if rate_error > 0.02:
+            mismatches.append({
+                "field": "input_writer.actual_payload_gbps",
+                "expected": f"within 2% of {planned_writer_gbps}",
+                "actual": actual_writer_gbps,
+            })
+        expected_elapsed_ns = pressure.duration_seconds * 1_000_000_000
+        if (
+            not isinstance(writer_elapsed_ns, int)
+            or writer_elapsed_ns <= 0
+            or writer_elapsed_ns > expected_elapsed_ns * 102 // 100
+        ):
+            mismatches.append({
+                "field": "input_writer.active_elapsed_ns",
+                "expected": f"in (0, {expected_elapsed_ns * 102 // 100}]",
+                "actual": writer_elapsed_ns,
+            })
         gpu_metrics = statistics.get("gpu", {}).get("metrics", {})
         if expected_execution_mode == "STAGED_PIPELINE":
             staged_required = {
-                "submitted_blocks": junk.block_count,
-                "completed_blocks": junk.block_count,
-                "published_blocks": junk.block_count,
+                "submitted_blocks": pressure.block_count,
+                "completed_blocks": pressure.block_count,
+                "published_blocks": pressure.block_count,
                 "input_staging_bytes": 0,
                 "input_staging_copy_ns_total": 0,
                 "input_staging_copy_ns_max": 0,
@@ -3364,7 +3377,7 @@ def _validate_statistics(
                     plan.compute_ring_blocks * plan.compute_block_bytes
                 ),
                 "output_staging_bytes": (
-                    junk.block_count * plan.output_block_bytes
+                    pressure.block_count * plan.output_block_bytes
                 ),
             }
             for name, expected in staged_required.items():
@@ -4333,7 +4346,7 @@ def _compact_processes(run_dir: pathlib.Path,
         "receiver.process.json": "rdma2dada",
         "worker.process.json": "vdif_unpack_worker",
         "pipeline-worker.process.json": "pipeline_worker",
-        "input-writer.process.json": "dada_junkdb",
+        "input-writer.process.json": "gpu_pressure_writer",
     }
     plan = manifest.get("plan", {})
     consumer_ring = pipeline_topology(
@@ -4364,7 +4377,7 @@ def _compact_processes(run_dir: pathlib.Path,
         "rdma2dada": "rdma2dada",
         "vdif_unpack_worker": "vdif_unpack_worker",
         "pipeline_worker": "pipeline_worker",
-        "dada_junkdb": "dada_junkdb",
+        "gpu_pressure_writer": "gpu_pressure_writer",
         f"{consumer_ring}-consumer": consumer_tool,
     }
     worker_affinity = ""
@@ -4629,6 +4642,11 @@ def run_rate_sequence(
         "measured_count": measured_runs,
         "runs": runs,
         "actual_aggregate_gbps": aggregate,
+        "actual_aggregate_gbps_source": (
+            "input_writer.actual_payload_gbps"
+            if plan.pipeline_stage == "gpu"
+            else "senders.actual_payload_gbps_sum"
+        ),
     }
     _atomic_json(suite_root / "summary.json", summary)
     _write_suite_manifest(suite_root)
@@ -4711,6 +4729,11 @@ def run_rate_request_sequence(
         "measured_count": measured_runs,
         "runs": runs,
         "actual_aggregate_gbps": aggregate,
+        "actual_aggregate_gbps_source": (
+            "input_writer.actual_payload_gbps"
+            if request.pipeline_stage == "gpu"
+            else "senders.actual_payload_gbps_sum"
+        ),
     }
     _atomic_json(suite_root / "summary.json", summary)
     _write_suite_manifest(suite_root)
@@ -4718,7 +4741,7 @@ def run_rate_request_sequence(
 
 
 def _actual_result_payload_gbps(result: dict[str, Any]) -> float:
-    """Return the measured/configured pressure rate for the selected input."""
+    """Return the measured payload rate for the selected input."""
     plan = result.get("plan", {})
     pipeline_stage = (
         plan.get("pipeline_stage") if isinstance(plan, dict) else None
@@ -4726,14 +4749,16 @@ def _actual_result_payload_gbps(result: dict[str, Any]) -> float:
     senders = result.get("senders", [])
     if pipeline_stage != "gpu" and senders:
         return sum(float(sender["actual_payload_gbps"]) for sender in senders)
-    metrics = result.get("statistics", {}).get("gpu", {}).get("metrics", {})
-    if isinstance(metrics, dict) and float(
-        metrics.get("active_input_payload_gbps", 0.0)
+    writer_metrics = result.get("statistics", {}).get("input_writer", {})
+    if isinstance(writer_metrics, dict) and float(
+        writer_metrics.get("actual_payload_gbps", 0.0)
     ) > 0.0:
-        return float(metrics["active_input_payload_gbps"])
-    gpu_input = plan.get("gpu_input", {}) if isinstance(plan, dict) else {}
-    if isinstance(gpu_input, dict) and "actual_payload_gbps" in gpu_input:
-        return float(gpu_input["actual_payload_gbps"])
+        return float(writer_metrics["actual_payload_gbps"])
+    if pipeline_stage == "gpu":
+        raise ValueError(
+            "GPU result is missing a positive "
+            "statistics.input_writer.actual_payload_gbps measurement"
+        )
     return sum(float(sender["actual_payload_gbps"]) for sender in senders)
 
 

@@ -54,6 +54,9 @@ def build_config(
     project_root: pathlib.Path,
     weights_name: str,
     product: str,
+    duration_seconds: str = "30.000128",
+    cuda_mode: str = "STAGED_PIPELINE",
+    inflight_blocks: int = 3,
 ) -> dict:
     nchan, npol = geometry(product)
     product_module = "power" if product == "power" else "stokes"
@@ -68,7 +71,7 @@ def build_config(
         "observation": {
             "observation_id": observation_id,
             "utc_start": "2026-08-26-00:00:00",
-            "duration_seconds": "30.000128",
+            "duration_seconds": duration_seconds,
             "station_ids": list(range(1000, 1000 + NANT)),
             "first_channel_id": 100,
             "nchan": nchan,
@@ -114,8 +117,8 @@ def build_config(
             "cuda_device": 0,
             "run_once": True,
             "cuda_pipeline": {
-                "mode": "STAGED_PIPELINE",
-                "inflight_blocks": 3,
+                "mode": cuda_mode,
+                "inflight_blocks": inflight_blocks,
             },
             "conversion": {"scale": "0.0078125"},
             "output": {"sample_format": "AUTO"},
@@ -152,7 +155,29 @@ def main() -> int:
         default="power",
         help="Generate the Power (F4/P1) or coherency (F2/P2) profile",
     )
+    parser.add_argument(
+        "--duration-seconds",
+        default="30.000128",
+        help="Observation duration written verbatim as a positive decimal",
+    )
+    parser.add_argument(
+        "--cuda-mode",
+        choices=("SYNCHRONOUS_DIRECT", "STAGED_PIPELINE"),
+        default="STAGED_PIPELINE",
+    )
+    parser.add_argument("--inflight-blocks", type=int, default=3)
     args = parser.parse_args()
+
+    try:
+        duration = float(args.duration_seconds)
+    except ValueError:
+        parser.error("--duration-seconds must be a positive decimal")
+    if not duration > 0.0:
+        parser.error("--duration-seconds must be a positive decimal")
+    if args.cuda_mode == "SYNCHRONOUS_DIRECT" and args.inflight_blocks != 1:
+        parser.error("SYNCHRONOUS_DIRECT requires --inflight-blocks 1")
+    if args.cuda_mode == "STAGED_PIPELINE" and not 1 <= args.inflight_blocks <= 4:
+        parser.error("STAGED_PIPELINE requires --inflight-blocks in [1,4]")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     nchan, npol = geometry(args.product)
@@ -169,7 +194,14 @@ def main() -> int:
     write_npy_int8(weights_path, nchan, npol)
     config_path.write_text(
         json.dumps(
-            build_config(args.project_root, weights_path.name, args.product),
+            build_config(
+                args.project_root,
+                weights_path.name,
+                args.product,
+                args.duration_seconds,
+                args.cuda_mode,
+                args.inflight_blocks,
+            ),
             indent=2,
             sort_keys=True,
         )
@@ -184,6 +216,9 @@ def main() -> int:
         "nbeam": NBEAM,
         "groups_per_block": GROUPS_PER_BLOCK,
         "product": args.product,
+        "cuda_mode": args.cuda_mode,
+        "inflight_blocks": args.inflight_blocks,
+        "duration_seconds": args.duration_seconds,
     }, sort_keys=True))
     return 0
 

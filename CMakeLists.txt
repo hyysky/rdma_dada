@@ -58,6 +58,12 @@ target_include_directories(rdma_receive_policy
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+add_library(rdma_gpu_pressure_plan STATIC
+    src/testing/gpu_pressure_plan.cpp)
+target_include_directories(rdma_gpu_pressure_plan
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(rdma_pipeline_core STATIC
     src/pipeline/ascii_metadata.cpp
     src/pipeline/group_block_writer.cpp
@@ -275,6 +281,8 @@ if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     add_executable(rdma_receive_policy_test tests/rdma_receive_policy_test.cpp)
     target_link_libraries(rdma_receive_policy_test PRIVATE rdma_receive_policy)
+    add_executable(gpu_pressure_plan_test tests/gpu_pressure_plan_test.cpp)
+    target_link_libraries(gpu_pressure_plan_test PRIVATE rdma_gpu_pressure_plan)
     add_executable(project_vdif_v1_test tests/project_vdif_v1_test.cpp)
     target_link_libraries(project_vdif_v1_test PRIVATE rdma_module_vdif_unpack)
     add_executable(vdif_unpack_config_test tests/vdif_unpack_config_test.cpp)
@@ -419,6 +427,7 @@ if(BUILD_TESTING)
     add_test(
         NAME rdma_receive_policy_test
         COMMAND rdma_receive_policy_test)
+    add_test(NAME gpu_pressure_plan_test COMMAND gpu_pressure_plan_test)
     add_test(
         NAME project_vdif_v1_test
         COMMAND project_vdif_v1_test)
@@ -824,6 +833,15 @@ if(BUILD_RDMA_PIPELINE)
         target_compile_definitions(pipeline_worker PRIVATE
             RDMA_DADA_HAVE_CUDA=1)
         target_link_libraries(pipeline_worker PRIVATE CUDA::cudart)
+    endif()
+
+    add_executable(gpu_pressure_writer tools/gpu_pressure_writer.cpp)
+    target_compile_definitions(gpu_pressure_writer PRIVATE _GNU_SOURCE)
+    target_link_libraries(gpu_pressure_writer PRIVATE
+        rdma_gpu_pressure_plan
+        ${PSRDADA_TARGET})
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(gpu_pressure_writer PRIVATE rt)
     endif()
 
     add_executable(vdif_unpack_worker apps/vdif_unpack_worker/main.cpp)

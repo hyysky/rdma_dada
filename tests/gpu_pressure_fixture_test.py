@@ -33,6 +33,66 @@ def read_npy_v1(path: pathlib.Path):
 
 
 class GpuPressureFixtureTest(unittest.TestCase):
+    def test_generates_matched_direct_and_staged_execution_configs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            direct = root / "direct"
+            staged = root / "staged"
+            common = [
+                sys.executable,
+                str(GENERATOR),
+                "--duration-seconds",
+                "60",
+            ]
+            direct_run = subprocess.run(
+                common
+                + [
+                    "--output-dir",
+                    str(direct),
+                    "--cuda-mode",
+                    "SYNCHRONOUS_DIRECT",
+                    "--inflight-blocks",
+                    "1",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            staged_run = subprocess.run(
+                common
+                + [
+                    "--output-dir",
+                    str(staged),
+                    "--cuda-mode",
+                    "STAGED_PIPELINE",
+                    "--inflight-blocks",
+                    "3",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(direct_run.returncode, 0, direct_run.stderr)
+            self.assertEqual(staged_run.returncode, 0, staged_run.stderr)
+            name = "gpu-pressure-a469-f4-p1-b350.json"
+            direct_config = json.loads((direct / name).read_text())
+            staged_config = json.loads((staged / name).read_text())
+            self.assertEqual(
+                direct_config["processing"]["cuda_pipeline"],
+                {"mode": "SYNCHRONOUS_DIRECT", "inflight_blocks": 1},
+            )
+            self.assertEqual(
+                staged_config["processing"]["cuda_pipeline"],
+                {"mode": "STAGED_PIPELINE", "inflight_blocks": 3},
+            )
+            self.assertEqual(
+                direct_config["observation"]["duration_seconds"], "60"
+            )
+            direct_config["processing"]["cuda_pipeline"] = (
+                staged_config["processing"]["cuda_pipeline"]
+            )
+            self.assertEqual(direct_config, staged_config)
+
     def test_checked_in_sender_observations_cover_small_and_production_geometry(self):
         small = json.loads(SMALL_SENDER_CONFIG.read_text())
         production = json.loads(PRODUCTION_SENDER_CONFIG.read_text())

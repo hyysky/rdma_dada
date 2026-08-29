@@ -152,6 +152,14 @@ def make_plan(
                     "valid": True,
                     "config_id": resolved["config_id"],
                     "geometry_id": resolved["geometry_id"],
+                    "gpu_pipeline_budget": {
+                        "execution_mode": "SYNCHRONOUS_DIRECT",
+                        "inflight_blocks": 1,
+                        "service_deadline_ns": 123456,
+                        "device_memory": {
+                            "planned_device_bytes": 987654,
+                        },
+                    },
                 }
             )
             + "\n"
@@ -176,6 +184,12 @@ def make_plan(
         ring_plan=rings,
         artifact_files=artifacts,
         pipeline_stage=pipeline_stage,
+        gpu_pipeline_budget={
+            "execution_mode": "SYNCHRONOUS_DIRECT",
+            "inflight_blocks": 1,
+            "service_deadline_ns": 123456,
+            "device_memory": {"planned_device_bytes": 987654},
+        },
     )
     return plan
 
@@ -346,23 +360,37 @@ class GpuOnlyFakeBackend(FakeBackend):
         raise AssertionError("gpu-only stage must not wait for network senders")
 
     def collect(self, plan, run_dir):
-        junk = MODULE.derive_gpu_junk_input(plan)
+        pressure = MODULE.derive_gpu_pressure_input(plan)
         return self._stage(
             "COLLECTING",
             {
+                "input_writer": {
+                    "blocks_per_second": pressure.blocks_per_second,
+                    "planned_blocks": pressure.block_count,
+                    "published_blocks": pressure.block_count,
+                    "block_bytes": plan.compute_block_bytes,
+                    "published_bytes": pressure.total_bytes,
+                    "active_elapsed_ns": int(
+                        plan.duration_seconds * 1_000_000_000
+                    ),
+                    "actual_payload_gbps": (
+                        pressure.bytes_per_second * 8 / 1_000_000_000
+                    ),
+                    "eod_sent": True,
+                },
                 "gpu": {
                     "completed": True,
                     "metrics": {
                         "execution_mode": "SYNCHRONOUS_DIRECT",
                         "inflight_blocks": 1,
-                        "blocks": junk.block_count,
-                        "input_bytes": junk.total_bytes,
+                        "blocks": pressure.block_count,
+                        "input_bytes": pressure.total_bytes,
                         "output_bytes": (
-                            junk.block_count * plan.output_block_bytes
+                            pressure.block_count * plan.output_block_bytes
                         ),
                         "transfer_elapsed_ns": 10_000_000_000,
                         "input_payload_gbps": (
-                            junk.total_bytes * 8 / 10_000_000_000
+                            pressure.total_bytes * 8 / 10_000_000_000
                         ),
                     },
                 },
@@ -601,7 +629,7 @@ class Task8cRatePointTest(unittest.TestCase):
             "gpu": {
                 "rings": ("compute", "output"),
                 "consumer_ring": "output",
-                "input_kind": "junkdb",
+                "input_kind": "pressure_writer",
                 "receiver": False,
                 "unpack": False,
                 "gpu": True,
@@ -646,7 +674,7 @@ class Task8cRatePointTest(unittest.TestCase):
             (
                 "compute-ring",
                 "output-ring",
-                "dada_junkdb",
+                "gpu_pressure_writer",
                 "pipeline_worker",
                 "output-consumer",
             ),
@@ -1157,6 +1185,14 @@ class Task8cRatePointTest(unittest.TestCase):
                         "valid": True,
                         "config_id": resolved["config_id"],
                         "geometry_id": resolved["geometry_id"],
+                        "gpu_pipeline_budget": {
+                            "execution_mode": "STAGED_PIPELINE",
+                            "inflight_blocks": 3,
+                            "service_deadline_ns": 123456,
+                            "device_memory": {
+                                "planned_device_bytes": 987654,
+                            },
+                        },
                     }
                 ).encode(),
             }
@@ -1168,6 +1204,11 @@ class Task8cRatePointTest(unittest.TestCase):
             plan = MODULE.RatePlan.from_artifact_directory(
                 root, aggregate_gbps=1.0, duration_seconds=10.0,
                 batch_packets=16, compute_consumer="dbdisk"
+            )
+            self.assertEqual(
+                plan.as_dict()["gpu_pipeline_budget"]["device_memory"]
+                ["planned_device_bytes"],
+                987654,
             )
             (root / "raw.header").write_bytes(b"modified")
             with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
@@ -1500,6 +1541,8 @@ class Task8cRatePointTest(unittest.TestCase):
             f"dada_dbnull -k {plan.compute_key}", bundle["start.sh"]
         )
         self.assertIn("pipeline-worker.pid", bundle["start.sh"])
+        self.assertNotIn("gpu_pressure_writer", bundle["start.sh"])
+        self.assertNotIn("gpu-pressure-writer-metrics.json", bundle["start.sh"])
         self.assertIn("output-ring.pid", bundle["prepare.sh"])
         self.assertIn("output-ring.created", bundle["cleanup.sh"])
         for process in ("reader", "pipeline-worker", "worker", "receiver"):
@@ -1577,7 +1620,6 @@ class Task8cRatePointTest(unittest.TestCase):
         bundle = MODULE.build_qths_bundle(
             plan,
             "/tmp/task8c-gpu-only",
-            dada_junkdb_path="/home/user/psrdada/bin/dada_junkdb",
         )
 
         self.assertNotIn("raw-ring", bundle["prepare.sh"])
@@ -1591,16 +1633,26 @@ class Task8cRatePointTest(unittest.TestCase):
             '--metrics-json "$run_dir/pipeline-worker-metrics.json"',
             bundle["start.sh"],
         )
+        self.assertIn('"$project/gpu_pressure_writer"', bundle["start.sh"])
+        pressure = MODULE.derive_gpu_pressure_input(plan)
         self.assertIn(
-            "/home/user/psrdada/bin/dada_junkdb", bundle["start.sh"]
+            f"--blocks-per-second {pressure.blocks_per_second}",
+            bundle["start.sh"],
         )
-        junk = MODULE.derive_gpu_junk_input(plan)
-        self.assertIn(f"-R {junk.megabytes_per_second}", bundle["start.sh"])
-        self.assertIn(f"-b {junk.total_bytes}", bundle["start.sh"])
-        self.assertIn(f"-t {junk.duration_seconds}", bundle["start.sh"])
-        self.assertIn('"$run_dir/gpu-input.header"', bundle["start.sh"])
+        self.assertIn(
+            f"--block-count {pressure.block_count}", bundle["start.sh"]
+        )
+        self.assertIn(
+            f"--block-bytes {plan.compute_block_bytes}",
+            bundle["start.sh"],
+        )
+        self.assertIn(' --header "$run_dir/unpacked.header"', bundle["start.sh"])
+        self.assertIn(
+            ' --metrics-json "$run_dir/gpu-pressure-writer-metrics.json"',
+            bundle["start.sh"],
+        )
         self.assertIn("input-writer.pid", bundle["start.sh"])
-        self.assertIn("gpu-input.header", bundle)
+        self.assertNotIn("gpu-input.header", bundle)
         self.assertNotIn("input.dada", bundle["prepare.sh"])
         self.assertNotIn("raw_key", plan.as_dict())
         self.assertIn("compute_key", plan.as_dict())
@@ -1629,64 +1681,113 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertIn("TASK8C_NUMA_NODE=1", bundle["prepare.sh"])
 
-    def test_gpu_stage_builds_exact_junkdb_input_header(self):
+    def test_gpu_stage_preserves_compiler_input_header(self):
         plan = make_plan(
             30.0, 10.0, compute_consumer="dbnull", pipeline_stage="gpu"
         )
         bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-gpu-header")
-        junk = MODULE.derive_gpu_junk_input(plan)
-        header = bundle["gpu-input.header"]
-        self.assertEqual(len(header), 4096)
-        text = header.rstrip(b"\0").decode("ascii")
-        self.assertIn(f"FILE_SIZE {junk.total_bytes}\n", text)
-        self.assertIn(f"TRANSFER_SIZE {junk.total_bytes}\n", text)
-        self.assertIn(f"BYTES_PER_SECOND {junk.bytes_per_second}\n", text)
-        self.assertIn("DATA_STAGE UNPACKED\n", text)
-        self.assertIn("ORDER ATFP\n", text)
+        self.assertEqual(
+            bundle["unpacked.header"], plan.artifact_files["unpacked.header"]
+        )
+        self.assertNotIn("gpu-input.header", bundle)
 
-    def test_gpu_junk_input_rounds_up_each_second_for_any_target_rate(self):
+    def test_gpu_pressure_input_rounds_up_each_second_for_any_target_rate(self):
         plan = make_plan(
             30.0, 1.0, compute_consumer="dbnull", pipeline_stage="gpu"
         )
-        junk = MODULE.derive_gpu_junk_input(plan)
+        pressure = MODULE.derive_gpu_pressure_input(plan)
         target_bytes_per_second = 30_000_000_000 // 8
         self.assertEqual(
-            junk.blocks_per_second,
+            pressure.blocks_per_second,
             math.ceil(target_bytes_per_second / plan.compute_block_bytes),
         )
         self.assertEqual(
-            junk.bytes_per_second,
-            junk.blocks_per_second * plan.compute_block_bytes,
+            pressure.bytes_per_second,
+            pressure.blocks_per_second * plan.compute_block_bytes,
         )
-        self.assertGreaterEqual(junk.bytes_per_second, target_bytes_per_second)
-        self.assertEqual(junk.block_count, junk.blocks_per_second)
+        self.assertGreaterEqual(pressure.bytes_per_second, target_bytes_per_second)
+        self.assertEqual(pressure.block_count, pressure.blocks_per_second)
 
     def test_gpu_result_reports_block_aligned_pressure_not_zero_senders(self):
         plan = make_plan(
             12.5, 3.0, compute_consumer="dbnull", pipeline_stage="gpu"
         )
-        result = {"plan": plan.as_dict(), "senders": []}
+        result = {
+            "plan": plan.as_dict(),
+            "senders": [],
+            "statistics": {
+                "input_writer": {"actual_payload_gbps": 12.75},
+                "gpu": {"metrics": {"active_input_payload_gbps": 90.0}},
+            },
+        }
         self.assertEqual(
-            MODULE._actual_result_payload_gbps(result),
-            plan.as_dict()["gpu_input"]["actual_payload_gbps"],
+            MODULE._actual_result_payload_gbps(result), 12.75
+        )
+
+    def test_gpu_result_never_falls_back_to_gpu_or_planned_rate(self):
+        plan = make_plan(
+            12.5, 3.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        result = {
+            "plan": plan.as_dict(),
+            "senders": [],
+            "statistics": {
+                "input_writer": {},
+                "gpu": {"metrics": {"active_input_payload_gbps": 90.0}},
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError, "input_writer.actual_payload_gbps"
+        ):
+            MODULE._actual_result_payload_gbps(result)
+
+    def test_gpu_suite_summary_names_writer_actual_rate_as_source(self):
+        plan = make_plan(
+            12.5, 3.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            summary = MODULE.run_rate_sequence(
+                plan,
+                lambda: FakeBackend(plan),
+                pathlib.Path(directory),
+                warmup_runs=0,
+                measured_runs=1,
+            )
+        self.assertEqual(
+            summary["actual_aggregate_gbps_source"],
+            "input_writer.actual_payload_gbps",
         )
 
     def test_gpu_statistics_require_every_configured_input_and_output_block(self):
         plan = make_plan(
             2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu"
         )
-        junk = MODULE.derive_gpu_junk_input(plan)
+        pressure = MODULE.derive_gpu_pressure_input(plan)
         statistics = {
+            "input_writer": {
+                "blocks_per_second": pressure.blocks_per_second,
+                "planned_blocks": pressure.block_count,
+                "published_blocks": pressure.block_count,
+                "block_bytes": plan.compute_block_bytes,
+                "published_bytes": pressure.total_bytes,
+                "active_elapsed_ns": int(
+                    plan.duration_seconds * 1_000_000_000
+                ),
+                "actual_payload_gbps": (
+                    pressure.bytes_per_second * 8 / 1_000_000_000
+                ),
+                "eod_sent": True,
+            },
             "gpu": {
                 "completed": True,
                 "metrics": {
                     "execution_mode": "SYNCHRONOUS_DIRECT",
                     "inflight_blocks": 1,
-                    "blocks": junk.block_count,
-                    "input_bytes": junk.total_bytes,
-                    "output_bytes": junk.block_count * plan.output_block_bytes,
+                    "blocks": pressure.block_count,
+                    "input_bytes": pressure.total_bytes,
+                    "output_bytes": pressure.block_count * plan.output_block_bytes,
                     "transfer_elapsed_ns": 2_000_000_000,
-                    "input_payload_gbps": junk.total_bytes * 8 / 2_000_000_000,
+                    "input_payload_gbps": pressure.total_bytes * 8 / 2_000_000_000,
                 },
             },
             "output": {
@@ -1702,25 +1803,114 @@ class Task8cRatePointTest(unittest.TestCase):
             MODULE._validate_statistics(statistics, plan, "")
         self.assertIn("gpu-statistics", raised.exception.argv)
 
+    def test_gpu_statistics_reject_writer_count_deficit(self):
+        plan = make_plan(
+            2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        pressure = MODULE.derive_gpu_pressure_input(plan)
+        statistics = {
+            "input_writer": {
+                "published_blocks": pressure.block_count - 1,
+                "published_bytes": pressure.total_bytes - plan.compute_block_bytes,
+                "eod_sent": True,
+            },
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "execution_mode": "SYNCHRONOUS_DIRECT",
+                    "inflight_blocks": 1,
+                    "blocks": pressure.block_count,
+                    "input_bytes": pressure.total_bytes,
+                    "output_bytes": pressure.block_count * plan.output_block_bytes,
+                    "transfer_elapsed_ns": 2_000_000_000,
+                    "input_payload_gbps": pressure.total_bytes * 8 / 2_000_000_000,
+                },
+            },
+            "output": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("gpu-statistics", raised.exception.argv)
+        self.assertIn("input_writer.published_blocks", raised.exception.stderr)
+
+    def test_gpu_statistics_reject_writer_rate_deficit(self):
+        plan = make_plan(
+            2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        pressure = MODULE.derive_gpu_pressure_input(plan)
+        planned_gbps = pressure.bytes_per_second * 8 / 1_000_000_000
+        statistics = {
+            "input_writer": {
+                "blocks_per_second": pressure.blocks_per_second,
+                "planned_blocks": pressure.block_count,
+                "published_blocks": pressure.block_count,
+                "block_bytes": plan.compute_block_bytes,
+                "published_bytes": pressure.total_bytes,
+                "active_elapsed_ns": int(plan.duration_seconds * 1_200_000_000),
+                "actual_payload_gbps": planned_gbps / 1.2,
+                "eod_sent": True,
+            },
+            "gpu": {
+                "completed": True,
+                "metrics": {
+                    "execution_mode": "SYNCHRONOUS_DIRECT",
+                    "inflight_blocks": 1,
+                    "blocks": pressure.block_count,
+                    "input_bytes": pressure.total_bytes,
+                    "output_bytes": pressure.block_count * plan.output_block_bytes,
+                    "transfer_elapsed_ns": 1_000_000_000,
+                    "input_payload_gbps": planned_gbps,
+                },
+            },
+            "output": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("input_writer.actual_payload_gbps", raised.exception.stderr)
+
     def test_staged_gpu_statistics_require_closed_ordered_lifecycle(self):
         plan = make_plan(
             2.75, 2.0, compute_consumer="dbnull", pipeline_stage="gpu",
             cuda_pipeline_mode="STAGED_PIPELINE", cuda_inflight_blocks=3,
         )
-        junk = MODULE.derive_gpu_junk_input(plan)
-        output_bytes = junk.block_count * plan.output_block_bytes
+        pressure = MODULE.derive_gpu_pressure_input(plan)
+        output_bytes = pressure.block_count * plan.output_block_bytes
         statistics = {
+            "input_writer": {
+                "blocks_per_second": pressure.blocks_per_second,
+                "planned_blocks": pressure.block_count,
+                "published_blocks": pressure.block_count,
+                "block_bytes": plan.compute_block_bytes,
+                "published_bytes": pressure.total_bytes,
+                "active_elapsed_ns": int(
+                    plan.duration_seconds * 1_000_000_000
+                ),
+                "actual_payload_gbps": (
+                    pressure.bytes_per_second * 8 / 1_000_000_000
+                ),
+                "eod_sent": True,
+            },
             "gpu": {
                 "completed": True,
                 "metrics": {
                     "execution_mode": "STAGED_PIPELINE",
                     "inflight_blocks": 3,
-                    "blocks": junk.block_count,
-                    "submitted_blocks": junk.block_count,
-                    "completed_blocks": junk.block_count,
-                    "published_blocks": junk.block_count,
+                    "blocks": pressure.block_count,
+                    "submitted_blocks": pressure.block_count,
+                    "completed_blocks": pressure.block_count,
+                    "published_blocks": pressure.block_count,
                     "max_inflight": 3,
-                    "input_bytes": junk.total_bytes,
+                    "input_bytes": pressure.total_bytes,
                     "output_bytes": output_bytes,
                     "input_staging_bytes": 0,
                     "input_staging_copy_ns_total": 0,
@@ -1734,11 +1924,11 @@ class Task8cRatePointTest(unittest.TestCase):
                     "output_staging_bytes": output_bytes,
                     "active_elapsed_ns": 2_000_000_000,
                     "active_input_payload_gbps": (
-                        junk.total_bytes * 8 / 2_000_000_000
+                        pressure.total_bytes * 8 / 2_000_000_000
                     ),
                     "transfer_elapsed_ns": 2_000_000_000,
                     "input_payload_gbps": (
-                        junk.total_bytes * 8 / 2_000_000_000
+                        pressure.total_bytes * 8 / 2_000_000_000
                     ),
                 },
             },
@@ -3240,7 +3430,7 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(evidence["sender_endpoints"], [])
         self.assertIsNone(evidence["receiver_preflight"])
         self.assertIn("qths1:pipeline_worker", evidence["binary_sha"])
-        self.assertIn("qths1:dada_junkdb", evidence["binary_sha"])
+        self.assertIn("qths1:gpu_pressure_writer", evidence["binary_sha"])
         self.assertNotIn("qths1:rdma2dada", evidence["binary_sha"])
         self.assertNotIn("qths1:ethtool", evidence["binary_sha"])
 
