@@ -11,7 +11,7 @@ NANT = 469
 NCHAN = 4
 NPOL = 1
 NBEAM = 350
-GROUPS_PER_BLOCK = 14
+GROUPS_PER_BLOCK = 26
 
 
 def write_npy_int8(path: pathlib.Path) -> None:
@@ -49,7 +49,7 @@ def build_config(project_root: pathlib.Path, weights_name: str) -> dict:
         "observation": {
             "observation_id": "gpu-pressure-a469-f4-p1-b350",
             "utc_start": "2026-08-26-00:00:00",
-            "duration_seconds": "30",
+            "duration_seconds": "30.000128",
             "station_ids": list(range(1000, 1000 + NANT)),
             "first_channel_id": 100,
             "nchan": NCHAN,
@@ -66,7 +66,7 @@ def build_config(project_root: pathlib.Path, weights_name: str) -> dict:
                 (project_root / "config/packet_formats/frontend.example-v1.json")
                 .resolve()
             ),
-            "samples_per_packet": 1024,
+            "samples_per_packet": 512,
         },
         "blocks": {
             "groups_per_block": GROUPS_PER_BLOCK,
@@ -94,16 +94,24 @@ def build_config(project_root: pathlib.Path, weights_name: str) -> dict:
             "backend": "CUDA",
             "cuda_device": 0,
             "run_once": True,
+            "cuda_pipeline": {
+                "mode": "STAGED_PIPELINE",
+                "inflight_blocks": 3,
+            },
             "conversion": {"scale": "0.0078125"},
             "output": {"sample_format": "AUTO"},
-            "modules": [{
-                "type": "beamform",
-                "weights_file": weights_name,
-                "weights_order": "FPAB2",
-                "weights_id": "gpu-pressure-f4-p1-a469-b350-i8-v1",
-                "weights_scale": "0.0078125",
-                "compute_mode": "FP32",
-            }],
+            "modules": [
+                {
+                    "type": "beamform",
+                    "weights_file": weights_name,
+                    "weights_order": "FPAB2",
+                    "weights_id": "gpu-pressure-f4-p1-a469-b350-i8-v1",
+                    "weights_scale": "0.0078125",
+                    "compute_mode": "FP32",
+                },
+                {"type": "power"},
+                {"type": "integrate", "length": 128, "operation": "MEAN"},
+            ],
         },
     }
 

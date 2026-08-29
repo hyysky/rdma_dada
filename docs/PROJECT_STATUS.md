@@ -1,8 +1,9 @@
 # 项目模块状态
 
-更新日期：2026-08-28
-当前提交基线：`598d11f`；工作树另含尚未提交的多 CUDA stream、compute-ring CUDA
-注册、测试 profile 复用和配套测试/文档修改。
+更新日期：2026-08-29
+当前开发分支：`codex/pipeline-architecture`；本轮完成多 Station sender、生产几何
+Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 worker transfer
+生命周期，并已通过目标服务器正式验收。
 
 本文是项目当前实现、验收边界和后续顺序的统一入口。数据契约以 `doc/`、`config/`
 和各模块 README 为准；历史设计与执行记录保存在 `docs/superpowers/`。
@@ -56,7 +57,7 @@
 | `fpga_sender_sim` | 已验收 | 多服务器模拟 Station；Project VDIF；source port；`sendmmsg`；定速及错误注入 | 用于重复速率和异常观测验收 |
 | `rdma2dada` | 30 Gbps 正式重复门禁已通过 | destination-only flow；1 QP/CQ/线程；NSGE=2 直接写 raw ring；固定 1 秒 drain | 保留 35 Gbps 未通过边界，后续只在接收实现变化时重跑正式基线 |
 | `vdif_unpack_worker` | 30 Gbps 正式重复门禁已通过 | coordinator + 固定 parser worker pool + 单 compute writer；有界队列和 window lease/ACK；Station→A、补零、partial/EOD | 完整 GPU 链复用已验收 profile，不重复把 unchanged ingest/unpack 当新模块测试 |
-| `pipeline_worker` | 双 Station 小几何 30 Gbps 正式重复门禁已通过 | 保留 `SYNCHRONOUS_DIRECT/1`；新增 1–4 个有界 staged slots，每 slot 独占 output pinned staging、device buffers、non-blocking stream 和事件；compute ring 由 CUDA 直接注册，单 writer 按 block sequence 写 output ring | 后续只在明确实验中做 direct/staged 或 slot-count 匹配对照；GPU-only 暂缓 |
+| `pipeline_worker` | 469-Station Full Power 约 30 Gbps 正式重复门禁已通过 | 保留 `SYNCHRONOUS_DIRECT/1`；新增 1–4 个有界 staged slots，每 slot 独占 output pinned staging、device buffers、non-blocking stream 和事件；compute ring 由 CUDA 直接注册，单 writer 按 block sequence 写 output ring；读取以 compute-ring EOD 收口 | 后续只在明确实验中做 direct/staged 或 slot-count 匹配对照；GPU-only 暂缓 |
 | 分阶段测试控制器 | full profile 集成及正式重复门禁已通过 | 支持 `receive`、`unpack`、`gpu`、`full`；full 继承 qths1 unpack profile，固定 CPU/NUMA、queue、ring/window、source port 和 1 秒 preparation；Full 汇总使用 sender aggregate payload rate | 保持通过配置为基线；只有实现或实验参数变化时才重跑相关拓扑 |
 | 测试结果 Catalog | 已完成服务器验收 | 原子导入 compact suite；确定性 JSON/CSV；按拓扑/速率/结果/日期/profile 查询；显式证据提升；测试任务只回传开发任务 | 开发任务维护汇总表；“总结成文”在更新论文时按需查询 |
 | `dada2rdma` | 待开发 | 已定义职责边界 | 完成整链验收后设计 processed packetization 与发送路径 |
@@ -97,21 +98,24 @@
 | GPU-only 持续压力 | 暂缓 | 严格 header、平滑完整-block pacing 和 production geometry writer 尚未收口；恢复前不宣称 ready 或稳定速率 |
 | 生产几何 GPU 压力 | 暂缓 | `A≈500,F=4,P=1,B≈350` 仍是未来单 GPU 资源实验，不属于当前双 Station full-chain 基线 |
 | 低速完整 GPU pipeline | 已通过服务器验收 | 0.1 Gbps，1 warm-up + 3 measured；双 Station sender、receiver、unpack、GPU、output header/EOD 和 cleanup 每轮精确闭合 |
-| 30 Gbps 完整 GPU pipeline，60 s | 正式通过 | 双 Station 小几何，1 warm-up + 3 measured；sender、receiver、unpack、三 slot CUDA、output、dbnull/EOD 和 cleanup 每轮闭合；aggregate payload median=29.999992290 Gbps |
+| 30 Gbps 完整 GPU pipeline，60 s | 原型正式通过 | `A=2` 小几何，1 warm-up + 3 measured；sender、receiver、unpack、三 slot CUDA、output、dbnull/EOD 和 cleanup 每轮闭合；不能替代论文 `A=469` 主几何验收 |
+| 469-Station full Power | 正式通过 | suite `full-30.2505Gbps-60s-20260829T033639Z`；`A=469,F=4,P=1,B=350`、`STAGED_PIPELINE/3`、Beamform→Power→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563937–30.248563939 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合 |
+| 469-Station full coherency/Stokes | 待正式验收 | 输出 `AA/BB/AB_REAL/AB_IMAG`；reference 同时核对 I/Q/U/V 推导，工程不单独发布 I/Q/U/V 数组 |
 | 500-Station 完整 GPU pipeline | 待输入能力 | 必须由多 Station sender 或合法 raw-VDIF generator 提供约 500 个 Station，覆盖 Station-ID→A、unpack、GPU 和 output；不能用双 Station 结果替代 |
 | 低错误率/长时间连续观测 | 待执行 | 错误率目标 0.001%–0.1%；还需 Station 失败、资源恢复和稳态验证 |
 | 论文第3章模块证据闭环 | 部分完成 | receive/unpack 正式基线已具备；仍需 GPU 模块 suite 收口、unpack 指标补齐及 1/2/4 worker 匹配比较 |
 
-因此当前最准确的表述是：**30 Gbps receive-only、receive+unpack，以及双 Station
-小几何完整 GPU pipeline 均已完成 60 秒、1 warm-up + 3 measured 的正式重复门禁。**
-该结论不外推到约 500 Station 生产矩阵、GPU-only 压力、多 GPU 或额外 headroom。
+因此当前最准确的表述是：**30 Gbps receive-only、receive+unpack，以及生产几何
+`A=469,F=4,P=1,B=350` Full Power pipeline 均已完成 60 秒、1 warm-up + 3 measured
+的正式重复门禁。** 论文 Power 完整链主验收已有权威证据；coherency/Stokes GPU-only
+和 full 正式结果仍待完成。
 详细证据与边界见 [`VDIF_UNPACK_STATUS.md`](VDIF_UNPACK_STATUS.md)。
 
 ## 下一阶段顺序
 
-1. 冻结并复用当前通过的 full profile、source port、CPU/NUMA、preparation、ring/window 和 binary identity；不重复测试未变化的 ingest/unpack。
-2. GPU-only 压力暂缓；恢复时先完成严格 header、完整-block pacing 的版本化输入 writer，再做 direct/staged 与 slot-count 匹配实验。
-3. 下一项产品开发按既定顺序进入 module registry；之后实现 `pipelinectl`，再开展后续整链和 `dada2rdma`。
+1. 冻结并复用已通过的 469-Station Full Power profile、source port、CPU/NUMA、preparation、ring/window 和 binary identity；不重复测试未变化的 ingest/unpack。
+2. 提交当前 Full Power 实现后，在独立分支 `codex/rdma-staged-copy-ablation` 执行 RDMA staged-copy 与 NSGE=2 direct placement 的匹配对照。
+3. 返回主开发分支继续 coherency/Stokes GPU-only/full 正式验收、论文决定性指标补齐和 module registry。
 
 具体可执行任务见
 [`docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md`](superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md)。
@@ -121,11 +125,10 @@
 
 ## 当前限制
 
-- 30 Gbps 正式重复证据覆盖 receive-only、receive+unpack，以及双 Station 小几何
-  `rdma2dada -> unpack -> pipeline_worker -> output -> dbnull` 完整链。
-- 当前 sender/controller 网络 fixture 只覆盖两个 Station；它能测试 aggregate payload 吞吐，
-  不能验证约 500 个 Station 的 A 轴映射。GPU-only 可使用 A≈500 的合成 compute blocks，
-  但这不是同一条完整链。
+- 约 30 Gbps 正式重复证据覆盖 receive-only、receive+unpack，以及 469-Station
+  `rdma2dada -> unpack -> pipeline_worker -> output -> dbnull` Full Power 完整链。
+- sender/controller 已支持两台物理 sender 按 235/234 Station 分片，并在完整链中验证
+  Station ID→A 轴映射；coherency/Stokes 的生产几何网络 fixture 尚待正式验收。
 - GPU worker 保留单 stream 同步 direct 基线，并新增有界多 stream staged 路径；worker
   在 transfer 生命周期注册整个 compute ring，H2D 直接读取 ring block，不再经过 pinned
   input staging。每个 slot 保留 pinned output，单 writer 等待逻辑 next sequence 完成后

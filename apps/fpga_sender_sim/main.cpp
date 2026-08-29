@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (config.schema_version == 2U) {
+    if (config.schema_version == 2U || config.schema_version == 3U) {
         rdma_dada::simulation::VdifSenderStats stats = {};
         if (!rdma_dada::simulation::RunUdpVdifSender(config, &stats, &error)) {
             std::cerr << "SEND_ERROR: " << error << '\n';

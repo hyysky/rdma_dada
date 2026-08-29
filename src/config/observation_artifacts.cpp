@@ -88,15 +88,6 @@ bool CheckedMultiply(std::uint64_t left, std::uint64_t right,
     return true;
 }
 
-std::string StationList(const std::vector<std::uint16_t>& stations) {
-    std::ostringstream output;
-    for (std::size_t index = 0; index < stations.size(); ++index) {
-        if (index != 0U) output << ',';
-        output << stations[index];
-    }
-    return output.str();
-}
-
 pipeline::Metadata BuildRawHeader(const ResolvedObservationPlan& plan,
                                   const PipelineConfig& config,
                                   const PipelineLayout& layout,
@@ -122,7 +113,6 @@ pipeline::Metadata BuildRawHeader(const ResolvedObservationPlan& plan,
     header.SetString("ORDER", "TFP");
     header.SetString("UTC_START", plan.source.utc_start);
     header.SetDouble("MJD_START", portable.mjd);
-    header.SetString("STATION_IDS", StationList(plan.source.station_ids));
     header.SetString("PACKET_FORMAT_ID", plan.wire.format_id);
     header.SetUint64("NANT", plan.nant);
     header.SetUint64("NCHAN", plan.source.nchan);

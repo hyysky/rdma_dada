@@ -167,6 +167,90 @@
         "suite_id": "full-30Gbps-60s-20260828T075032Z"
       },
       "promoted_utc": "2026-08-28T08:40:55Z"
+    },
+    {
+      "catalog_entry": {
+        "actual_payload_gbps": {
+          "maximum": 30.248563939,
+          "median": 30.248563937999997,
+          "minimum": 30.248563937
+        },
+        "cleanup_result": "PASS",
+        "configuration": {
+          "gpu_worker_cpu": 21,
+          "ingress_numa_node": null,
+          "numa_node": 1,
+          "processing_numa_node": null,
+          "receiver_poll_batch": 32,
+          "receiver_poll_cpu": 13,
+          "receiver_wr_num": 1024,
+          "reorder_horizon_groups": 416,
+          "rings": {
+            "compute": {
+              "block_bytes": 49946624,
+              "blocks": 8
+            },
+            "output": {
+              "block_bytes": 582400,
+              "blocks": 8
+            },
+            "raw": {
+              "block_bytes": 50336832,
+              "blocks": 16
+            }
+          },
+          "sink_cpu_list": "20",
+          "unpack_start_delay_seconds": 1,
+          "window_groups": null,
+          "worker_cpu_list": "14,15,16,17,18,19"
+        },
+        "duration_seconds": 60.0,
+        "first_failure": null,
+        "identity": {
+          "baseline_profile_id": null,
+          "baseline_profile_sha256": null,
+          "binary_sha256": {
+            "qths1:dada_db": "61b1a6a92f8f45b07fc760868aee59f683511ffa331ba80b62306466a7d5e1a4",
+            "qths1:dada_dbnull": "fbe083b4fdc775e0b3e4513c1c150a1e73e7475164beef83487823b8ba13bcbc",
+            "qths1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qths1:pipeline_worker": "05d6856515005eb17b31f49c411fb0f4cce65c175c82270612afb67402a91ca0",
+            "qths1:rdma2dada": "55f9aeb3942fb6493b790f86aa62bd7cf909c42796da7d19c037e9299224a152",
+            "qths1:vdif_unpack_worker": "30009b97263e801d94f277e9129ec089199146718af08539818a30ced5387e59",
+            "qtpulsar1:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar1:fpga_sender_sim": "c804811ccf1cbdfaf348940f42abda1239dd8629bb469920638399fa714bb821",
+            "qtpulsar2:ethtool": "7c04ff79c2ef3c0f72fcecd958203c8b407db7d68bbe76cbf890c1e9656d461c",
+            "qtpulsar2:fpga_sender_sim": "c804811ccf1cbdfaf348940f42abda1239dd8629bb469920638399fa714bb821"
+          },
+          "config_id": "9bd0f8383d3a94b2784a8bd107dcc9ffca189e32f0caf1d00bdca34f53996905",
+          "geometry_id": "957a6a22df0c04da55cb80f34dffaec86155416b1b0a21b5f2aea80370e80e9f",
+          "source_manifest_sha256": "3315fe380d29888ea9e4ce688de29073c0acbbdd27eaa1c4aebf0a9b17c1c132"
+        },
+        "measured_count": 3,
+        "modules": [
+          "rdma2dada",
+          "vdif_unpack_worker",
+          "pipeline_worker",
+          "dada_dbnull"
+        ],
+        "result_path": "suites/full-30.2505Gbps-60s-20260829T033639Z",
+        "started_utc": "2026-08-29T03:36:45.798289Z",
+        "suite_id": "full-30.2505Gbps-60s-20260829T033639Z",
+        "suite_manifest_sha256": "be0eedf37c48caef943efe2cb75b01652cb07b482115c27831f68fbe55625d74",
+        "summary_sha256": "5dfb42707c523d272dce60f8288308b56bda30f23acc194ea9afc5fc5a461882",
+        "target_payload_gbps": 30.2505,
+        "test_result": "PASS",
+        "test_topology": "full",
+        "warmup_count": 1
+      },
+      "origin": {
+        "imported_utc": "2026-08-29T04:38:45Z",
+        "remote_suite_root": "/home/user/wy/task8c-power-results/full-30.2505Gbps-60s-20260829T033639Z",
+        "schema_version": 1,
+        "source_host": "HF",
+        "source_manifest_sha256": "3315fe380d29888ea9e4ce688de29073c0acbbdd27eaa1c4aebf0a9b17c1c132",
+        "suite_id": "full-30.2505Gbps-60s-20260829T033639Z"
+      },
+      "promoted_utc": "2026-08-29T04:38:45Z"
     }
   ],
   "schema_version": 1

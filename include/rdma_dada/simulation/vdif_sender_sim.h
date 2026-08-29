@@ -17,6 +17,7 @@ struct VdifSenderSimConfig {
     std::uint16_t destination_port;
     std::uint32_t path_mtu;
     std::uint16_t station_id;
+    std::vector<std::uint16_t> station_ids;
     modules::vdif_unpack::ProjectVdifGeometry geometry;
     std::uint8_t reference_epoch;
     std::uint32_t start_seconds;
@@ -43,10 +44,32 @@ bool BuildVdifSenderHeader(
     modules::vdif_unpack::ProjectVdifHeader* header,
     std::string* error);
 
+bool BuildVdifSenderHeaderForStation(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    std::uint16_t station_id,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error);
+
+// Hot-path helper for VdifSenderBatch after Initialize has validated config and
+// Station membership. Other callers must use BuildVdifSenderHeaderForStation.
+bool BuildVdifSenderHeaderFromValidatedConfig(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    std::uint16_t station_id,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error);
+
 bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
                            std::uint64_t group_index,
                            std::vector<std::uint8_t>* record,
                            std::string* error);
+
+bool BuildVdifSenderRecordForStation(const VdifSenderSimConfig& config,
+                                     std::uint64_t group_index,
+                                     std::uint16_t station_id,
+                                     std::vector<std::uint8_t>* record,
+                                     std::string* error);
 
 }  // namespace simulation
 }  // namespace rdma_dada

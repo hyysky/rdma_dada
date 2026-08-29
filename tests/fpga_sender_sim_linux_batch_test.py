@@ -34,10 +34,11 @@ def main() -> int:
         receiver.settimeout(4.0)
         destination_port = receiver.getsockname()[1]
         config = json.loads(source_config.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
         config["source"]["port"] = source_port
         config["destination"]["port"] = destination_port
-        config["station"]["station_id"] = 777
-        config["time"]["group_count"] = 64
+        config["station"] = {"station_ids": [777, 778, 779, 780]}
+        config["time"]["group_count"] = 16
         config["time"]["start_utc"] = (
             datetime.now(timezone.utc) + timedelta(seconds=1)
         ).strftime("%Y-%m-%d-%H:%M:%S")
@@ -69,8 +70,12 @@ def main() -> int:
         fail("Linux batch sender did not use the configured source port")
     stations = [struct.unpack_from("<I", packet, 12)[0] & 0xFFFF
                 for packet, _ in received]
-    if stations != [777] * 64:
-        fail(f"Linux batch sender corrupted Station IDs: {stations[:8]}")
+    expected = []
+    configured = [777, 778, 779, 780]
+    for group in range(16):
+        expected.extend(configured[group % 4:] + configured[:group % 4])
+    if stations != expected:
+        fail(f"Linux multi-Station batch order is incorrect: {stations[:12]}")
 
     lines = [line for line in stdout.splitlines() if line.strip()]
     try:
@@ -81,6 +86,10 @@ def main() -> int:
         fail(f"Linux sender did not use sendmmsg: {summary}")
     if summary["sent_packets"] != 64 or summary["failed_packets"] != 0:
         fail(f"Linux batch counters do not reconcile: {summary}")
+    if summary.get("station_ids") != configured:
+        fail(f"Linux batch summary lost Station IDs: {summary}")
+    if [item["sent_packets"] for item in summary.get("station_counts", [])] != [16] * 4:
+        fail(f"Linux batch per-Station counts do not close: {summary}")
     if summary["batches"] != 4 or summary["batch_packets"] != 16:
         fail(f"Linux batch geometry is incorrect: {summary}")
 

@@ -539,7 +539,8 @@ if(BUILD_TESTING)
         add_test(
             NAME gpu_pressure_fixture_test
             COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_pressure_fixture_test.py)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_pressure_fixture_test.py
+                    $<TARGET_FILE:observation_config_compile>)
         add_test(
             NAME task8c_rate_point_test
             COMMAND ${Python3_EXECUTABLE}

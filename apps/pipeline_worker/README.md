@@ -78,6 +78,9 @@ Stokes 还要求 `NPOL=2`、`POL_LABELS=<label0>,<label1>`。可选的
 `TRANSFER_SIZE`、`FILE_SIZE` 和 `OBS_OFFSET` 如果存在，必须对一个完整 TFPA 时间帧
 对齐；输出 header 按输入/输出 frame byte 比例缩放这些字段。启用积分时还必须有正数
 有限值 `TSAMP`；所有上述 byte count 在产品变换和除以积分长度 `K` 时都必须能精确表示。
+`TRANSFER_SIZE` 用于严格几何和输出字节规划；PSRDADA reader 本身始终读取到 compute
+ring 的 EOD。这样当有限观测恰好结束于完整 block 边界时，不会因 reader 先达到声明
+字节数、producer 后发布 EOD 而误开一个带非零 `OBS_OFFSET` 的伪 continuation transfer。
 
 ## 单一配置入口
 

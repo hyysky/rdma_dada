@@ -119,6 +119,34 @@ compute_block_bytes = records_per_block * packet_payload_bytes
 - `payload_mode` 为 `REPEAT_TEMPLATE` 或 `DETERMINISTIC`；
 - 所有 Station 等速，控制端不支持权重或单 Station override。
 
+Task 8C controller 对多 Station Observation 生成 schema v3 配置，不另存一份手工示例：
+
+- `station.station_ids` 是 Observation 中 Station ID 的有序、非空、无重复子集；
+- qtpulsar1/2 各使用一个固定 source IP/port 和一个 socket；
+- `time.group_count` 是时间组数，总 record 数为 `group_count × station_ids.size()`；
+- 组内发送全部本机 Station，下一组轮换起始 Station；
+- `transmit.target_gbps` 仍是完整 VDIF record（32-byte header + data）的速率，不是
+  仅天文采样 data 的速率。
+
+版本化多 Station 网络测试输入位于：
+
+- `testing/multi-station-sender-small.json`：`A=4,F=4,P=1`，每个 F 为 1 MHz，
+  用于低速 warm-up+3 流程验收；
+- `testing/multi-station-sender-production.json`：`A=469,F=4,P=1`，每个 F 为
+  1 MHz，仅用于 sender/receive/unpack 压力计划；GPU `B=350` 权重仍由
+  `generate_gpu_pressure_fixture.py` 独立生成。该生成器同时产出
+  `STAGED_PIPELINE/3` 的 Beamform→Power→MEAN Integration（K=128）Full
+  Observation，供生产几何完整链测试使用，不改变 sender/unpack 配置。
+
+生产几何的天文采样 payload 为 30.016 Gbps；计入每个 packet 的 32-byte VDIF
+header 后，sender 的 UDP datagram payload 目标为 30.2505 Gbps。controller 以后者
+调度与验收，结果同时记录两种口径，禁止互换。
+
+完整 `station_ids` 只保存在 Observation/Resolved Plan 中：sender 用它分片，unpack
+用它建立 Station ID→ATFP A 轴映射。映射完成后的 ring header 不重复保存
+`STATION_IDS`，只保存 `NANT` 和配置/几何身份；因此固定 4096-byte header 不随阵元数
+线性膨胀。
+
 IPv4 UDP record 必须满足：
 
 ```text

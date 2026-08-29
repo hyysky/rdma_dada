@@ -91,6 +91,32 @@ bool UintField(const json::Value::Object& object, const char* key,
     return ParseUnsignedText(key, value.text(), result, error);
 }
 
+bool StationListField(const json::Value::Object& object, const char* key,
+                      std::vector<std::uint16_t>* result,
+                      std::string* error) {
+    const json::Value& value = object.find(key)->second;
+    if (value.type() != json::Value::kArray || value.array().empty())
+        return Fail(std::string(key) + " must be a non-empty array", error);
+    std::vector<std::uint16_t> parsed;
+    std::set<std::uint16_t> unique;
+    for (std::size_t index = 0; index < value.array().size(); ++index) {
+        const json::Value& entry = value.array()[index];
+        if (entry.type() != json::Value::kNumber ||
+            entry.text().find_first_of(".eE-") != std::string::npos)
+            return Fail(std::string(key) + " entries must be integers", error);
+        std::uint64_t station = 0;
+        if (!ParseUnsignedText(key, entry.text(), &station, error)) return false;
+        if (station > 65535U)
+            return Fail(std::string(key) + " entry exceeds uint16 range", error);
+        const std::uint16_t narrowed = static_cast<std::uint16_t>(station);
+        if (!unique.insert(narrowed).second)
+            return Fail(std::string(key) + " contains a duplicate", error);
+        parsed.push_back(narrowed);
+    }
+    *result = parsed;
+    return true;
+}
+
 bool PositiveGbpsField(const json::Value::Object& object, const char* key,
                        std::uint64_t* result, std::string* error) {
     const json::Value& value = object.find(key)->second;
@@ -155,7 +181,7 @@ bool Contains(const std::vector<std::uint64_t>& values, std::uint64_t value) {
 }
 
 bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
-    if (config.schema_version == 2U) {
+    if (config.schema_version == 2U || config.schema_version == 3U) {
         in_addr source = {};
         if (config.source_ip.empty() ||
             inet_pton(AF_INET, config.source_ip.c_str(), &source) != 1 ||
@@ -165,7 +191,7 @@ bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
         if (config.source_port == 0)
             return Fail("source port must be positive", error);
         if (config.mode != "PACED")
-            return Fail("schema v2 mode must be PACED", error);
+            return Fail("paced schema mode must be PACED", error);
         if (config.start_utc.empty())
             return Fail("PACED mode requires start_utc", error);
         if (config.target_payload_bits_per_second == 0)
@@ -176,6 +202,14 @@ bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
             config.payload_mode != "REPEAT_TEMPLATE")
             return Fail("payload_mode must be DETERMINISTIC or REPEAT_TEMPLATE",
                         error);
+    }
+    if (config.schema_version == 3U) {
+        if (config.station_ids.empty())
+            return Fail("schema v3 station_ids must not be empty", error);
+        const std::set<std::uint16_t> stations(config.station_ids.begin(),
+                                                config.station_ids.end());
+        if (stations.size() != config.station_ids.size())
+            return Fail("schema v3 station_ids contains a duplicate", error);
     }
     if (config.destination_ip.empty()) return Fail("destination IP must not be empty", error);
     if (config.destination_port == 0) return Fail("destination port must be positive", error);
@@ -191,7 +225,7 @@ bool ValidateConfig(const VdifSenderSimConfig& config, std::string* error) {
         return Fail("sample interval and group count must be positive", error);
     if (config.groups_per_second > 0x1000000U)
         return Fail("groups_per_second exceeds VDIF frame range", error);
-    if (config.schema_version != 2U &&
+    if (config.schema_version != 2U && config.schema_version != 3U &&
         config.mode != "BURST" && config.mode != "REALTIME")
         return Fail("schema v1 mode must be BURST or REALTIME", error);
     if (config.mode == "REALTIME" && config.start_utc.empty())
@@ -269,8 +303,8 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         return Fail("root is missing: schema_version", error);
     std::uint64_t schema = 0;
     if (!UintField(object, "schema_version", &schema, error) ||
-        (schema != 1U && schema != 2U))
-        return Fail("schema_version must be 1 or 2", error);
+        (schema != 1U && schema != 2U && schema != 3U))
+        return Fail("schema_version must be 1, 2 or 3", error);
     static const char* const root_keys_v2[] = {
         "schema_version", "source", "destination", "station", "packet",
         "time", "transmit", "faults"
@@ -283,7 +317,7 @@ bool LoadVdifSenderSimConfig(const std::string& path,
 
     const json::Value::Object *source = NULL, *transmit = NULL;
     const json::Value::Object *destination, *station, *packet, *time, *faults;
-    if (schema == 2U &&
+    if ((schema == 2U || schema == 3U) &&
         (!ObjectField(object, "source", &source, error) ||
          !ObjectField(object, "transmit", &transmit, error))) return false;
     if (!ObjectField(object, "destination", &destination, error) ||
@@ -293,6 +327,7 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         !ObjectField(object, "faults", &faults, error)) return false;
     static const char* const destination_keys[] = {"ip", "port", "path_mtu"};
     static const char* const station_keys[] = {"station_id"};
+    static const char* const station_keys_v3[] = {"station_ids"};
     static const char* const packet_keys[] = {
         "first_channel_id", "nchan", "npol", "nsamp_per_packet",
         "component_bits", "sample_interval_ps"
@@ -311,11 +346,13 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     static const char* const transmit_keys[] = {
         "target_gbps", "batch_packets", "payload_mode"
     };
-    if ((schema == 2U &&
+    if (((schema == 2U || schema == 3U) &&
          (!ExactKeys(*source, source_keys, 2, "source", error) ||
           !ExactKeys(*transmit, transmit_keys, 3, "transmit", error))) ||
         !ExactKeys(*destination, destination_keys, 3, "destination", error) ||
-        !ExactKeys(*station, station_keys, 1, "station", error) ||
+        !(schema == 3U
+              ? ExactKeys(*station, station_keys_v3, 1, "station", error)
+              : ExactKeys(*station, station_keys, 1, "station", error)) ||
         !ExactKeys(*packet, packet_keys, 6, "packet", error) ||
         !(time->count("groups_per_second")
               ? ExactKeys(*time, fixed_time_keys, 6, "time", error)
@@ -330,7 +367,7 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     std::uint64_t nsamp, component_bits, epoch, start_seconds;
     std::uint64_t source_port = 0, batch_packets = 0;
     std::string interval;
-    if (schema == 2U &&
+    if ((schema == 2U || schema == 3U) &&
         (!StringField(*source, "ip", &parsed.source_ip, error) ||
          !UintField(*source, "port", &source_port, error) ||
          !PositiveGbpsField(*transmit, "target_gbps",
@@ -341,7 +378,6 @@ bool LoadVdifSenderSimConfig(const std::string& path,
     if (!StringField(*destination, "ip", &parsed.destination_ip, error) ||
         !UintField(*destination, "port", &port, error) ||
         !UintField(*destination, "path_mtu", &mtu, error) ||
-        !UintField(*station, "station_id", &station_id, error) ||
         !UintField(*packet, "first_channel_id", &first_channel, error) ||
         !UintField(*packet, "nchan", &nchan, error) ||
         !UintField(*packet, "npol", &npol, error) ||
@@ -353,6 +389,15 @@ bool LoadVdifSenderSimConfig(const std::string& path,
         !UintField(*time, "group_count", &parsed.group_count, error) ||
         !StringField(*time, "mode", &parsed.mode, error) ||
         !StringField(*time, "start_utc", &parsed.start_utc, error)) return false;
+    if (schema == 3U) {
+        if (!StationListField(*station, "station_ids", &parsed.station_ids,
+                              error)) return false;
+        station_id = parsed.station_ids.front();
+    } else {
+        if (!UintField(*station, "station_id", &station_id, error)) return false;
+        if (station_id <= 65535U)
+            parsed.station_ids.push_back(static_cast<std::uint16_t>(station_id));
+    }
     if (time->count("groups_per_second") &&
         !UintField(*time, "groups_per_second", &parsed.groups_per_second,
                    error)) return false;
@@ -400,8 +445,33 @@ bool BuildVdifSenderHeader(
     std::uint64_t group_index,
     modules::vdif_unpack::ProjectVdifHeader* header,
     std::string* error) {
+    return BuildVdifSenderHeaderForStation(
+        config, group_index, config.station_id, header, error);
+}
+
+bool BuildVdifSenderHeaderForStation(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    std::uint16_t station_id,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error) {
     if (!header) return Fail("header output pointer is null", error);
     if (!ValidateConfig(config, error)) return false;
+    if (config.schema_version == 3U &&
+        std::find(config.station_ids.begin(), config.station_ids.end(),
+                  station_id) == config.station_ids.end())
+        return Fail("station_id is absent from configured station_ids", error);
+    return BuildVdifSenderHeaderFromValidatedConfig(
+        config, group_index, station_id, header, error);
+}
+
+bool BuildVdifSenderHeaderFromValidatedConfig(
+    const VdifSenderSimConfig& config,
+    std::uint64_t group_index,
+    std::uint16_t station_id,
+    modules::vdif_unpack::ProjectVdifHeader* header,
+    std::string* error) {
+    if (!header) return Fail("header output pointer is null", error);
     if (group_index >= config.group_count)
         return Fail("group index is outside group_count", error);
     std::uint64_t second_offset = 0;
@@ -427,7 +497,7 @@ bool BuildVdifSenderHeader(
         config.start_seconds + second_offset);
     result.reference_epoch = config.reference_epoch;
     result.frame_number_within_second = static_cast<std::uint32_t>(frame);
-    result.station_id = config.station_id;
+    result.station_id = station_id;
     result.first_channel_id = config.geometry.first_channel_id;
     result.nchan = config.geometry.nchan;
     result.npol = config.geometry.npol;
@@ -443,9 +513,19 @@ bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
                            std::uint64_t group_index,
                            std::vector<std::uint8_t>* record,
                            std::string* error) {
+    return BuildVdifSenderRecordForStation(
+        config, group_index, config.station_id, record, error);
+}
+
+bool BuildVdifSenderRecordForStation(const VdifSenderSimConfig& config,
+                                     std::uint64_t group_index,
+                                     std::uint16_t station_id,
+                                     std::vector<std::uint8_t>* record,
+                                     std::string* error) {
     if (!record) return Fail("record output pointer is null", error);
     modules::vdif_unpack::ProjectVdifHeader header = {};
-    if (!BuildVdifSenderHeader(config, group_index, &header, error)) return false;
+    if (!BuildVdifSenderHeaderForStation(
+            config, group_index, station_id, &header, error)) return false;
 
     std::vector<std::uint8_t> result(static_cast<std::size_t>(
         32U + config.geometry.payload_bytes), 0);
@@ -458,7 +538,7 @@ bool BuildVdifSenderRecord(const VdifSenderSimConfig& config,
             for (std::uint32_t p = 0; p < config.geometry.npol; ++p) {
                 for (std::uint32_t component = 0; component < 2; ++component) {
                     const std::uint64_t value =
-                        (config.station_id + (group_index % (mask + 1U)) * 7U +
+                        (station_id + (group_index % (mask + 1U)) * 7U +
                          (t % (mask + 1U)) * 3U + (f % (mask + 1U)) * 5U +
                          (p % (mask + 1U)) * 11U + component) & mask;
                     result[offset++] = static_cast<std::uint8_t>(value & 0xffU);

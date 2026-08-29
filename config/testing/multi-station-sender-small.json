@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "observation": {
+    "observation_id": "multi-station-sender-small-a4-f4-p1",
+    "utc_start": "2026-08-28-00:00:00",
+    "duration_seconds": "10.000384",
+    "station_ids": [
+      1000,
+      1001,
+      1002,
+      1003
+    ],
+    "first_channel_id": 100,
+    "nchan": 4,
+    "npol": 1,
+    "sample_interval_ps": 1000000
+  },
+  "metadata": {
+    "telescope": "CA",
+    "bandwidth_hz": 4000000,
+    "center_frequency_hz": 1250000000
+  },
+  "wire": {
+    "profile": "../packet_formats/frontend.example-v1.json",
+    "samples_per_packet": 512
+  },
+  "blocks": {
+    "groups_per_block": 3200,
+    "raw_ring_blocks": 16,
+    "compute_ring_blocks": 8,
+    "window_blocks": 4
+  },
+  "rings": {
+    "raw_key": "0x00d2",
+    "compute_key": "0x00d4",
+    "output_key": "0x00d6"
+  },
+  "storage": {
+    "enabled": false,
+    "blocks_per_file": 0,
+    "direct_io": false
+  },
+  "receiver": {
+    "device": "mlx5_0",
+    "destination_mac": "98:03:9b:aa:99:d8",
+    "destination_ip": "174.0.1.111",
+    "destination_port": 1000
+  },
+  "processing": {
+    "backend": "CUDA",
+    "cuda_device": 0,
+    "run_once": true,
+    "conversion": {
+      "scale": "0.0078125"
+    },
+    "output": {
+      "sample_format": "AUTO"
+    },
+    "modules": []
+  }
+}

@@ -506,6 +506,14 @@ int OpenTransfer(dada_client_t* client) {
     runtime->staged_pipeline_active = false;
     runtime->next_input_sequence = 0U;
     runtime->metrics.Reset();
+    // Keep fallback metrics truthful when transfer setup fails before the
+    // staged executor owns the authoritative metrics object.  Zero planned
+    // byte counts mean setup did not reach the allocation/configuration gate;
+    // they must not make the requested execution mode look like direct/1.
+    runtime->metrics.ConfigureExecution(
+        rdma_dada::CudaPipelineModeName(
+            runtime->config.cuda_pipeline_mode),
+        runtime->config.cuda_inflight_blocks, 0U, 0U);
     if (runtime->input_cuda_registered) {
         runtime->metrics.RecordInputRingRegistration(
             runtime->registered_ring_blocks,
@@ -888,7 +896,15 @@ int OpenTransfer(dada_client_t* client) {
             return -1;
         }
 
-        client->transfer_bytes = transfer_size;
+        // TRANSFER_SIZE is a strict observation contract and is used above to
+        // validate/plan the output geometry.  It must not be used as the
+        // PSRDADA reader stop limit: when a finite transfer ends on an exact
+        // full-block boundary, the consumer can reach that byte count before
+        // the producer publishes EOD.  dada_client_read then opens a spurious
+        // continuation transfer with an incremented OBS_OFFSET.  Reading to
+        // ring EOD keeps the complete finite observation in one transfer and
+        // matches the upstream unpack worker's publication contract.
+        client->transfer_bytes = 0U;
         client->optimal_bytes = runtime->input_block_capacity;
         client->header_transfer = 0;
         multilog(runtime->log, LOG_INFO,

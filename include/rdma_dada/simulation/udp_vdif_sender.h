@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rdma_dada {
 namespace simulation {
@@ -21,6 +22,9 @@ struct VdifSenderStats {
     std::uint64_t batches;
     std::uint64_t short_batches;
     std::uint64_t overrun_batches;
+    std::vector<std::uint16_t> station_ids;
+    std::vector<std::uint64_t> station_scheduled_packets;
+    std::vector<std::uint64_t> station_sent_packets;
     std::string backend;
     std::string payload_prefix_hex;
 };

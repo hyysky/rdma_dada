@@ -199,8 +199,9 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
                       std::string* error) {
     if (!stats) return Fail("sender statistics pointer is null", error);
     *stats = VdifSenderStats();
-    if (config.schema_version != 2U || config.mode != "PACED")
-        return Fail("paced UDP runtime requires schema v2 PACED config", error);
+    if ((config.schema_version != 2U && config.schema_version != 3U) ||
+        config.mode != "PACED")
+        return Fail("paced UDP runtime requires schema v2/v3 PACED config", error);
     if (!config.drop_groups.empty() || !config.duplicate_groups.empty() ||
         !config.invalid_header_groups.empty())
         return Fail("paced all-valid runtime does not accept fault lists", error);
@@ -261,7 +262,21 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
         config.target_payload_bits_per_second, start_ns
     };
     stats->pacing_start_monotonic_ns = start_ns;
-    stats->scheduled_packets = config.group_count;
+    const std::vector<std::uint16_t> stations =
+        config.schema_version == 3U
+            ? config.station_ids
+            : std::vector<std::uint16_t>(1U, config.station_id);
+    if (stations.empty() ||
+        config.group_count > std::numeric_limits<std::uint64_t>::max() /
+                                 stations.size())
+        return Fail("scheduled multi-Station packet count exceeds uint64 range",
+                    error);
+    const std::uint64_t scheduled_packets =
+        config.group_count * stations.size();
+    stats->scheduled_packets = scheduled_packets;
+    stats->station_ids = stations;
+    stats->station_scheduled_packets.assign(stations.size(), config.group_count);
+    stats->station_sent_packets.assign(stations.size(), 0U);
 #if defined(__linux__)
     stats->backend = "SENDMMSG";
     std::vector<iovec> vectors(batch.capacity());
@@ -270,10 +285,10 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
     stats->backend = "SEND";
 #endif
 
-    std::uint64_t first_group = 0;
+    std::uint64_t first_packet = 0;
     std::uint64_t cumulative_bytes = 0;
-    while (first_group < config.group_count) {
-        const std::uint64_t remaining = config.group_count - first_group;
+    while (first_packet < scheduled_packets) {
+        const std::uint64_t remaining = scheduled_packets - first_packet;
         const std::uint32_t count = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(remaining, batch.capacity()));
         std::uint64_t deadline = 0;
@@ -281,9 +296,9 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
                                       &deadline, error)) return false;
         bool overrun = false;
         if (!WaitUntilMonotonic(deadline, &overrun, error)) return false;
-        if (overrun && first_group != 0) ++stats->overrun_batches;
-        if (!batch.Prepare(first_group, count, error)) return false;
-        if (first_group == 0 &&
+        if (overrun && first_packet != 0) ++stats->overrun_batches;
+        if (!batch.Prepare(first_packet, count, error)) return false;
+        if (first_packet == 0 &&
             !MonotonicNowNs(&stats->first_send_monotonic_ns, error))
             return false;
 #if defined(__linux__)
@@ -300,7 +315,7 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
             }
         }
 #endif
-        if (first_group + count == config.group_count &&
+        if (first_packet + count == scheduled_packets &&
             !MonotonicNowNs(&stats->last_send_monotonic_ns, error))
             return false;
         ++stats->batches;
@@ -312,9 +327,13 @@ bool RunUdpVdifSender(const VdifSenderSimConfig& config,
                 return Fail("sent payload byte counter exceeds uint64 range",
                             error);
             cumulative_bytes += batch.packet(i).bytes;
+            const std::uint32_t station_index = batch.packet(i).station_index;
+            if (station_index >= stats->station_sent_packets.size())
+                return Fail("batch emitted an invalid Station index", error);
+            ++stats->station_sent_packets[station_index];
         }
         stats->payload_bytes = cumulative_bytes;
-        first_group += count;
+        first_packet += count;
     }
     std::uint64_t completion_deadline = 0;
     if (!ComputePayloadDeadlineNs(rate_plan, cumulative_bytes,
@@ -340,9 +359,27 @@ std::string FormatVdifSenderStatsJson(const VdifSenderSimConfig& config,
         static_cast<double>(stats.sent_packets) * 1e9 /
             static_cast<double>(stats.elapsed_ns);
     std::ostringstream output;
-    output << '{'
-           << "\"station_id\":" << config.station_id << ','
-           << "\"source_ip\":\"" << config.source_ip << "\","
+    output << '{';
+    if (config.schema_version == 3U) {
+        output << "\"station_ids\":[";
+        for (std::size_t index = 0; index < stats.station_ids.size(); ++index) {
+            if (index) output << ',';
+            output << stats.station_ids[index];
+        }
+        output << "],\"station_counts\":[";
+        for (std::size_t index = 0; index < stats.station_ids.size(); ++index) {
+            if (index) output << ',';
+            output << "{\"station_id\":" << stats.station_ids[index]
+                   << ",\"scheduled_packets\":"
+                   << stats.station_scheduled_packets[index]
+                   << ",\"sent_packets\":"
+                   << stats.station_sent_packets[index] << '}';
+        }
+        output << "],";
+    } else {
+        output << "\"station_id\":" << config.station_id << ',';
+    }
+    output << "\"source_ip\":\"" << config.source_ip << "\","
            << "\"source_port\":" << config.source_port << ','
            << "\"destination_ip\":\"" << config.destination_ip << "\","
            << "\"destination_port\":" << config.destination_port << ','

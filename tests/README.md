@@ -56,14 +56,14 @@ ctest --test-dir build-linux --output-on-failure
 | `vdif_atfp_engine_test` | `vdif_atfp_engine_test.cpp` | 校验固定环形 slot、直接 Station lookup、每包单次 payload memcpy、ATFP block view、多 Station 最小 watermark、领先 Station 不淘汰落后数据、完全缺失/部分缺失补零、large gap、Station skew/raw-block 组成统计、wrap/partial EOD 及与旧 TFPA reference 的等价性 | `BUILD_TESTING=ON` |
 | `atfp_block_writer_test` | `atfp_block_writer_test.cpp` | 验证每个 compute block 只 Acquire/Commit 一次、每个 A 平面无回绕一次复制/回绕最多两段复制、partial block 紧凑布局及 sink 失败路径 | `BUILD_TESTING=ON` |
 | `group_block_writer_test` | `group_block_writer_test.cpp` | 用内存 block sink 验证有序 group 直接填充满 block、EOD 精确提交部分 block、空传输不提交，以及 group/sink 容量错误不发布数据 | `BUILD_TESTING=ON` |
-| `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 schema v1/v2 sender JSON、显式 source、PACED/batch/payload mode、整数皮秒跨秒/frame 重置、双 Station、CI8/CI16、MTU 和 fault | `BUILD_TESTING=ON` |
+| `vdif_sender_sim_test` | `vdif_sender_sim_test.cpp` | 校验严格 schema v1/v2/v3 sender JSON、单/多 Station、显式 source、PACED/batch/payload mode、整数皮秒跨秒/frame 重置、CI8/CI16、MTU 和 fault | `BUILD_TESTING=ON` |
 | `vdif_sender_rate_test` | `vdif_sender_rate_test.cpp` | 校验等速 Station 整数分配、固定点累计字节 deadline、零值和 uint64 overflow | `BUILD_TESTING=ON` |
-| `vdif_sender_batch_test` | `vdif_sender_batch_test.cpp` | 校验固定 packet pool 地址、连续 header、Station 模板、repeat payload 和 deterministic reference 一致性 | `BUILD_TESTING=ON` |
+| `vdif_sender_batch_test` | `vdif_sender_batch_test.cpp` | 校验固定 packet pool 地址、连续 header、Station 模板、按时间组轮换 Station、O(1) Station 索引、repeat payload 和 deterministic reference 一致性 | `BUILD_TESTING=ON` |
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
-| `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault 行为，以及 schema v2 显式 source port、PACED、repeat payload、统计和约 1 秒窗口 ±2% rate | 找到 Python 3 |
-| `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 64 packet、16-packet batch、显式 source port、Station ID、计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
+| `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault、schema v2 单 Station PACED，以及 schema v3 单 socket/固定 source port 多 Station 轮换顺序与逐 Station 统计 | 找到 Python 3 |
+| `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 4 Station/64 packet、16-packet batch、固定 source port、轮换顺序、逐 Station 计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
 | `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用 `dada_junkdb` 按任意目标 payload 速率向上取整为整 compute blocks/s，严格核对逐 block 输入/输出；并覆盖基线漂移、preflight、进程账本、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
-| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 `A=469,F=4,P=1,B=350` 的 Observation JSON 与确定性 FPAB2 int8 NPY 权重 | 找到 Python 3；不连接远端服务器 |
+| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 `A=469,F=4,P=1,B=350` 的 `STAGED_PIPELINE/3` Beamform→Power→MEAN Integration（K=128）Observation 与确定性 FPAB2 int8 NPY 权重；使用配置编译器实际写出五个 4096-byte stage headers，核对其不重复 `STATION_IDS`、保留 `NANT=469`，并检查各级 block bytes、582,400-byte output block、受管的 sender/unpack 配置及双速率口径 | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
 | `task8c_profiles_test` | `task8c_profiles_test.py` | 验证 passing profile 严格 schema、原文件 SHA、默认填充、显式覆盖和逐字段 drift | 找到 Python 3 |
 | `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
 | `task8c_catalog_test` | `task8c_catalog_test.py` | 验证 compact suite 的严格 manifest/路径检查、原子导入、确定性 JSON/CSV Catalog、选择性查询和显式证据提升 | 找到 Python 3；不访问网络或 Git |
@@ -234,7 +234,7 @@ ctest --test-dir build \
 loopback 测试使用操作系统分配的临时端口，不依赖固定端口或外部网络；若执行环境禁止
 创建本地 socket，需要为该测试开放 `127.0.0.1` 回环权限。
 
-### Task 8C 双 Station 速率点
+### Task 8C 多 Station 速率点
 
 控制器自测不访问远端服务器：
 
@@ -284,17 +284,20 @@ suite 根目录只保留 `observation.json`、`resolved_observation.json`、`pre
 `summary.json` 和 `MANIFEST.sha256`。每轮在 `runs/` 下保留一个包含进程参数、状态、
 统计、结果与清理的 `<run-id>.json`，以及一个只含原始summary/EOD/error/cleanup行的
 `<run-id>.evidence.log`；失败轮额外保留首错的 `debug/<run-id>/`。bundle、PID/ready、
-重复配置和完整progress日志在收口后删除。`summary.json` 汇总三次实测速率的
+其中 GPU/full 失败若已生成 `pipeline-worker.log`，会在 debug 目录保留该日志，避免
+transfer-open 首错被后续统计校验错误覆盖。bundle、PID/ready、重复配置和完整progress
+日志在收口后删除。`summary.json` 汇总三次实测速率的
 median/minimum/maximum/spread。只有四次运行清理均完成、三次 measured 均为 `PASS`
 且 summary 为 `PASS`，该速率点才通过。
 如果 warm-up 或任一 measured run 的测试结果或清理结果失败，suite 会立即停止，且不会
 创建后续 run 的进程、ring 或结果目录。
-任一 Station 无法启动或提前异常退出时，控制器会立即终止另一 Station，并停止
-receiver、unpack 和 consumer；不会把单 Station 数据当作有效观测继续处理。
-每个 run 从其唯一 ID 确定性生成一对不同的 UDP source port，并在创建 qths1 rings 前
-分别到 qtpulsar1/2 探测 source IP/port 是否可绑定。端口已占用会以 `ENV_BLOCKED`
-停止本轮，不会误报为算法或吞吐失败，也不会重复使用固定 `41001/42001` 与其他任务
-争抢。
+任一物理 sender 无法启动或提前异常退出时，控制器会立即终止另一 sender，并停止
+receiver、unpack 和 consumer；不会把部分 Station 数据当作有效观测继续处理。一个
+Station 的诊断仍使用一个 sender；两个或更多 Station 时，控制器把 Observation 有序列表
+确定性拆成 qtpulsar1 的 `ceil(N/2)` 和 qtpulsar2 的 `floor(N/2)`，每台只启动一个
+schema-v3 sender/socket。passing profile 固定两端 source port；创建 qths1 rings 前分别
+探测 source IP/port 是否可绑定。端口已占用会以 `ENV_BLOCKED` 停止，不会误报算法或
+吞吐失败。
 
 1 Gbps correctness gate 保持默认 `--compute-consumer dbdisk`，以检查实际 `.dada` 文件。
 后续高速 rate point 使用：
@@ -359,12 +362,12 @@ PASS 证据生成；仓库尚无 GPU accepted profile 时，只允许显式
 bootstrap 与后续 accepted GPU profile 都必须显式设置 `--gpu-worker-cpu`、
 `--sink-cpu-list` 和 `--numa-node`；profile 会在创建 ring 前恢复并核对这些值。
 
-生产几何 GPU 压力使用约 `A=500,F=4,P=1,B=350` 的 Observation、ATFP block 和 FPAB
-权重。正式约 30 Gbps fixture 可取 `A=469,F=4`，并把 `A=500,F=4` 记录为约 32 Gbps
-压力点。该测试真实执行相应的 Convert/Beamform/产品和 H2D/D2H，但输入来自
-`dada_junkdb`，所以只验收 GPU 计算资源和 compute/output ring 稳态。现有双 Station
-sender 继续用于 receive/unpack aggregate-rate 测试；两类结果不得合并成
-“500-Station full PASS”。
+生产几何 fixture 使用 `A=469,F=4,P=1,B=350` 的 Observation、ATFP block 和 FPAB
+权重，模块链为 Convert/Transpose→Beamform→Power→MEAN Integration（K=128），CUDA
+执行模式为 `STAGED_PIPELINE/3`。每 block 的输入 T=13,312，可被 K 整除，积分后
+T=104，output block 为 582,400 bytes。该 fixture 可用于 GPU-only 压力，也可与版本化
+多 Station sender 组合成 Full 测试；只有后者完成 sender→output 全计数闭合后才称为
+生产几何完整链 PASS。
 
 ### 紧凑结果 Catalog
 

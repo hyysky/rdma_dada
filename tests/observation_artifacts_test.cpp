@@ -119,7 +119,8 @@ int main(int argc, char** argv) {
     ExpectText(raw, "ORDER", "TFP");
     ExpectText(raw, "UTC_START", "2026-08-08-00:00:00");
     ExpectDouble(raw, "MJD_START", 61260.0);
-    ExpectText(raw, "STATION_IDS", "101,102");
+    Expect(!raw.Has("STATION_IDS"),
+           "ring headers do not duplicate the resolved Station map");
     ExpectUint(raw, "BANDWIDTH_HZ", 300000000U);
     ExpectUint(raw, "CENTER_FREQUENCY_HZ", 1250000000U);
     ExpectUint(raw, "NANT", 2U);

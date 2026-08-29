@@ -1,6 +1,6 @@
 # Pipeline development plan
 
-更新日期：2026-08-28
+更新日期：2026-08-29
 
 本文记录当前里程碑、进入条件和开发顺序。模块轴、数值及 header 契约以
 [`ALGORITHM_MODULE_CONTRACTS.md`](ALGORITHM_MODULE_CONTRACTS.md) 为准；实时性能要求和
@@ -21,11 +21,13 @@
 - 四阶段版本化控制器，以及 0.1 Gbps full-stage 正确性验收；
 - compute-ring CUDA 直接注册、三 slot staged pipeline、有序单 writer 和 active throughput
   指标；
-- 双 Station 小几何 30 Gbps full-stage、60 秒、1 warm-up + 3 measured 正式门禁。
+- 生产几何 `A=469,F=4,P=1,B=350` Full Power、约 30 Gbps、60 秒、
+  1 warm-up + 3 measured 正式门禁。
 
-receive-only、receive+unpack 与双 Station 小几何完整 GPU pipeline 均已完成 30 Gbps、
-60 秒、1 warm-up + 3 measured 的正式重复门禁。GPU-only 生产几何压力暂缓，当前结果
-不外推到约 500 Station、多 GPU 或额外 headroom。
+receive-only、receive+unpack 与 469-Station Full Power GPU pipeline 均已完成约 30 Gbps、
+60 秒、1 warm-up + 3 measured 的正式重复门禁。权威 Power suite 为
+`full-30.2505Gbps-60s-20260829T033639Z`。GPU-only 生产几何压力暂缓，当前结果不外推到
+coherency/Stokes、多 GPU 或额外 headroom。
 
 ## 所有模块的输入输出门禁
 
@@ -86,7 +88,8 @@ headroom 属于第4章，不作为第3章门禁。
    绑定精确路径；`evidence.log` 仅作原始行审计，失败才查看 `debug/`。
 
 Stokes 的论文与工程门禁固定为 `AA`、`BB`、`AB_REAL`、`AB_IMAG` 四个相关产物；当前
-不实现、不测试也不讨论 I/Q/U/V 的物理输出或推导。
+不单独发布 I/Q/U/V 数组。数值 reference 需要额外核对
+`I=AA+BB`、`Q=AA-BB`、`U=2*AB_REAL`、`V=-2*AB_IMAG`，但这不改变工程输出契约。
 
 详细执行计划见
 [`../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md`](../docs/superpowers/plans/2026-08-24-chapter3-module-validation-evidence.md)。
@@ -110,8 +113,9 @@ Beamform → Power → Integrate(K=128, MEAN)，整链 deadline 为 11.184810 ms
 通过。早期 30 Gbps 单次诊断的平均 service/H2D/算法/D2H 为
 16.243/12.077/3.873/0.260 ms，暴露 pageable ring H2D 与逐 block 同步问题。当前实现已用
 `dada_cuda_dbregister` 注册 compute ring，由三 slot staged pipeline 直接 H2D，并按 active
-区间记录吞吐；双 Station 小几何 30 Gbps、60 秒、1 warm-up + 3 measured 已正式通过。
-小几何主要用于数据流基线，不能代表目标 Beamform 矩阵的 CUDA 核心利用率。
+区间记录吞吐；生产几何 `A=469,F=4,P=1,B=350` Full Power 已在约 30 Gbps、60 秒、
+1 warm-up + 3 measured 正式通过。worker 以 compute-ring EOD 结束逻辑 transfer，避免
+精确整 block 的有限观测在 EOD 发布前因 `TRANSFER_SIZE` 字节上限误开 continuation。
 
 第一步 NUMA 优化已完成控制器开发：`ingress_numa_node` 绑定 raw ring 和
 `rdma2dada`，`processing_numa_node` 绑定 unpack、compute/output ring、GPU worker 和 sink。
@@ -121,20 +125,22 @@ Beamform → Power → Integrate(K=128, MEAN)，整链 deadline 为 11.184810 ms
 
 GPU-only 生产几何压力当前暂缓。恢复时仍按以下边界执行：
 
-1. 网络侧保持现有双 Station sender，继续承担 `receive`/`unpack` 的约 30 Gbps payload
-   吞吐验证；不把两个 Station 解释为约 500 个阵元。
+1. 网络侧复用当前两台 sender 的 235/234 Station 分片和已通过的约 30 Gbps profile；
+   不重新测试未变化的 receive/unpack 边界。
 2. GPU 侧先完成 repository-owned、严格 header、完整-block 平滑 pacing 的输入 writer，
    再采用接近生产的 `A≈500,F=4,P=1,B≈350` ATFP/FPAB 几何；现有 `dada_junkdb`
    路径不作为正式验收入口。
 3. GPU-only 必须使用匹配权重和真实输出几何，记录 H2D、转换、Beamform、可选产品、D2H、
    output wait、显存和逐 block 闭合；合成填充值只影响科学数值，不降低计算/传输负载。
-4. 该结果称为“生产几何 GPU 压力”，不是“500-Station 完整链验收”。后者仍需多 Station
-   sender 或合法 raw-VDIF 生成器，把 Station-ID→A、时间对齐、unpack 和 GPU 放入同一链。
+4. GPU-only 结果称为“生产几何 GPU 压力”，与已经通过的 469-Station Full Power 完整链
+   分开记录；前者用于隔离 GPU 资源边界，后者证明 Station-ID→A、时间对齐、unpack 和 GPU
+   的联合闭合。
 
-低速 full-stage 和 30 Gbps、60 秒 full-stage 均已完成重复门禁。多 stream 已实现为
-1--4 个有界 staged slots；当前正式基线使用 staged/3、compute-ring CUDA 直注册和有序
-output writer。accepted unpack profile、固定 source port、CPU/NUMA、1 秒 preparation、
-ring/window 均已复用，未重新把 unchanged ingest/unpack 当新模块测试。
+`A=2` 小几何 full 结果保留为原型证据；最终 Power 主验收已经升级为 469-Station
+生产几何。多 stream 已实现为 1--4 个有界 staged slots；当前正式基线使用 staged/3、
+compute-ring CUDA 直注册、有序 output writer 和 EOD 驱动的输入 transfer 生命周期。
+accepted unpack profile、固定 source port、CPU/NUMA、1 秒 preparation、ring/window 均已
+复用，未重新把 unchanged ingest/unpack 当新模块测试。
 
 GPU-only 恢复后的任务：
 
@@ -144,6 +150,17 @@ GPU-only 恢复后的任务：
    max inflight 和顺序发布证据定位瓶颈；split-NUMA 仅作为独立命名实验；
 4. 多 Station 输入就绪后，重复 `full` 阶段并核对全部 Station、block、header 和 EOD；
 5. 只有 `full` 的全部 measured 通过，才能称该 rate 为完整 pipeline 稳定速率。
+
+论文后续正式测试统一采用 physical Ethernet line rate 为主速率，并同时记录 UDP
+datagram/payload 与 astronomical signal payload。最终主几何固定为
+`A=469,F=4,P=1,B=350`、每 F 1 MHz、两台 sender 按 235/234 Stations 分片。Power 与
+coherency 必须分别完成 GPU-only 和 full 验收。正式时长采用 30 秒还是 60 秒、以及是否
+执行完整 `1/5/10/20/30/35/40` 阶梯仍待用户确认，确认前不启动新的正式 campaign。
+
+当前 Power Full 输入由 `generate_gpu_pressure_fixture.py` 生成：
+`STAGED_PIPELINE/3`、Beamform→Power→K128 MEAN Integration、T=13,312、积分后
+T=104、output block=582,400 B。runner 保持既有 aggregate VDIF-record rate 语义；约
+30 Gbps 主点允许采用几何导出的实际速率，不为精确 30.000 Gbps 增加新的速率接口。
 
 完成标准：给出最高可重复 payload 速率、每级 service-time 预算和明确运行 headroom。
 

@@ -17,6 +17,15 @@ from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "task8c_rate_point.py"
+SMALL_MULTI_STATION_CONFIG = (
+    SCRIPT.parents[1] / "config" / "testing" / "multi-station-sender-small.json"
+)
+PRODUCTION_MULTI_STATION_CONFIG = (
+    SCRIPT.parents[1]
+    / "config"
+    / "testing"
+    / "multi-station-sender-production.json"
+)
 sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("task8c_rate_point", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -622,6 +631,14 @@ class Task8cRatePointTest(unittest.TestCase):
                 self.assertEqual(
                     topology.requires_rdma_capability, values["receiver"]
                 )
+
+    def test_sender_process_count_follows_host_sharding_not_station_count(self):
+        self.assertEqual(MODULE.expected_sender_process_count(1), 1)
+        self.assertEqual(MODULE.expected_sender_process_count(2), 2)
+        self.assertEqual(MODULE.expected_sender_process_count(4), 2)
+        self.assertEqual(MODULE.expected_sender_process_count(469), 2)
+        with self.assertRaisesRegex(ValueError, "Station count"):
+            MODULE.expected_sender_process_count(0)
 
     def test_gpu_topology_requires_only_compute_pressure_processes(self):
         self.assertEqual(
@@ -2284,6 +2301,193 @@ class Task8cRatePointTest(unittest.TestCase):
             [(101, 45871), (102, 55871)],
         )
 
+    def test_large_observation_uses_two_fixed_endpoint_multi_station_senders(self):
+        base = make_plan(30.2505, 30.0, pipeline_stage="full")
+        source = base.source
+        stations = list(range(1000, 1469))
+        source["observation"]["station_ids"] = stations
+        resolved_plan = dict(base.resolved_plan)
+        resolved_plan["source_json"] = json.dumps(source)
+        plan = dataclasses.replace(
+            base,
+            resolved_plan=resolved_plan,
+            per_station_gbps=0.0645,
+            sender_source_port_101=45871,
+            sender_source_port_102=55871,
+        )
+
+        specs = MODULE.sender_specs_for_plan(plan, "large-array-suite")
+
+        self.assertEqual(len(specs), 2)
+        self.assertEqual(specs[0].host, "qtpulsar1")
+        self.assertEqual(specs[1].host, "qtpulsar2")
+        self.assertEqual(specs[0].source_port, 45871)
+        self.assertEqual(specs[1].source_port, 55871)
+        self.assertEqual(list(specs[0].station_ids), stations[:235])
+        self.assertEqual(list(specs[1].station_ids), stations[235:])
+
+        first = MODULE.build_sender_config(
+            plan, specs[0].station_ids, specs[0].source_ip,
+            specs[0].source_port, "2030-01-01-00:03:00"
+        )
+        second = MODULE.build_sender_config(
+            plan, specs[1].station_ids, specs[1].source_ip,
+            specs[1].source_port, "2030-01-01-00:03:00"
+        )
+        self.assertEqual(first["schema_version"], 3)
+        self.assertEqual(first["station"]["station_ids"], stations[:235])
+        self.assertEqual(second["station"]["station_ids"], stations[235:])
+        self.assertAlmostEqual(first["transmit"]["target_gbps"], 15.1575)
+        self.assertAlmostEqual(second["transmit"]["target_gbps"], 15.093)
+        self.assertEqual(first["time"], second["time"])
+
+    def test_preparation_packet_rate_emits_sender_rates_with_at_most_nine_decimals(self):
+        base = make_plan(30.2505, 30.0, pipeline_stage="unpack")
+        source = base.source
+        stations = list(range(1000, 1469))
+        source["observation"]["station_ids"] = stations
+        resolved_plan = dict(base.resolved_plan)
+        resolved_plan["source_json"] = json.dumps(source)
+        plan = dataclasses.replace(
+            base,
+            resolved_plan=resolved_plan,
+            per_station_gbps=30.2505 / 469,
+            unpack_start_delay_seconds=1,
+            preparation_groups=1953,
+            packets_per_second=1953,
+            sender_source_port_101=45871,
+            sender_source_port_102=55871,
+        )
+
+        configs = [
+            MODULE.build_sender_config(
+                plan,
+                spec.station_ids,
+                spec.source_ip,
+                spec.source_port,
+                "2030-01-01-00:03:00",
+            )
+            for spec in MODULE.sender_specs_for_plan(plan, "preparation-rate")
+        ]
+
+        self.assertEqual(
+            [config["transmit"]["target_gbps"] for config in configs],
+            [15.15652992, 15.092034048],
+        )
+        for config in configs:
+            encoded = json.dumps(config, separators=(",", ":"))
+            target_text = encoded.split('"target_gbps":', 1)[1].split(",", 1)[0]
+            self.assertNotIn("e", target_text.lower())
+            self.assertLessEqual(len(target_text.partition(".")[2]), 9)
+
+    def test_bundle_writer_records_exact_preparation_sender_rate_tokens(self):
+        base = make_plan(30.2505, 30.0, pipeline_stage="unpack")
+        source = base.source
+        source["observation"]["station_ids"] = list(range(1000, 1469))
+        resolved_plan = dict(base.resolved_plan)
+        resolved_plan["source_json"] = json.dumps(source)
+        plan = dataclasses.replace(
+            base,
+            resolved_plan=resolved_plan,
+            per_station_gbps=30.2505 / 469,
+            unpack_start_delay_seconds=1,
+            preparation_groups=1953,
+            packets_per_second=1953,
+            sender_source_port_101=45871,
+            sender_source_port_102=55871,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backend = MODULE.SshBackend(
+                transport=RecordingTransport(),
+                project_root=root,
+                known_hosts=root / "known-hosts",
+            )
+            backend.local_run_dir = root / "run"
+            backend.local_run_dir.mkdir()
+            backend.remote_run_dir = "/tmp/task8c-rate-token-test"
+            bundle = backend._write_bundle(plan, "2030-01-01-00:03:00")
+
+            self.assertEqual(
+                [
+                    item["target_gbps_token"]
+                    for item in backend._sender_config_evidence
+                ],
+                ["15.15652992", "15.092034048"],
+            )
+            for item in backend._sender_config_evidence:
+                config_bytes = (bundle / item["bundle_name"]).read_bytes()
+                self.assertEqual(
+                    hashlib.sha256(config_bytes).hexdigest(), item["sha256"]
+                )
+
+    def test_checked_in_multi_station_observations_render_two_schema3_senders(self):
+        cases = (
+            (SMALL_MULTI_STATION_CONFIG, 0.258, (2, 2), (0.129, 0.129)),
+            (
+                PRODUCTION_MULTI_STATION_CONFIG,
+                30.2505,
+                (235, 234),
+                (15.1575, 15.093),
+            ),
+        )
+        for path, aggregate_gbps, partition_sizes, target_rates in cases:
+            with self.subTest(path=path.name):
+                source = json.loads(path.read_text())
+                base = make_plan(aggregate_gbps, 30.0, pipeline_stage="unpack")
+                resolved_plan = dict(base.resolved_plan)
+                resolved_plan["source_json"] = json.dumps(source)
+                station_count = len(source["observation"]["station_ids"])
+                plan = dataclasses.replace(
+                    base,
+                    resolved_plan=resolved_plan,
+                    per_station_gbps=aggregate_gbps / station_count,
+                    sender_source_port_101=45871,
+                    sender_source_port_102=55871,
+                )
+
+                specs = MODULE.sender_specs_for_plan(plan, "checked-in-fixture")
+                configs = [
+                    MODULE.build_sender_config(
+                        plan,
+                        spec.station_ids,
+                        spec.source_ip,
+                        spec.source_port,
+                        "2030-01-01-00:03:00",
+                    )
+                    for spec in specs
+                ]
+
+                self.assertEqual(tuple(len(spec.station_ids) for spec in specs), partition_sizes)
+                self.assertEqual([item["schema_version"] for item in configs], [3, 3])
+                self.assertEqual(
+                    tuple(item["transmit"]["target_gbps"] for item in configs),
+                    target_rates,
+                )
+                self.assertEqual([spec.source_port for spec in specs], [45871, 55871])
+
+    def test_multi_station_sender_validation_requires_exact_groups_per_station(self):
+        summary = {
+            "station_ids": [1000, 1001, 1002],
+            "station_counts": [
+                {"station_id": station, "scheduled_packets": 4, "sent_packets": 4}
+                for station in (1000, 1001, 1002)
+            ],
+            "scheduled_packets": 12,
+            "sent_packets": 12,
+            "failed_packets": 0,
+            "backend": "SENDMMSG",
+            "payload_prefix_hex": "e8e9f2f3",
+            "actual_payload_gbps": 0.192,
+        }
+        MODULE._validate_sender(summary, 0.192, (1000, 1001, 1002), 4)
+
+        summary["station_counts"][1]["scheduled_packets"] = 3
+        summary["station_counts"][1]["sent_packets"] = 3
+        with self.assertRaises(MODULE.StageError):
+            MODULE._validate_sender(summary, 0.192, (1000, 1001, 1002), 4)
+
     def test_qths_bundle_uses_exact_pid_files_and_no_wildcard_kill(self):
         plan = make_plan(1.0, 10.0)
         bundle = MODULE.build_qths_bundle(
@@ -3938,6 +4142,12 @@ class Task8cRatePointTest(unittest.TestCase):
             suite_root = pathlib.Path(directory) / "suite"
             run_dir = suite_root / "warmup-01"
             run_dir.mkdir(parents=True)
+            qths = run_dir / "qths"
+            qths.mkdir()
+            (qths / "pipeline-worker.log").write_text(
+                "registered input DADA ring with CUDA\n"
+                "cannot configure staged GPU pipeline: fixture failure\n"
+            )
             (run_dir / "manifest.json").write_text("{}\n")
             (run_dir / "state-history.jsonl").write_text(
                 '{"state":"FAIL"}\n'
@@ -3965,6 +4175,11 @@ class Task8cRatePointTest(unittest.TestCase):
                 "receiver summary evidence\ncount mismatch\n",
             )
             self.assertTrue((debug / "resource-snapshot.json").is_file())
+            self.assertEqual(
+                (debug / "pipeline-worker.log").read_text(),
+                "registered input DADA ring with CUDA\n"
+                "cannot configure staged GPU pipeline: fixture failure\n",
+            )
 
     def test_pass_compaction_fails_closed_on_incomplete_process_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4000,6 +4215,32 @@ class Task8cRatePointTest(unittest.TestCase):
                 (suite_root / "debug" / "measured-01" /
                  "failed-command.json").is_file()
             )
+
+    def test_pass_compaction_expects_two_host_sharded_senders_for_four_stations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            run_dir = suite_root / "warmup-01"
+            run_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "plan": {
+                    "pipeline_stage": "unpack",
+                    "config_id": "a" * 64,
+                    "nant": 4,
+                },
+                "config": {"binary_sha": {"qths1:rdma2dada": "b" * 64}},
+            }))
+            result = {
+                "TEST_RESULT": "PASS",
+                "run_id": "warmup-01",
+                "cleanup": {"CLEANUP_RESULT": "PASS"},
+            }
+
+            with mock.patch.object(
+                MODULE.task8c_artifacts, "validate_process_ledger"
+            ) as validate:
+                MODULE.compact_suite_run(suite_root, "warmup-01", result)
+
+            self.assertEqual(validate.call_args.args[2], {"sender": 2})
 
     def test_repeated_runs_share_the_suite_observation_identity(self):
         suite = pathlib.Path("/results/full-30Gbps-30s")

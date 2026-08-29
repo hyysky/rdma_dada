@@ -120,12 +120,40 @@ void TestDeterministicBatchMatchesReference() {
            "deterministic batch is byte-identical to reference record");
 }
 
+void TestMultiStationTimeMajorRotatingOrder() {
+    sim::VdifSenderSimConfig config = MakeConfig(100, "REPEAT_TEMPLATE");
+    config.schema_version = 3;
+    config.station_ids = {100, 101, 102};
+    config.group_count = 3;
+    config.batch_packets = 6;
+    sim::VdifSenderBatch batch;
+    std::string error;
+    Expect(batch.Initialize(config, &error),
+           "multi-Station batch initializes: " + error);
+    Expect(batch.Prepare(0, 6, &error),
+           "two complete multi-Station groups prepare: " + error);
+    const std::uint64_t expected_groups[] = {0, 0, 0, 1, 1, 1};
+    const std::uint16_t expected_stations[] = {100, 101, 102, 101, 102, 100};
+    const std::uint32_t expected_station_indices[] = {0, 1, 2, 1, 2, 0};
+    for (std::uint32_t index = 0; index < 6U; ++index) {
+        const unpack::ProjectVdifHeader header = Decode(batch.packet(index));
+        Expect(batch.packet(index).group_index == expected_groups[index],
+               "flattened packet preserves its astronomical group");
+        Expect(header.station_id == expected_stations[index],
+               "each group rotates its first Station without omissions");
+        Expect(batch.packet(index).station_index ==
+                   expected_station_indices[index],
+               "packet exposes the O(1) configured Station index");
+    }
+}
+
 }  // namespace
 
 int main() {
     TestStableRepeatBatch();
     TestStationTemplatesDiffer();
     TestDeterministicBatchMatchesReference();
+    TestMultiStationTimeMajorRotatingOrder();
     if (failures) return 1;
     std::cout << "vdif_sender_batch_test passed\n";
     return 0;

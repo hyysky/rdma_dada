@@ -150,6 +150,58 @@ void TestStrictPacedConfig(const char* path) {
                           "unknown_payload_mode");
 }
 
+void TestStrictMultiStationPacedConfig(const char* path) {
+    std::string source = ReadText(path);
+    std::string::size_type position = source.find("\"schema_version\": 2");
+    Expect(position != std::string::npos, "paced schema marker exists");
+    if (position == std::string::npos) return;
+    source.replace(position, std::string("\"schema_version\": 2").size(),
+                   "\"schema_version\": 3");
+    position = source.find("\"station_id\": 101");
+    Expect(position != std::string::npos, "paced Station marker exists");
+    if (position == std::string::npos) return;
+    source.replace(position, std::string("\"station_id\": 101").size(),
+                   "\"station_ids\": [1000, 1001, 1002]");
+
+    std::ostringstream path_text;
+    path_text << "/tmp/rdma_dada_vdif_sender_multi_"
+              << static_cast<long>(getpid()) << ".json";
+    { std::ofstream output(path_text.str().c_str()); output << source; }
+
+    sim::VdifSenderSimConfig config = {};
+    std::string error;
+    Expect(sim::LoadVdifSenderSimConfig(path_text.str(), &config, &error),
+           "schema v3 multi-Station sender config loads: " + error);
+    Expect(config.station_ids == std::vector<std::uint16_t>({1000, 1001, 1002}),
+           "schema v3 preserves the ordered Station list");
+
+    std::vector<std::uint8_t> first;
+    std::vector<std::uint8_t> second;
+    Expect(sim::BuildVdifSenderRecordForStation(
+               config, 4, 1000, &first, &error),
+           "schema v3 first Station record builds: " + error);
+    Expect(sim::BuildVdifSenderRecordForStation(
+               config, 4, 1002, &second, &error),
+           "schema v3 second Station record builds: " + error);
+    const unpack::ProjectVdifHeader first_header = Decode(first);
+    const unpack::ProjectVdifHeader second_header = Decode(second);
+    Expect(first_header.station_id == 1000U &&
+               second_header.station_id == 1002U,
+           "one time group can carry every configured Station ID");
+    Expect(first_header.seconds_from_reference_epoch ==
+               second_header.seconds_from_reference_epoch &&
+               first_header.frame_number_within_second ==
+               second_header.frame_number_within_second,
+           "multi-Station records in one group share the exact time key");
+
+    std::remove(path_text.str().c_str());
+    ExpectInvalidMutation(source, "\"station_ids\": [1000, 1001, 1002]",
+                          "\"station_ids\": [1000, 1000]",
+                          "duplicate_station_ids");
+    ExpectInvalidMutation(source, "\"station_ids\": [1000, 1001, 1002]",
+                          "\"station_ids\": []", "empty_station_ids");
+}
+
 void TestDeterministicCi8AndTimeRollover() {
     sim::VdifSenderSimConfig station101 = MakeConfig(101, 8);
     sim::VdifSenderSimConfig station102 = station101;
@@ -256,6 +308,7 @@ int main(int argc, char** argv) {
     }
     TestStrictExampleConfig(argv[1]);
     TestStrictPacedConfig(argv[2]);
+    TestStrictMultiStationPacedConfig(argv[2]);
     TestDeterministicCi8AndTimeRollover();
     TestFixedPacketsPerSecondTimestamp();
     TestCi16LittleEndianPayload();

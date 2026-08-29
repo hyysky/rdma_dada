@@ -96,22 +96,81 @@ the target. This tests
 sustained block pressure and backpressure; it does not claim smooth packet
 pacing, so `full` remains the final astronomical data-flow acceptance.
 
-The next production-geometry GPU pressure profile uses approximately
-`A=500`, configurable `F` (initial target `F=4`), `P=1`, and `B=350` at about
-30 Gbps compute-ring payload. It must use matching ATFP geometry and FPAB
-weights, so the CUDA conversion, GEMM shape, output expansion, transfers and
-device buffers are representative even though `dada_junkdb` supplies synthetic
-bytes. The preferred 30 Gbps fixture may use `A=469,F=4`; `A=500,F=4` is a
-separate approximately 32 Gbps pressure point.
+The production-pressure geometry is `A=469,F=4,P=1,B=350`, CI8 complex, with
+every `F` representing exactly 1 MHz. Its astronomical signal payload is
+30.016 Gbps. The wire fixture uses 512 samples per packet (4096-byte payload)
+and 26 groups per block. Matching ATFP geometry and FPAB weights make the CUDA
+conversion, GEMM shape, output expansion, transfers and device buffers
+representative. The production Power fixture uses `STAGED_PIPELINE/3`, Power
+followed by 128-sample MEAN integration, and a 582,400-byte output block. The
+versioned runner continues to accept its existing aggregate VDIF-record rate;
+the nominal 30-Gbps point may follow the exact geometry-derived rate rather
+than being forced to exactly 30.000 Gbps.
 
-This production-geometry GPU pressure is not a 500-Station network acceptance.
-The current network sender remains a one-Station-per-process fixture and the
-current controller network topology uses two Station processes. It may still
-validate receive/unpack payload throughput, but it must not be combined with a
-different `A` in the GPU header or described as an end-to-end 500-Station run.
-A final 500-Station `full` result requires either a multi-Station sender or an
-equivalent valid raw-VDIF generator, followed by the normal full-stage
-warm-up-plus-three-measured gate.
+For a `full` network test, the controller partitions the exact compiler-resolved
+Station list into 235 IDs on qtpulsar1 and 234 on qtpulsar2. Each host runs one
+schema-v3 `fpga_sender_sim`, one fixed source endpoint and one socket. Their
+signal payloads are 15.040 and 14.976 Gbps; because every UDP datagram also
+contains the 32-byte VDIF header, the sender `target_gbps` values are 15.1575
+and 15.093 Gbps, for 30.2505 Gbps total VDIF-record traffic. Forcing an equal
+15/15 split would violate the fixed 1 MHz-per-channel observation geometry.
+Sender result JSON must close aggregate and per-Station packet counts before
+receiver/unpack/GPU results can be accepted.
+
+The complete Station list is a Resolved Plan property, not a ring-header
+field. The sender uses it for host sharding and unpack uses it to map VDIF
+Station IDs into the fixed ATFP `A` axis. Ring headers retain `NANT`,
+`CONFIG_ID`, and `GEOMETRY_ID`, but omit `STATION_IDS`; downstream processing
+therefore consumes the already ordered complete array without duplicating an
+O(A) list inside each fixed 4096-byte header.
+
+### Paper acceptance protocol
+
+Paper-facing Section 3/4 acceptance uses physical untagged-IPv4 Ethernet line
+rate as its primary rate definition and the production geometry
+`A=469,F=4,P=1,B=350`. Every compact result must also retain the corresponding
+UDP datagram/payload rate and astronomical signal payload rate so the three
+definitions can be reconciled without reconstructing them from prose. The two
+physical sender hosts shard the exact Station list 235/234; an `A=2` fixture is
+only a functional or prototype geometry and cannot establish the paper's final
+production-scale claim.
+
+Power and coherency are separate formal product modes. The coherency output
+contract remains `AA`, `BB`, `AB_REAL`, `AB_IMAG`. A numerical reference may
+also verify `I=AA+BB`, `Q=AA-BB`, `U=2*AB_REAL`, and `V=-2*AB_IMAG`, but those
+derived values are not separately published arrays unless the product contract
+is changed explicitly.
+
+The initial production coherency geometry is `A=469,F=2,P=2,B=350`, with each
+`F` still representing 1 MHz. Doubling polarization while halving channel count
+keeps the astronomical signal payload near the Power profile's 30-Gbps target;
+the compiler and sender plan must derive and record the exact physical, UDP and
+signal rates rather than copying a nominal value. Power retains
+`A=469,F=4,P=1,B=350`.
+
+The paper's formal duration and rate-point schedule are still an explicit
+campaign decision. Until that decision is recorded, retain the existing
+30-second `1/5/10/20/30/35/40` physical-wire campaign unchanged and do not use
+it as evidence that the paper author selected 30 seconds or the complete
+ladder. The minimum pending protocol choice is between a single primary
+30-Gbps, 60-second warm-up-plus-three gate and the documented 30-second ladder;
+any additional saturation points must be named separately.
+
+Section 3 requires a receive-only matched placement experiment between staged
+payload copy and `NSGE=2` direct raw-ring placement. Its boundary is
+senders → `rdma2dada` → raw ring → `dada_dbnull`; unpack and GPU are absent.
+Change only placement mode: receiver/NIC/link/MTU, Project VDIF record bytes,
+physical-line-rate packet rate, sender/flow count, endpoint/flow-rule structure,
+pacing/batching, aggregate physical line rate, duration, warm-up/measured count,
+raw ring, WR/poll settings, CPU affinity, NUMA, consumer and drain policy stay
+identical. `A=469` is preferred for workload consistency but is not a causal
+matching requirement at this boundary; another Station identity is valid when
+record size, packet rate and flow topology match exactly. The compact result must
+record placement mode, measured physical line rate, repetitions, packet
+loss/deficit, receive-to-publication service P50/P95, receiver CPU-seconds/GB,
+raw-ring HWM/backpressure, copy bytes/memory traffic and minimum headroom. If
+copy fails while direct passes, retain the effective failure boundary and first
+saturated boundary; sender rate alone cannot establish either result.
 
 Rate-point result directories use
 `<pipeline-stage>-<aggregate-rate>Gbps-<duration>s-<UTC timestamp>` so rate and
@@ -169,6 +228,17 @@ only to audit a cited raw line or diagnose a failure. The tracked
 with user approval. Promotion records evidence selection, not necessarily a
 product PASS.
 
+Remote result roots are retained until the user authorizes deletion. Maintain
+an inventory entry for every formal or diagnostic suite containing its purpose,
+topology/product mode, geometry, rate definitions, duration/repetitions,
+source/config/binary identities, result, cleanup, suite path, manifest SHA and
+whether it has been imported into the local catalog. A formal test is not
+closed until its compact manifest is verified, the suite is imported, and a
+bounded result report with the exact suite path and manifest SHA has been sent
+successfully to the originating development task. The paper/reporting task
+discovers results through the catalog query interface; direct notification is
+optional unless explicitly requested.
+
 After remote cleanup, the testing task sends the complete result and the exact
 compact-suite location to the originating development task. The development
 task verifies/transfers the suite, runs the local catalog importer, and
@@ -200,12 +270,15 @@ after the JSON and evidence log are durable. On failure add only:
 debug/<run-id>/failed-command.json
 debug/<run-id>/failed-process.log
 debug/<run-id>/resource-snapshot.json
+debug/<run-id>/pipeline-worker.log  # GPU/full failure only, when produced
 ```
 
 The debug files preserve the first failed command, its complete captured
-stdout/stderr and relevant cleanup/statistics. They do not retain unrelated
-stages. Preflight belongs to the suite as `preflight.json`; a formal suite does
-not create a sibling preflight result directory.
+stdout/stderr and relevant cleanup/statistics. GPU/full failures additionally
+retain the pipeline worker log so an early transfer-open error is not replaced
+by the controller's later statistics-validation symptom. They do not retain
+unrelated stages. Preflight belongs to the suite as `preflight.json`; a formal
+suite does not create a sibling preflight result directory.
 
 ## Versioned passing profiles
 
@@ -225,6 +298,12 @@ receiver CPU/NUMA placement, unpack thread roles, queue geometry, raw/compute
 rings, window/reorder geometry, source ports and preparation interval remain
 unchanged while GPU/output settings are added. This is profile inheritance,
 not a new acceptance run for `rdma2dada + unpack`.
+
+Unless a test is explicitly named as a preparation-policy experiment,
+`unpack` and `full` server runs use a one-second unpack preparation interval
+(`--unpack-start-delay-seconds 1`). A zero-second interval is a distinct
+configuration and its result must not be substituted for the accepted
+one-second baseline.
 
 GPU worker performance profiles also pin the Observation
 `processing.cuda_pipeline` contract. `SYNCHRONOUS_DIRECT/1` is the retained
@@ -354,12 +433,12 @@ are retained with the run artifacts.
   insufficient, regenerate and redistribute both Station configs.
 - All enabled Stations participate in the same repetition. Never combine a
   successful Station from one attempt with another Station from a later run.
-- Multi-host fixtures derive a distinct pair of UDP source ports from the
-  unique run identity and record them in the generated configs and manifest.
-  Before any receiver ring is created, the controller probes each source
-  IP/port on its sender host. An occupied bind endpoint is `ENV_BLOCKED`; a
-  bind race detected when the sender starts has the same classification and
-  still aborts the complete observation.
+- Multi-host fixtures use the source-port pair pinned by the selected passing
+  profile and record it in generated configs and the manifest. Before any
+  receiver ring is created, the controller probes each source IP/port on its
+  sender host. An occupied bind endpoint is `ENV_BLOCKED`; a bind race detected
+  when the sender starts has the same classification and still aborts the
+  complete observation.
 
 ## Astronomy observation semantics
 
@@ -367,7 +446,7 @@ Tests must preserve the failure semantics of a continuous astronomical
 observation, not merely exercise isolated commands:
 
 - every configured Station is required to enter the same observation; if any
-  Station sender cannot start, terminate already-started senders and stop the
+  physical sender process cannot start, terminate already-started senders and stop the
   receiver, unpack worker and consumer for that transfer;
 - after the common start, monitor all Station senders concurrently; an early
   abnormal exit from any sender aborts the whole transfer immediately rather
@@ -401,6 +480,17 @@ part of that result. Set `--missing-wait-ms` and
 `window_blocks = 1 + missing-wait blocks + Station-skew-reserve blocks` from
 the requested aggregate rate and block geometry before creating either ring;
 the worker receives the missing-wait horizon explicitly.
+
+Multi-Station sender acceptance uses the checked-in Observation inputs
+`config/testing/multi-station-sender-small.json` and
+`config/testing/multi-station-sender-production.json`. The first is the only
+network functional gate (warm-up + three measured repetitions); the second is
+a production-geometry sender/receive/unpack pressure plan and must not silently
+replace an accepted two-Station baseline. For `A=469,F=4,P=1` at 1 MHz per F,
+report 30.016 Gbps astronomical sample payload separately from the 30.2505
+Gbps UDP datagram payload used by sender pacing. The two physical sender hosts
+must run exactly one process/socket each, partition Stations 235/234, retain
+the fixed baseline source ports, and reconcile every Station's group count.
 
 For an `rdma2dada` receive-limit test, use `--pipeline-stage receive
 --compute-consumer dbnull`. This mode creates only the raw ring, attaches

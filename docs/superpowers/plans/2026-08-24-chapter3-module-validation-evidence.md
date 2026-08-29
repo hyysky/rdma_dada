@@ -24,6 +24,64 @@
 - Optimization comparisons change one named variable at a time and record the full baseline diff before creating resources.
 - The current public performance topologies remain exactly `receive`, `unpack`, `gpu`, and `full`; this plan does not add a synthetic unpack topology.
 
+## Confirmed Paper Protocol and Backlog
+
+The author has fixed the primary rate definition and geometry:
+
+- primary rate: physical untagged-IPv4 Ethernet line rate;
+- every result also records UDP datagram/payload and astronomical signal
+  payload rates;
+- production geometry: `A=469,F=4,P=1,B=350`, one MHz per `F`;
+- two physical sender hosts shard Stations 235/234;
+- Power and coherency are independent formal product modes;
+- coherency publishes `AA`, `BB`, `AB_REAL`, `AB_IMAG`; the numerical oracle
+  additionally verifies the derived I/Q/U/V equations without changing the
+  published output contract.
+
+Power uses `A=469,F=4,P=1,B=350`. The initial coherency/Stokes profile uses
+`A=469,F=2,P=2,B=350`, preserving one MHz per `F` and approximately the same
+30-Gbps aggregate signal load. Exact physical, UDP and signal rates remain
+compiler-derived result fields.
+
+An `A=2` Power full-chain PASS is prototype evidence only. Production Power has
+now passed at the selected approximately 30-Gbps point for 60 seconds with one
+warm-up and three measured repetitions; suite
+`full-30.2505Gbps-60s-20260829T033639Z` is imported and promoted. Final
+coherency/Stokes claims and any optional full rate ladder remain pending.
+
+The minimum ordered backlog is:
+
+- **P1 — evidence custody:** import the accepted 469-Station unpack suite into
+  the local catalog and verify its compact manifest before pruning its remote
+  copy.
+- **P2a — RDMA placement mechanism:** compare the historical staged payload
+  copy path with `NSGE=2` direct raw-ring placement at the receive-only
+  boundary. Change only placement mode and report
+  receiver CPU-seconds/GB, receive/publication service P50/P95, raw-ring HWM or
+  backpressure, copy bytes/memory traffic, loss/deficit and headroom.
+- **P2b — GPU numerical evidence:** emit machine-readable shape/byte counts,
+  tolerance, maximum absolute/relative error, and NaN/Inf counts for conversion,
+  beamforming, Power, coherency and SUM/MEAN integration. Verify the I/Q/U/V
+  equations in the reference only.
+- **P3 — GPU-only performance:** run 469-Station Power and coherency modes and
+  the minimum matched `SYNCHRONOUS_DIRECT/1` versus `STAGED_PIPELINE/3`
+  comparison needed to quantify the optimization.
+- **P4 — full pipeline:** production-geometry full Power is accepted at the
+  approximately 30-Gbps/60-second protocol. Formally accept full coherency at
+  the matched protocol; existing `A=2` full results remain prototype evidence.
+- **P5 — decisive metrics:** retain per-stage P50/P95, block arrival interval,
+  minimum stage headroom, ring/queue HWM or backpressure, CPU/GPU/PCIe
+  utilization, and the evidence-backed first saturated stage.
+
+Remote suites are retained until explicit user approval. Every run is entered
+in the result inventory with purpose, profile, identities, outcome, cleanup,
+path, manifest SHA and catalog-import status. A formal run is incomplete as an
+evidence workflow until the compact suite is verified/imported and its bounded
+report is delivered successfully to the development task. The paper task reads
+the catalog by suite ID/topology/product/result and does not require a separate
+notification for every run; send a direct handoff only when explicitly
+requested or when promoting evidence for a paper claim.
+
 ---
 
 ## Current Coverage Audit
@@ -31,9 +89,9 @@
 | Chapter 3 module family | Reusable implementation/tests | Evidence gap before paper acceptance |
 | --- | --- | --- |
 | Observation/config identity/Project VDIF | `observation_config_test`, `resolved_observation_plan_test`, `config_identity_test`, `packet_format_config_test`, `project_vdif_v1_test`, `observation_artifacts_test`, `observation_config_compile_test` | Existing tests are individually useful, but need one three-repetition suite with exact binary/config identity and compact JSON output |
-| RDMA receive/raw-ring boundary | `rdma_receive_policy_test`; controller `receive` stage; 30 Gbps/60 s warm-up+3 formal PASS with CQ/repost/accepted/published counters | Formal admission baseline exists; Chapter 3 still needs the module-suite packaging and paper-facing extraction |
+| RDMA receive/raw-ring boundary | `rdma_receive_policy_test`; controller `receive` stage; 30 Gbps/60 s warm-up+3 formal `NSGE=2` PASS with CQ/repost/accepted/published counters | No matched 469-Station staged-copy reference exists; direct versus staged payload placement is a required Section 3 mechanism experiment |
 | Parallel VDIF unpack | config/header/timeline/engine/ATFP/writer unit tests, `vdif_unpack_worker_integration_test`; 30 Gbps/60 s warm-up+3 formal PASS | Need three-repetition module-suite packaging plus parse/copy/raw-block service timing, process CPU usage and worker-count comparison |
-| GPU format/beam/product/integration/transfer | CPU and CUDA tests for conversion, Beamform, Power, Stokes, integration and transfer; CUDA chain/product tests | Need one authoritative three-repetition module suite. Stokes evidence covers exactly `AA`, `BB`, `AB_REAL` and `AB_IMAG`; materialized or derived I/Q/U/V is outside the current engineering and paper scope |
+| GPU format/beam/product/integration/transfer | CPU and CUDA tests for conversion, Beamform, Power, Stokes, integration and transfer; CUDA chain/product tests; production Full Power suite `full-30.2505Gbps-60s-20260829T033639Z` passed warm-up+3 | Need one authoritative three-repetition module suite with machine-readable numerical error fields and the production coherency/Stokes performance result. Stokes output remains `AA`, `BB`, `AB_REAL`, `AB_IMAG`; the reference also checks the derived I/Q/U/V equations without publishing separate arrays |
 | Result artifacts | `task8c_artifacts.py`, suite `preflight.json`, `summary.json`, `runs/*.json`, evidence logs and first-failure debug contract | CTest module tests do not yet have an equivalent compact suite controller; unpack comparison metrics are not yet complete |
 | Matched optimization comparison | versioned profiles, named experiments, worker CPU list, writer queue HWM/waits | No accepted worker-count 1/2/4 comparison exists. A one-worker coordinator/worker/writer run is not a serial-reference implementation and must be described as worker-count scaling |
 
@@ -171,7 +229,9 @@ AB_RE = Re(A * conj(B))
 AB_IM = Im(A * conj(B))
 ```
 
-Keep the product format unchanged. I/Q/U/V materialization or derivation is not part of this plan and must not be added to the implementation, tests, result schema or paper claims.
+Keep the product format unchanged. Add reference-only assertions for
+`I=AA+BB`, `Q=AA-BB`, `U=2*AB_RE`, and `V=-2*AB_IM`. Do not add separately
+materialized I/Q/U/V arrays to the implementation or output contract.
 
 - [ ] **Step 2: Add asymmetric known vectors**
 
@@ -315,6 +375,63 @@ If a run has a small deficit, classify its location before retrying: compare sen
 
 Stop the 30 Gbps suite at the first failure. Diagnose the receiver/NIC admission boundary from run JSON. Then run a descending named campaign using 25, 20, 15 and 10 Gbps, stopping at the first rate that passes the full warm-up-plus-three gate. Record 30 Gbps as an unresolved exploratory failure and the lower point as the formal Chapter 3 baseline.
 
+### Task 6A: Compare Staged Payload Copy with NSGE=2 Direct Placement
+
+**Files:**
+- Restore behind an explicit experiment-only selector: the last staged-copy
+  receiver implementation before commit
+  `3c4b7ae15a74512d57024e63516bd035503e5cb2`
+- Modify: `scripts/task8c_rate_point.py`
+- Modify: `tests/task8c_rate_point_test.py`
+- Modify: receiver metrics and tests only as required by the evidence fields
+
+**Interfaces:**
+- Consumes one Project-VDIF record geometry, accepted physical-line rate,
+  duration, sender/flow topology and receive-only baseline profile.
+- Produces two independent warm-up-plus-three suites whose only profile diff is
+  `payload_placement={STAGED_COPY,DIRECT_NSGE2}`.
+
+- [ ] **Step 1: Restore a correctness reference without changing the default**
+
+Keep `DIRECT_NSGE2` as the production default. Reintroduce staged copy as an
+explicit experiment path using the historical poll/completion queue → copy
+thread → raw-ring publication boundary. Unit tests require the selector,
+reject ambiguous configuration, and account exact copied bytes.
+
+- [ ] **Step 2: Freeze the matched experiment**
+
+The boundary is senders → `rdma2dada` → raw ring → `dada_dbnull`; do not start
+unpack or GPU. Use the same receiver/NIC/link/MTU, Project VDIF record bytes,
+packet rate, sender/flow count, endpoint/flow-rule structure, pacing/batching,
+aggregate physical line rate, duration, warm-up/measured counts, raw ring,
+WR depth, CQ poll batch, CPU affinity, NUMA, consumer and drain policy. `A=469`
+is preferred for consistency with the paper workload but is not required when
+record length, packet rate and flow topology match exactly. Allocate the copy
+thread one fixed CPU in both profiles; direct mode records it as unused so CPU
+sets remain explicit rather than silently changing placement.
+
+- [ ] **Step 3: Emit decisive receiver metrics**
+
+For each measured run retain placement mode, measured physical line rate,
+packet loss/deficit, receive-to-publication active-service P50/P95,
+receiver CPU-seconds/GB, raw-ring occupancy HWM/backpressure, payload copy
+bytes/memory traffic and minimum headroom. Sender rate alone is not a receiver
+throughput result.
+
+- [ ] **Step 4: Classify outcomes**
+
+If both modes pass, compare the matched medians and spreads. If staged copy
+fails while direct passes, report its effective performance boundary, packet
+deficit and first saturated boundary. Only if the primary point is conclusive
+and the author requests it, run separate matched searches for each mode's
+maximum stable physical line rate.
+
+- [ ] **Step 5: Keep the paper table minimal**
+
+Publish only: placement mode, measured physical line rate, repetitions,
+loss/deficit, P95 receive/publication service, CPU-seconds/GB,
+backpressure/HWM and headroom. Bind every row to its exact compact suite path.
+
 ### Task 7: Establish the Formal Unpack Performance Baseline
 
 **Files:**
@@ -397,5 +514,9 @@ Chapter 3 may report module numerical correctness, receive/unpack module perform
 
 - Spec coverage: all four requested module families, unpack repeatability, controlled optimization, compact artifacts, historical evidence reuse and Chapter 3/4 separation map to Tasks 1–9.
 - Interface conflicts: none require a product semantic change. The only planned product instrumentation adds aggregate counters and does not change packet/ring/header behavior.
-- Current blocker: HF is unavailable. Tasks 5–9 remain dormant until explicit user notification; Tasks 1–4 are local development work and still require normal GPU-server handoff after completion.
-- Claim boundary: worker-count comparison is not a serial-reference speedup; 30 Gbps remains unaccepted until warm-up plus three measured runs pass.
+- Current protocol status: production Full Power uses the accepted 60-second,
+  approximately 30-Gbps primary point; an optional wider physical-wire ladder
+  is not required to preserve that result and remains a separate decision.
+- Claim boundary: worker-count comparison is not a serial-reference speedup;
+  `A=2` full-chain evidence is prototype-only; production Power is accepted,
+  while production coherency/Stokes and GPU-only claims remain pending P3/P4.

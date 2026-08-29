@@ -14,6 +14,8 @@ struct VdifPacketView {
     const std::uint8_t* data;
     std::size_t bytes;
     std::uint64_t group_index;
+    std::uint16_t station_id;
+    std::uint32_t station_index;
 };
 
 class VdifSenderBatch {
@@ -21,7 +23,7 @@ public:
     VdifSenderBatch();
 
     bool Initialize(const VdifSenderSimConfig& config, std::string* error);
-    bool Prepare(std::uint64_t first_group,
+    bool Prepare(std::uint64_t first_packet,
                  std::uint32_t packet_count,
                  std::string* error);
 
@@ -35,7 +37,7 @@ private:
     std::uint32_t size_;
     std::vector<std::uint8_t> storage_;
     std::vector<VdifPacketView> packets_;
-    std::vector<std::uint8_t> repeat_template_;
+    std::vector<std::vector<std::uint8_t> > station_templates_;
 };
 
 }  // namespace simulation

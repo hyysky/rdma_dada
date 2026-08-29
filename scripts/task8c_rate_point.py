@@ -115,6 +115,13 @@ def required_process_roles(topology: PipelineTopology) -> tuple[str, ...]:
     return tuple(roles)
 
 
+def expected_sender_process_count(station_count: int) -> int:
+    """Return the host-sharded sender process count for one Observation."""
+    if station_count <= 0:
+        raise ValueError("Station count must be positive")
+    return 1 if station_count == 1 else 2
+
+
 @dataclasses.dataclass(frozen=True)
 class RateRequest:
     aggregate_gbps: float
@@ -751,6 +758,51 @@ def _aggregate_gbps_for_packet_rate(
     )
 
 
+def _sender_target_gbps(plan: RatePlan, station_count: int) -> float:
+    if station_count <= 0:
+        raise ValueError("sender station count must be positive")
+    if plan.packets_per_second:
+        target_bits_per_second = (
+            plan.packets_per_second
+            * plan.record_bytes
+            * 8
+            * station_count
+        )
+    else:
+        target_bits_per_second = int((
+            decimal.Decimal(str(plan.per_station_gbps))
+            * decimal.Decimal(station_count)
+            * decimal.Decimal(1_000_000_000)
+        ).to_integral_value(rounding=decimal.ROUND_HALF_UP))
+    return float(
+        decimal.Decimal(target_bits_per_second)
+        / decimal.Decimal(1_000_000_000)
+    )
+
+
+def _serialize_sender_config(
+    config: dict[str, Any], expected_target_bits_per_second: int
+) -> tuple[str, str]:
+    text = json.dumps(config, indent=2) + "\n"
+    match = re.search(r'"target_gbps"\s*:\s*([^,}\s]+)', text)
+    token = match.group(1) if match is not None else ""
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]{1,9})?", token) is None:
+        raise ValueError(
+            "serialized target_gbps must be a decimal JSON number with at "
+            "most 9 fractional digits"
+        )
+    observed_bits_per_second = (
+        decimal.Decimal(token) * decimal.Decimal(1_000_000_000)
+    )
+    if observed_bits_per_second != decimal.Decimal(
+        expected_target_bits_per_second
+    ):
+        raise ValueError(
+            "serialized target_gbps does not match integer target bits/s"
+        )
+    return text, token
+
+
 def _window_blocks_for_horizon(
     aggregate_gbps: float,
     missing_wait_ms: float,
@@ -1075,13 +1127,17 @@ def sender_source_identity(plan: RatePlan, run_identity: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class SenderSpec:
-    station_id: int
+    station_ids: tuple[int, ...]
     host: str
     source_ip: str
     source_port: int
     bundle_name: str
     remote_name: str
     log_name: str
+
+    @property
+    def station_id(self) -> int:
+        return self.station_ids[0]
 
 
 def sender_specs_for_plan(plan: RatePlan, run_identity: str) -> list[SenderSpec]:
@@ -1092,30 +1148,38 @@ def sender_specs_for_plan(plan: RatePlan, run_identity: str) -> list[SenderSpec]
     ):
         first_port = plan.sender_source_port_101
         second_port = plan.sender_source_port_102
-    topology = {
-        101: ("qtpulsar1", "174.0.1.100", first_port,
-              "sender101.json", "101.json", "sender101.log"),
-        102: ("qtpulsar2", "174.0.1.101", second_port,
-              "sender102.json", "102.json", "sender102.log"),
-    }
     stations = [int(value) for value in
                 plan.source.get("observation", {}).get("station_ids", [])]
-    if not stations or len(stations) > 2 or len(set(stations)) != len(stations):
-        raise ValueError("Task 8C requires one or two distinct Stations")
-    specs = []
-    for station_id in stations:
-        if station_id not in topology:
-            raise ValueError(f"unsupported Task 8C Station: {station_id}")
-        host, source_ip, source_port, bundle_name, remote_name, log_name = (
-            topology[station_id]
-        )
-        if len(stations) == 1 and plan.sender_source_port is not None:
+    if not stations or len(set(stations)) != len(stations):
+        raise ValueError("Task 8C requires distinct Observation Stations")
+    if len(stations) == 1:
+        station_id = stations[0]
+        if station_id not in (101, 102):
+            raise ValueError(f"unsupported single-Station diagnostic: {station_id}")
+        if station_id == 101:
+            host, source_ip, source_port = "qtpulsar1", "174.0.1.100", first_port
+            names = ("sender101.json", "101.json", "sender101.log")
+        else:
+            host, source_ip, source_port = "qtpulsar2", "174.0.1.101", second_port
+            names = ("sender102.json", "102.json", "sender102.log")
+        if plan.sender_source_port is not None:
             source_port = plan.sender_source_port
-        specs.append(SenderSpec(
-            station_id, host, source_ip, source_port,
-            bundle_name, remote_name, log_name,
-        ))
-    return specs
+        return [SenderSpec(
+            (station_id,), host, source_ip, source_port, *names
+        )]
+
+    split = (len(stations) + 1) // 2
+    partitions = (tuple(stations[:split]), tuple(stations[split:]))
+    endpoints = (
+        ("qtpulsar1", "174.0.1.100", first_port,
+         "sender101.json", "101.json", "sender101.log"),
+        ("qtpulsar2", "174.0.1.101", second_port,
+         "sender102.json", "102.json", "sender102.log"),
+    )
+    return [
+        SenderSpec(partition, *endpoint)
+        for partition, endpoint in zip(partitions, endpoints)
+    ]
 
 
 def build_sender_endpoint_probe() -> str:
@@ -1140,7 +1204,7 @@ finally:
 
 def build_sender_config(
     plan: RatePlan,
-    station_id: int,
+    station_ids: int | Sequence[int],
     source_ip: str,
     source_port: int,
     start_utc: str,
@@ -1155,20 +1219,27 @@ def build_sender_config(
     formal_start_seconds = int(resolved["group_start_seconds"])
     if formal_start_seconds < plan.unpack_start_delay_seconds:
         raise ValueError("unpack start delay crosses the VDIF reference epoch")
-    target_gbps = plan.per_station_gbps
-    if plan.packets_per_second:
-        target_gbps = (
-            plan.packets_per_second * plan.record_bytes * 8 / 1_000_000_000
-        )
+    configured_stations = (
+        [int(station_ids)]
+        if isinstance(station_ids, int)
+        else [int(value) for value in station_ids]
+    )
+    if not configured_stations or len(set(configured_stations)) != len(configured_stations):
+        raise ValueError("sender config requires distinct Station IDs")
+    target_gbps = _sender_target_gbps(plan, len(configured_stations))
     result = {
-        "schema_version": 2,
+        "schema_version": 2 if len(configured_stations) == 1 else 3,
         "source": {"ip": source_ip, "port": source_port},
         "destination": {
             "ip": receiver["destination_ip"],
             "port": receiver["destination_port"],
             "path_mtu": 9000,
         },
-        "station": {"station_id": station_id},
+        "station": (
+            {"station_id": configured_stations[0]}
+            if len(configured_stations) == 1
+            else {"station_ids": configured_stations}
+        ),
         "packet": {
             "first_channel_id": observation["first_channel_id"],
             "nchan": observation["nchan"],
@@ -2090,6 +2161,7 @@ class SshBackend:
         self._sender_runtime: list[dict[str, Any]] = []
         self._sender_endpoints: list[tuple[str, str, int]] = []
         self._sender_specs: list[SenderSpec] = []
+        self._sender_config_evidence: list[dict[str, Any]] = []
         self._compute_consumer = "dbdisk"
         self._pipeline_stage = "full"
         self._psrdada_paths = {
@@ -2224,20 +2296,34 @@ class SshBackend:
             if path.suffix == ".sh":
                 path.chmod(0o755)
         self._sender_endpoints = []
+        self._sender_config_evidence = []
         for spec in self._sender_specs:
             self._sender_endpoints.append(
                 (spec.host, spec.source_ip, spec.source_port)
             )
-            (bundle_root / spec.bundle_name).write_text(
-                json.dumps(
-                    build_sender_config(
-                        plan, spec.station_id, spec.source_ip,
-                        spec.source_port, start_utc
-                    ),
-                    indent=2,
-                )
-                + "\n"
+            target_bits_per_second = int(
+                decimal.Decimal(str(
+                    _sender_target_gbps(plan, len(spec.station_ids))
+                )) * decimal.Decimal(1_000_000_000)
             )
+            serialized, target_token = _serialize_sender_config(
+                build_sender_config(
+                    plan, spec.station_ids, spec.source_ip,
+                    spec.source_port, start_utc
+                ),
+                target_bits_per_second,
+            )
+            path = bundle_root / spec.bundle_name
+            path.write_text(serialized)
+            self._sender_config_evidence.append({
+                "host": spec.host,
+                "bundle_name": spec.bundle_name,
+                "station_count": len(spec.station_ids),
+                "target_bits_per_second": target_bits_per_second,
+                "target_gbps_token": target_token,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "python_version": sys.version,
+            })
         (bundle_root / "probe_sender_endpoint.py").write_text(
             build_sender_endpoint_probe()
         )
@@ -2473,6 +2559,7 @@ class SshBackend:
             "config_id": plan.config_id,
             "geometry_id": plan.geometry_id,
             "receiver_preflight": receiver_preflight,
+            "sender_config_evidence": list(self._sender_config_evidence),
         }
 
     def _resolve_psrdada_tool(self, tool: str) -> str:
@@ -2691,6 +2778,13 @@ class SshBackend:
         self.preparation["start_utc"] = start
         bundle_root = self._write_bundle(plan, start)
         self._transfer_sender_configs(bundle_root)
+        manifest_path = self.local_run_dir / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            manifest.setdefault("config", {})["sender_config_evidence"] = list(
+                self._sender_config_evidence
+            )
+            _atomic_json(manifest_path, manifest)
 
     def start_senders(self, plan: RatePlan, run_dir: pathlib.Path) -> list[Any]:
         if self._remaining_start_margin() < 90.0:
@@ -2732,6 +2826,7 @@ class SshBackend:
                 "host": host,
                 "role": "sender",
                 "station_id": spec.station_id,
+                "station_ids": list(spec.station_ids),
                 "argv": list(argv),
                 "env": {},
                 "cpu_affinity": [],
@@ -3159,13 +3254,34 @@ def _parse_sender_summary(output: str) -> dict[str, Any]:
 
 
 def _validate_sender(
-    summary: dict[str, Any], target: float, expected_station: int
+    summary: dict[str, Any], target: float, expected_stations: Sequence[int],
+    expected_groups: int,
 ) -> None:
     scheduled = int(summary.get("scheduled_packets", -1))
     sent = int(summary.get("sent_packets", -2))
     failed = int(summary.get("failed_packets", -1))
     backend = summary.get("backend")
-    station_id = int(summary.get("station_id", -1))
+    expected = [int(value) for value in expected_stations]
+    if len(expected) == 1:
+        station_identity_matches = (
+            int(summary.get("station_id", -1)) == expected[0]
+            and scheduled == expected_groups
+        )
+    else:
+        observed = [int(value) for value in summary.get("station_ids", [])]
+        counts = summary.get("station_counts", [])
+        station_identity_matches = (
+            observed == expected
+            and isinstance(counts, list)
+            and len(counts) == len(expected)
+            and all(
+                int(item.get("station_id", -1)) == station
+                and int(item.get("scheduled_packets", -1)) == expected_groups
+                and int(item.get("sent_packets", -2)) == expected_groups
+                for item, station in zip(counts, expected)
+            )
+            and scheduled == expected_groups * len(expected)
+        )
     payload_prefix = str(summary.get("payload_prefix_hex", ""))
     actual = float(summary.get("actual_payload_gbps", -1.0))
     error = abs(actual - target) / target if target else float("inf")
@@ -3173,7 +3289,7 @@ def _validate_sender(
         scheduled != sent
         or failed != 0
         or backend != "SENDMMSG"
-        or station_id != expected_station
+        or not station_identity_matches
         or re.fullmatch(r"[0-9a-f]{8}", payload_prefix) is None
         or error > 0.02
     ):
@@ -3917,19 +4033,26 @@ class RatePointController:
                 summaries = [
                     _parse_sender_summary(output) for output in sender_outputs
                 ]
-                stations = plan.source["observation"]["station_ids"]
-                if len(summaries) != len(stations):
+                expected_specs = sender_specs_for_plan(
+                    plan, sender_source_identity(plan, self.run_id)
+                )
+                if len(summaries) != len(expected_specs):
                     raise StageError(
                         "SENDERS_RUNNING",
                         ["validate", "sender-count"],
                         1,
                         str(len(summaries)),
-                        str(len(stations)),
+                        str(len(expected_specs)),
                         "PRODUCT_FAIL",
                     )
-                for summary, station in zip(summaries, stations):
+                for summary, spec in zip(
+                    summaries, expected_specs
+                ):
                     _validate_sender(
-                        summary, plan.per_station_gbps, int(station)
+                        summary,
+                        _sender_target_gbps(plan, len(spec.station_ids)),
+                        spec.station_ids,
+                        plan.sender_group_count,
                     )
             self._state("COLLECTING")
             statistics = self.backend.collect(plan, self.run_dir)
@@ -4327,6 +4450,14 @@ def _write_failure_debug(suite_root: pathlib.Path, run_id: str,
     (debug / "failed-process.log").write_text(
         stdout.rstrip("\n") + "\n" + stderr.rstrip("\n") + "\n"
     )
+    run_dir = suite_root / run_id
+    for candidate in (
+        run_dir / "qths" / "pipeline-worker.log",
+        run_dir / "qths-cleanup" / "pipeline-worker.log",
+    ):
+        if candidate.is_file():
+            shutil.copyfile(candidate, debug / "pipeline-worker.log")
+            break
     _atomic_json(debug / "resource-snapshot.json", {
         "cleanup": result.get("cleanup", {}),
         "statistics": result.get("statistics", {}),
@@ -4382,7 +4513,9 @@ def compact_suite_run(suite_root: pathlib.Path, run_id: str,
         try:
             task8c_artifacts.validate_process_ledger(
                 compact["processes"], required_process_roles(topology),
-                {"sender": int(manifest_plan.get("nant", 1))}
+                {"sender": expected_sender_process_count(
+                    int(manifest_plan.get("nant", 1))
+                )}
                 if topology.uses_network_senders else None,
             )
         except ValueError as error:
