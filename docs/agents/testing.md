@@ -172,6 +172,17 @@ raw-ring HWM/backpressure, copy bytes/memory traffic and minimum headroom. If
 copy fails while direct passes, retain the effective failure boundary and first
 saturated boundary; sender rate alone cannot establish either result.
 
+The versioned runner expresses this single-variable comparison with
+`--receiver-placement-mode NSGE2_DIRECT|STAGED_COPY`. `NSGE2_DIRECT` remains
+the default and invokes `rdma2dada`. `STAGED_COPY` invokes the independent
+`rdma2dada_staged_copy` executable and is valid only for `--pipeline-stage
+receive`; it must be rejected for unpack and full. The staged reference keeps
+one flow, one QP, one CQ and one receive/copy thread, receives the complete
+frame into registered staging slots, then copies only the Project VDIF record
+into the raw ring. Both modes must retain placement identity, copy bytes,
+receive/publication P50/P95, receiver thread CPU time, raw-ring used-byte HWM,
+raw-block acquire wait and cleanup evidence in compact JSON.
+
 Rate-point result directories use
 `<pipeline-stage>-<aggregate-rate>Gbps-<duration>s-<UTC timestamp>` so rate and
 time are visible without opening the manifest.

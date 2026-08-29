@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "adjudications": [
+    {
+      "adjudication_id": "rdma-staged-copy-30gbps-60s-20260829-count-closure",
+      "suite_id": "rdma2dada-30Gbps-60s-20260829T055947Z",
+      "suite_manifest_sha256": "4aff6ed793af58fafb39dd54f8dec1154c1cd4fb0181d26580264c89adbc7067",
+      "summary_sha256": "7704fd118a6a1f52e64bb639dc996b13ff77c09d044c3a6aaf8c0bda7d188fe8",
+      "source_manifest_sha256": "b0238093347213afd58eb3db2800bd42101ae5676b60297a0c54298f07667fe8",
+      "remote_suite_root": "/home/user/wy/task8c-ablation-results/rdma2dada-30Gbps-60s-20260829T055947Z",
+      "original_test_result": "PASS",
+      "effective_test_result": "PERFORMANCE_FAIL",
+      "effective_cleanup_result": "PASS",
+      "decision": "COUNT_CLOSURE_FAIL",
+      "reason_code": "RECEIVE_PREPARATION_RANGE_MASKED_PACKET_DEFICIT",
+      "scope": "INTERPRETATION_ONLY",
+      "explanation": "The historical receive-only validator allowed accepted packet counts within the preparation range when unpack_start_delay_seconds was 1. Receive-only acceptance requires every sender packet to be accepted and published; all four STAGED_COPY runs have a repeatable receiver deficit despite exact sender completion.",
+      "comparison_suite_id": "rdma2dada-30Gbps-60s-20260829T054121Z",
+      "expected_sender_packets_per_run": 55414230,
+      "runs": [
+        {
+          "run_id": "warmup-01",
+          "receiver_accepted": 55111237,
+          "receiver_published": 55111237,
+          "packet_deficit": 302993,
+          "packet_deficit_fraction": 0.005467783275162355
+        },
+        {
+          "run_id": "measured-01",
+          "receiver_accepted": 55111704,
+          "receiver_published": 55111704,
+          "packet_deficit": 302526,
+          "packet_deficit_fraction": 0.005459355836939357
+        },
+        {
+          "run_id": "measured-02",
+          "receiver_accepted": 55116309,
+          "receiver_published": 55116309,
+          "packet_deficit": 297921,
+          "packet_deficit_fraction": 0.005376254438616218
+        },
+        {
+          "run_id": "measured-03",
+          "receiver_accepted": 55114629,
+          "receiver_published": 55114629,
+          "packet_deficit": 299601,
+          "packet_deficit_fraction": 0.0054065715611315
+        }
+      ],
+      "invariants": {
+        "sender_scheduled_equals_sent": true,
+        "sender_failed_packets": 0,
+        "receiver_wrong_length": 0,
+        "receiver_cq_errors": 0,
+        "receiver_repost_failures": 0
+      },
+      "reader_rule": "When the suite ID and both suite hashes match, report effective_test_result and decision while retaining original_test_result as historical runner output. Do not describe this suite as PASS."
+    }
+  ]
+}

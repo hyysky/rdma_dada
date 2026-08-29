@@ -738,7 +738,8 @@ if(BUILD_RDMA_PIPELINE)
     set(RDMA_IO_SOURCES
         src/io/rdma/verbs_context.cpp
         src/io/rdma/packet_builder.cpp
-        src/io/rdma/receiver.cpp)
+        src/io/rdma/receiver.cpp
+        src/io/rdma/staged_copy_receiver.cpp)
     set(PSRDADA_IO_SOURCES
         src/io/psrdada/ring_writer.cpp
         src/io/psrdada/header_codec.cpp)
@@ -792,6 +793,12 @@ if(BUILD_RDMA_PIPELINE)
 
     add_executable(rdma2dada apps/rdma2dada/main.cpp)
     target_link_libraries(rdma2dada PRIVATE
+        rdma_dada_core
+        rdma_observation_compiler)
+
+    add_executable(rdma2dada_staged_copy
+        apps/rdma2dada_staged_copy/main.cpp)
+    target_link_libraries(rdma2dada_staged_copy PRIVATE
         rdma_dada_core
         rdma_observation_compiler)
 

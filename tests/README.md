@@ -47,7 +47,7 @@ ctest --test-dir build-linux --output-on-failure
 
 | CTest 名称 | 来源 | 功能 | 构建条件 |
 | --- | --- | --- | --- |
-| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、错误长度可恢复分类、致命 CQ 分类、1 秒 drain/4096 次空轮询计时门控/期间 WR 重投递，以及 zero/one/batch/partial raw tail 的完整-record 发布判定 | `BUILD_TESTING=ON` |
+| `rdma_receive_policy_test` | `rdma_receive_policy_test.cpp` | 不依赖 NIC 地验证仅目的端 MAC/IP/UDP 精确匹配、所有源字段通配、NSGE=2 错误长度分类、staged-copy 42-byte header stripping/零填/连续错误门限、1 秒 drain/4096 次空轮询计时门控、固定直方图 P50/P95，以及 raw tail 的完整-record 发布判定 | `BUILD_TESTING=ON` |
 | `project_vdif_v1_test` | `project_vdif_v1_test.cpp` | 对固定 32-byte Project VDIF v1 header 做 little-endian golden decode/encode，并校验 CI8/CI16 record 几何和保留字段错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_config_test` | `vdif_unpack_config_test.cpp` | 校验 ring key、Station ID→A 映射、两 block payload-only 窗口几何、profile 冲突、内存上限与溢出错误路径 | `BUILD_TESTING=ON` |
 | `vdif_unpack_header_test` | `vdif_unpack_header_test.cpp` | 校验 RAW→UNPACKED header 转换、观测 timeline 原样传播、按 `EXPECTED_GROUPS` 计算 `TRANSFER_SIZE`、未知字段保留、block-scoped ATFP/无包头几何及输入冲突不发布输出 | `BUILD_TESTING=ON` |
@@ -62,7 +62,7 @@ ctest --test-dir build-linux --output-on-failure
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault、schema v2 单 Station PACED，以及 schema v3 单 socket/固定 source port 多 Station 轮换顺序与逐 Station 统计 | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 4 Station/64 packet、16-packet batch、固定 source port、轮换顺序、逐 Station 计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
-| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用 `dada_junkdb` 按任意目标 payload 速率向上取整为整 compute blocks/s，严格核对逐 block 输入/输出；并覆盖基线漂移、preflight、进程账本、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；receive 可显式选择默认 `NSGE2_DIRECT` 或 receive-only `STAGED_COPY`，并锁定独立 binary、plan/metrics/process-ledger 身份和非 receive 拒绝；GPU-only 用 `dada_junkdb` 按整 compute blocks/s 注入；同时覆盖基线漂移、preflight、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
 | `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 `A=469,F=4,P=1,B=350` 的 `STAGED_PIPELINE/3` Beamform→Power→MEAN Integration（K=128）Observation 与确定性 FPAB2 int8 NPY 权重；使用配置编译器实际写出五个 4096-byte stage headers，核对其不重复 `STATION_IDS`、保留 `NANT=469`，并检查各级 block bytes、582,400-byte output block、受管的 sender/unpack 配置及双速率口径 | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
 | `task8c_profiles_test` | `task8c_profiles_test.py` | 验证 passing profile 严格 schema、原文件 SHA、默认填充、显式覆盖和逐字段 drift | 找到 Python 3 |
 | `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
@@ -109,7 +109,7 @@ ctest --test-dir build-linux --output-on-failure
 
 ## 单项调用
 
-### RDMA direct raw 接收策略
+### RDMA raw 接收与 placement ablation
 
 可移植策略测试：
 
@@ -121,6 +121,11 @@ ctest --test-dir build -R '^rdma_receive_policy_test$' --output-on-failure
 真实 NIC/PSRDADA 三机测试统一由 HF 上的版本化
 `scripts/task8c_rate_point.py` 驱动；qths1 不反向 SSH 到 sender。该控制器分别连接接收端和两个发送端，并覆盖有限传输
 CQ tail、partial raw block、unpack 计数守恒和 compute 输出验证。
+
+`--receiver-placement-mode NSGE2_DIRECT` 是默认和生产路径。
+`--receiver-placement-mode STAGED_COPY` 只允许与 `--pipeline-stage receive`
+组合，调用独立的 `rdma2dada_staged_copy`；它不能用于 unpack/full，
+避免参考 copy 路径意外取代已验收的 direct placement。
 
 ### `pipeline_config_test`
 

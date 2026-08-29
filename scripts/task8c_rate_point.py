@@ -140,6 +140,7 @@ class RateRequest:
     processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
+    receiver_placement_mode: str = "NSGE2_DIRECT"
     unpack_missing_per_second: bool = False
     unpack_start_delay_seconds: int = 0
     station_id: int | None = None
@@ -176,6 +177,15 @@ class RateRequest:
         if self.compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
         topology = pipeline_topology(self.pipeline_stage)
+        if self.receiver_placement_mode not in ("NSGE2_DIRECT", "STAGED_COPY"):
+            raise ValueError(
+                "receiver_placement_mode must be NSGE2_DIRECT or STAGED_COPY"
+            )
+        if (
+            self.receiver_placement_mode == "STAGED_COPY"
+            and self.pipeline_stage != "receive"
+        ):
+            raise ValueError("STAGED_COPY is restricted to receive pipeline_stage")
         if self.pipeline_stage in ("receive", "unpack") and self.compute_consumer != "dbnull":
             raise ValueError(f"{self.pipeline_stage} pipeline_stage requires dbnull")
         if self.pipeline_stage == "receive" and self.unpack_missing_per_second:
@@ -349,6 +359,7 @@ class RatePlan:
     processing_numa_node: int | None = None
     receiver_poll_batch: int = 32
     receiver_wr_num: int = 1024
+    receiver_placement_mode: str = "NSGE2_DIRECT"
     unpack_missing_per_second: bool = False
     unpack_start_delay_seconds: int = 0
     preparation_groups: int = 0
@@ -375,6 +386,14 @@ class RatePlan:
     @property
     def topology(self) -> PipelineTopology:
         return pipeline_topology(self.pipeline_stage)
+
+    @property
+    def receiver_binary_name(self) -> str:
+        return (
+            "rdma2dada_staged_copy"
+            if self.receiver_placement_mode == "STAGED_COPY"
+            else "rdma2dada"
+        )
 
     @property
     def effective_ingress_numa_node(self) -> int | None:
@@ -1028,6 +1047,7 @@ def compile_rate_plan(
         processing_numa_node=request.processing_numa_node,
         receiver_poll_batch=request.receiver_poll_batch,
         receiver_wr_num=request.receiver_wr_num,
+        receiver_placement_mode=request.receiver_placement_mode,
         unpack_missing_per_second=request.unpack_missing_per_second,
         unpack_start_delay_seconds=request.unpack_start_delay_seconds,
         preparation_groups=preparation_groups,
@@ -1380,6 +1400,7 @@ def build_qths_bundle(
             dada_junkdb_path, qths_binary_dir,
         )
     receive_only = plan.pipeline_stage == "receive"
+    receiver_binary_name = plan.receiver_binary_name
     full_gpu_pipeline = plan.uses_pipeline_worker
     consumer_key = (
         plan.raw_key if receive_only
@@ -1631,7 +1652,7 @@ project={qths_binary_dir}
 {pipeline_worker_start}
 rm -f "$run_dir/pipeline.ready"
 {worker_start}
-{ingress_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {ingress_prefix}"$project/rdma2dada" --plan "$run_dir/resolved_observation.json" --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{receiver_args} >"$run_dir/receiver.log" 2>&1 &
+{ingress_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/receiver.exit" {ingress_prefix}"$project/{receiver_binary_name}" --plan "$run_dir/resolved_observation.json" --poll-batch {plan.receiver_poll_batch} --recv-wr-num {plan.receiver_wr_num}{receiver_args} >"$run_dir/receiver.log" 2>&1 &
 echo $! >"$run_dir/receiver.pid"
 for _ in $(seq 1 300); do
 {readiness_checks}
@@ -1702,7 +1723,7 @@ fi
 fi
 ''' if full_gpu_pipeline else "") + f"""
 if [[ -f "$run_dir/capability.added" ]]; then
-  binary={qths_binary_dir}/rdma2dada
+  binary={qths_binary_dir}/{receiver_binary_name}
   sudo -n setcap -r "$binary" || status=1
   if [[ -n "$(getcap "$binary")" ]]; then
     echo "capability still present on $binary" >&2
@@ -2461,7 +2482,11 @@ class SshBackend:
         hashes.update(self._transfer_sender_configs(bundle_root))
         binaries = [
             *(
-                (("qths1", "rdma2dada", self.qths_binary_dir / "rdma2dada"),)
+                ((
+                    "qths1",
+                    plan.receiver_binary_name,
+                    self.qths_binary_dir / plan.receiver_binary_name,
+                ),)
                 if plan.topology.uses_receiver else ()
             ),
             *(
@@ -2538,7 +2563,7 @@ class SshBackend:
         receiver_preflight = None
         if plan.topology.uses_receiver:
             preflight_argv = [
-                str(self.qths_binary_dir / "rdma2dada"),
+                str(self.qths_binary_dir / plan.receiver_binary_name),
                 "--plan",
                 f"{self.remote_run_dir}/resolved_observation.json",
                 "--preflight-only",
@@ -2701,7 +2726,7 @@ class SshBackend:
             ring_key_resolvers[name]() for name in plan.topology.rings
         ]
         if plan.topology.requires_rdma_capability:
-            binary = str(self.qths_binary_dir / "rdma2dada")
+            binary = str(self.qths_binary_dir / plan.receiver_binary_name)
             try:
                 self._ssh(
                     "qths1",
@@ -3432,7 +3457,13 @@ def _validate_statistics(
         ("receiver", "wrong_length"): 0,
         ("receiver", "cq_errors"): 0,
     }
-    if not plan.unpack_start_delay_seconds:
+    receiver_statistics = statistics.get("receiver", {})
+    if isinstance(receiver_statistics, dict) and "placement_mode" in receiver_statistics:
+        required[("receiver", "placement_mode")] = plan.receiver_placement_mode
+    if (
+        not plan.unpack_start_delay_seconds
+        or plan.pipeline_stage == "receive"
+    ):
         required.update({
             ("receiver", "accepted"): expected_receiver_records,
             ("receiver", "published"): expected_receiver_records,
@@ -3506,7 +3537,10 @@ def _validate_statistics(
                 ("compute", "sample_prefix_hex"): expected_sample_prefix,
             })
     mismatches = []
-    if plan.unpack_start_delay_seconds:
+    if (
+        plan.unpack_start_delay_seconds
+        and plan.pipeline_stage != "receive"
+    ):
         receiver = statistics.get("receiver", {})
         accepted = int(receiver.get("accepted", -1))
         published = int(receiver.get("published", -2))
@@ -3657,7 +3691,8 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
         "cq_errors": sum(receiver_log.count(pattern) for pattern in cq_patterns),
     }
     direct_match = re.search(
-        r"Direct receive summary:\s*poll_calls=(\d+),\s*"
+        r"(Direct|Staged) receive summary:\s*"
+        r"(?:placement=([A-Z0-9_]+),\s*)?poll_calls=(\d+),\s*"
         r"empty_polls=(\d+),\s*full_polls=(\d+),\s*"
         r"reposted_wrs=(\d+),\s*repost_failures=(\d+),\s*"
         r"repost_batches=(\d+),\s*min_posted_wrs=(\d+),\s*"
@@ -3665,11 +3700,20 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
         r"completion_to_repost_ns_total=(\d+),\s*"
         r"completion_to_repost_ns_max=(\d+)"
         r"(?:,\s*drain_duration_ns=(\d+),\s*"
-        r"completions_after_stop=(\d+),\s*exit_reason=([A-Z_]+))?",
+        r"completions_after_stop=(\d+)"
+        r"(?:,\s*staged_copy_bytes=(\d+),\s*"
+        r"staged_copy_ns_total=(\d+),\s*"
+        r"receive_publication_ns_p50=(\d+),\s*"
+        r"receive_publication_ns_p95=(\d+),\s*"
+        r"receive_thread_cpu_ns=(\d+),\s*"
+        r"raw_ring_used_bytes_high_watermark=(\d+),\s*"
+        r"raw_block_acquire_wait_ns_total=(\d+),\s*"
+        r"raw_block_acquire_wait_ns_max=(\d+))?"
+        r",\s*exit_reason=([A-Z_]+))?",
         receiver_log,
     )
     if direct_match:
-        numeric_groups = direct_match.groups()[:10]
+        numeric_groups = direct_match.groups()[2:12]
         result["direct"] = dict(zip(
             (
                 "poll_calls", "empty_polls", "full_polls",
@@ -3680,12 +3724,28 @@ def _parse_receiver_statistics(receiver_log: str) -> dict[str, Any]:
             ),
             (int(value) for value in numeric_groups),
         ))
-        if direct_match.group(11) is not None:
+        result["placement_mode"] = (
+            direct_match.group(2)
+            or ("NSGE2_DIRECT" if direct_match.group(1) == "Direct" else "STAGED_COPY")
+        )
+        if direct_match.group(13) is not None:
             result["direct"].update({
-                "drain_duration_ns": int(direct_match.group(11)),
-                "completions_after_stop": int(direct_match.group(12)),
-                "exit_reason": direct_match.group(13),
+                "drain_duration_ns": int(direct_match.group(13)),
+                "completions_after_stop": int(direct_match.group(14)),
+                "exit_reason": direct_match.group(23),
             })
+        staged_names = (
+            "staged_copy_bytes", "staged_copy_ns_total",
+            "receive_publication_ns_p50", "receive_publication_ns_p95",
+            "receive_thread_cpu_ns", "raw_ring_used_bytes_high_watermark",
+            "raw_block_acquire_wait_ns_total",
+            "raw_block_acquire_wait_ns_max",
+        )
+        if direct_match.group(15) is not None:
+            result["direct"].update(dict(zip(
+                staged_names,
+                (int(value) for value in direct_match.groups()[14:22]),
+            )))
     return result
 
 
@@ -4361,7 +4421,12 @@ def _compact_processes(run_dir: pathlib.Path,
         "raw-ring": "dada_db",
         "compute-ring": "dada_db",
         "output-ring": "dada_db",
-        "rdma2dada": "rdma2dada",
+        "rdma2dada": (
+            "rdma2dada_staged_copy"
+            if isinstance(plan, dict)
+            and plan.get("receiver_placement_mode") == "STAGED_COPY"
+            else "rdma2dada"
+        ),
         "vdif_unpack_worker": "vdif_unpack_worker",
         "pipeline_worker": "pipeline_worker",
         "dada_junkdb": "dada_junkdb",
@@ -4800,6 +4865,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--receiver-poll-batch", type=int, default=None)
     parser.add_argument("--receiver-wr-num", type=int, default=None)
     parser.add_argument(
+        "--receiver-placement-mode",
+        choices=("NSGE2_DIRECT", "STAGED_COPY"),
+        default="NSGE2_DIRECT",
+        help=(
+            "receive placement mechanism; STAGED_COPY is an explicit "
+            "receive-only ablation reference"
+        ),
+    )
+    parser.add_argument(
         "--station-id",
         type=int,
         choices=(101, 102),
@@ -4936,6 +5010,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.receiver_poll_batch if args.receiver_poll_batch is not None else 32
         ),
         receiver_wr_num=args.receiver_wr_num if args.receiver_wr_num is not None else 1024,
+        receiver_placement_mode=args.receiver_placement_mode,
         unpack_missing_per_second=args.unpack_missing_per_second,
         unpack_start_delay_seconds=(
             args.unpack_start_delay_seconds

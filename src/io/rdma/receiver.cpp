@@ -120,7 +120,10 @@ struct RoCEv2Dada::DirectReceiveState {
           repost_batches(0), posted_wrs(wr_depth), min_posted_wrs(wr_depth),
           poll_batch_high_watermark(0), completion_to_repost_ns_total(0),
           completion_to_repost_ns_max(0), drain_duration_ns(0),
-          completions_after_stop(0),
+          completions_after_stop(0), receive_thread_cpu_ns(0),
+          raw_ring_used_bytes_high_watermark(0),
+          raw_block_acquire_wait_ns_total(0),
+          raw_block_acquire_wait_ns_max(0),
           exit_reason(RoCEv2Dada::ReceiveExitReason::kNotStopped),
           consecutive_wrong_length(0),
           targets(wr_depth) {}
@@ -147,8 +150,13 @@ struct RoCEv2Dada::DirectReceiveState {
     std::atomic<std::uint64_t> completion_to_repost_ns_max;
     std::atomic<std::uint64_t> drain_duration_ns;
     std::atomic<std::uint64_t> completions_after_stop;
+    std::atomic<std::uint64_t> receive_thread_cpu_ns;
+    std::atomic<std::uint64_t> raw_ring_used_bytes_high_watermark;
+    std::atomic<std::uint64_t> raw_block_acquire_wait_ns_total;
+    std::atomic<std::uint64_t> raw_block_acquire_wait_ns_max;
     std::atomic<RoCEv2Dada::ReceiveExitReason> exit_reason;
     std::uint32_t consecutive_wrong_length;
+    rdma_dada::io::rdma::ReceiveLatencyHistogram batch_latency;
 };
 
 RoCEv2Dada::RoCEv2Dada(const RdmaParam& value)
@@ -161,7 +169,7 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam& value)
         param.poll_batch == 0U || param.poll_batch > param.recv_wr_num ||
         param.poll_cpu_id < -1 || !param.PrepareRawRingMemory ||
         !param.AcquireRawBlockPtr || !param.CommitRawBlockPtr ||
-        !param.ReleaseRawRingMemory) {
+        !param.ReleaseRawRingMemory || !param.RawRingUsedBytesPtr) {
         fprintf(stderr, "[ERROR] Invalid direct raw receive parameters.\n");
         return;
     }
@@ -250,7 +258,13 @@ RoCEv2Dada::RoCEv2Dada(const RdmaParam& value)
 bool RoCEv2Dada::AcquireDirectBlock() {
     if (!receive_state || receive_state->blocks.size() >= 2U) return false;
     DirectRawBlockLease lease = {};
-    if (param.AcquireRawBlockPtr(&lease) != 0 || !lease.addr ||
+    const std::uint64_t started_ns = MonotonicRawNs();
+    const int acquire_result = param.AcquireRawBlockPtr(&lease);
+    const std::uint64_t acquire_ns = MonotonicRawNs() - started_ns;
+    receive_state->raw_block_acquire_wait_ns_total.fetch_add(acquire_ns);
+    UpdateAtomicMax(&receive_state->raw_block_acquire_wait_ns_max,
+                    acquire_ns);
+    if (acquire_result != 0 || !lease.addr ||
         lease.bytes == 0U || lease.bytes % param.pkt_size != 0U) {
         fprintf(stderr, "[ERROR] Failed to acquire aligned raw ring block.\n");
         if (receive_state) receive_state->failed.store(true);
@@ -322,6 +336,9 @@ bool RoCEv2Dada::PublishReadyDirectBlocks(bool replenish) {
         }
         published_receive_packets.fetch_add(lease.bytes / param.pkt_size);
         published_receive_blocks.fetch_add(1);
+        UpdateAtomicMax(
+            &receive_state->raw_ring_used_bytes_high_watermark,
+            param.RawRingUsedBytesPtr());
         receive_state->blocks.pop_front();
         if (replenish && !AcquireDirectBlock()) return false;
     }
@@ -343,6 +360,8 @@ bool RoCEv2Dada::PublishDirectTail() {
     }
     published_receive_packets.fetch_add(records);
     published_receive_blocks.fetch_add(1);
+    UpdateAtomicMax(&receive_state->raw_ring_used_bytes_high_watermark,
+                    param.RawRingUsedBytesPtr());
     if (valid_bytes < block.lease.bytes) {
         partial_receive_blocks.fetch_add(1);
         cq_tail_receive_records.store(records);
@@ -362,6 +381,13 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
     std::uint64_t drain_deadline_ns = 0;
     bool draining = false;
     bool drain_deadline_reached = false;
+    const std::uint64_t cpu_started_ns = []() {
+        struct timespec value = {};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value);
+        return static_cast<std::uint64_t>(value.tv_sec) *
+                   UINT64_C(1000000000) +
+               static_cast<std::uint64_t>(value.tv_nsec);
+    }();
 
     while (!state->failed.load()) {
         if (receiver->stop_requested.load() && !draining) {
@@ -488,12 +514,20 @@ void *RoCEv2Dada::ReceiveDirectThread(void *arg) {
             state->reposted_wrs.fetch_add(repost_count);
             state->posted_wrs.fetch_add(repost_count);
             state->repost_batches.fetch_add(1);
+            state->batch_latency.Observe(reposted_ns - completed_ns);
         }
         if (drain_deadline_reached) break;
     }
     if (state->failed.load())
         state->exit_reason.store(ReceiveExitReason::kError);
     if (!state->failed.load()) receiver->PublishDirectTail();
+    struct timespec cpu_ended = {};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_ended);
+    const std::uint64_t cpu_ended_ns =
+        static_cast<std::uint64_t>(cpu_ended.tv_sec) *
+            UINT64_C(1000000000) +
+        static_cast<std::uint64_t>(cpu_ended.tv_nsec);
+    state->receive_thread_cpu_ns.store(cpu_ended_ns - cpu_started_ns);
     return NULL;
 }
 
@@ -566,7 +600,15 @@ int RoCEv2Dada::Stop() {
            ", completion_to_repost_ns_total=%" PRIu64
            ", completion_to_repost_ns_max=%" PRIu64
            ", drain_duration_ns=%" PRIu64
-           ", completions_after_stop=%" PRIu64 ", exit_reason=%s\n",
+           ", completions_after_stop=%" PRIu64
+           ", staged_copy_bytes=0, staged_copy_ns_total=0"
+           ", receive_publication_ns_p50=%" PRIu64
+           ", receive_publication_ns_p95=%" PRIu64
+           ", receive_thread_cpu_ns=%" PRIu64
+           ", raw_ring_used_bytes_high_watermark=%" PRIu64
+           ", raw_block_acquire_wait_ns_total=%" PRIu64
+           ", raw_block_acquire_wait_ns_max=%" PRIu64
+           ", exit_reason=%s\n",
            stats.poll_calls, stats.empty_polls, stats.full_polls,
            stats.reposted_wrs, stats.repost_failures,
            stats.repost_batches, stats.min_posted_wrs,
@@ -574,6 +616,12 @@ int RoCEv2Dada::Stop() {
            stats.completion_to_repost_ns_total,
            stats.completion_to_repost_ns_max,
            stats.drain_duration_ns, stats.completions_after_stop,
+           stats.receive_publication_ns_p50,
+           stats.receive_publication_ns_p95,
+           stats.receive_thread_cpu_ns,
+           stats.raw_ring_used_bytes_high_watermark,
+           stats.raw_block_acquire_wait_ns_total,
+           stats.raw_block_acquire_wait_ns_max,
            stats.exit_reason == ReceiveExitReason::kDrainDeadline
                ? "DRAIN_DEADLINE"
                : stats.exit_reason == ReceiveExitReason::kError
@@ -608,6 +656,20 @@ RoCEv2Dada::ReceiveStats RoCEv2Dada::GetReceiveStats() const {
         stats.drain_duration_ns = receive_state->drain_duration_ns.load();
         stats.completions_after_stop =
             receive_state->completions_after_stop.load();
+        stats.staged_copy_bytes = 0;
+        stats.staged_copy_ns_total = 0;
+        stats.receive_publication_ns_p50 =
+            receive_state->batch_latency.Percentile(50);
+        stats.receive_publication_ns_p95 =
+            receive_state->batch_latency.Percentile(95);
+        stats.receive_thread_cpu_ns =
+            receive_state->receive_thread_cpu_ns.load();
+        stats.raw_ring_used_bytes_high_watermark =
+            receive_state->raw_ring_used_bytes_high_watermark.load();
+        stats.raw_block_acquire_wait_ns_total =
+            receive_state->raw_block_acquire_wait_ns_total.load();
+        stats.raw_block_acquire_wait_ns_max =
+            receive_state->raw_block_acquire_wait_ns_max.load();
         stats.exit_reason = receive_state->exit_reason.load();
     }
     return stats;

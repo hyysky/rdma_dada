@@ -1566,6 +1566,60 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertNotIn("compute_key", plan.as_dict())
         self.assertNotIn("compute_block_bytes", plan.as_dict())
 
+    def test_staged_copy_is_explicit_receive_only_reference(self):
+        MODULE.RateRequest(
+            30.0,
+            60.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+            receiver_placement_mode="STAGED_COPY",
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "STAGED_COPY.*receive"):
+            MODULE.RateRequest(
+                30.0,
+                60.0,
+                compute_consumer="dbnull",
+                pipeline_stage="full",
+                receiver_placement_mode="STAGED_COPY",
+            ).validate()
+
+    def test_receive_bundle_selects_independent_staged_copy_binary(self):
+        plan = dataclasses.replace(
+            make_plan(
+                30.0,
+                60.0,
+                compute_consumer="dbnull",
+                pipeline_stage="receive",
+            ),
+            receiver_placement_mode="STAGED_COPY",
+        )
+
+        bundle = MODULE.build_qths_bundle(
+            plan,
+            "/tmp/task8c-staged-copy",
+            qths_binary_dir="/opt/rdma-ablation",
+        )
+
+        self.assertIn(
+            '"$project/rdma2dada_staged_copy" --plan', bundle["start.sh"]
+        )
+        self.assertNotIn('"$project/rdma2dada" --plan', bundle["start.sh"])
+        self.assertEqual(plan.as_dict()["receiver_placement_mode"], "STAGED_COPY")
+
+    def test_receive_bundle_keeps_direct_path_as_default(self):
+        plan = make_plan(
+            30.0,
+            60.0,
+            compute_consumer="dbnull",
+            pipeline_stage="receive",
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-direct")
+        self.assertIn('"$project/rdma2dada" --plan', bundle["start.sh"])
+        self.assertNotIn("rdma2dada_staged_copy", bundle["start.sh"])
+        self.assertEqual(
+            plan.as_dict()["receiver_placement_mode"], "NSGE2_DIRECT"
+        )
+
     def test_gpu_stage_uses_only_compute_and_output_rings(self):
         plan = make_plan(
             30.0,
@@ -1995,6 +2049,39 @@ class Task8cRatePointTest(unittest.TestCase):
             MODULE._validate_statistics(statistics, plan, "")
         self.assertEqual(raised.exception.classification, "PERFORMANCE_FAIL")
 
+    def test_receive_stage_preparation_still_requires_all_sender_packets(self):
+        plan = dataclasses.replace(
+            make_plan(
+                15.0,
+                30.0,
+                compute_consumer="dbnull",
+                pipeline_stage="receive",
+            ),
+            unpack_start_delay_seconds=1,
+            preparation_groups=227_108,
+            packets_per_second=227_108,
+        )
+        expected_records = plan.sender_group_count * plan.nant
+        statistics = {
+            "receiver": {
+                "accepted": expected_records - 1,
+                "published": expected_records - 1,
+                "wrong_length": 0,
+                "cq_errors": 0,
+            },
+            "raw": {
+                "consumer": "dada_dbnull",
+                "exit_code": 0,
+                "zero_copy": True,
+                "single_transfer": True,
+            },
+        }
+
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertEqual(raised.exception.classification, "PERFORMANCE_FAIL")
+        self.assertIn("receiver.accepted", raised.exception.stderr)
+
     def test_direct_receiver_summary_is_parsed(self):
         receiver = (
             "[RDMA] Receive summary: accepted=99, wrong_length=1, zeroed=1, "
@@ -2018,6 +2105,33 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(parsed["direct"]["drain_duration_ns"], 1000042000)
         self.assertEqual(parsed["direct"]["completions_after_stop"], 17)
         self.assertEqual(parsed["direct"]["exit_reason"], "DRAIN_DEADLINE")
+
+    def test_staged_receiver_ablation_metrics_are_parsed(self):
+        receiver = (
+            "[RDMA] Receive summary: accepted=100, wrong_length=0, zeroed=0, "
+            "published=100, blocks=1, partial_blocks=1, cq_tail_records=4\n"
+            "[RDMA] Staged receive summary: placement=STAGED_COPY, "
+            "poll_calls=10, empty_polls=3, full_polls=2, reposted_wrs=100, "
+            "repost_failures=0, repost_batches=7, min_posted_wrs=900, "
+            "poll_batch_high_watermark=32, "
+            "completion_to_repost_ns_total=1234, "
+            "completion_to_repost_ns_max=80, drain_duration_ns=1000000000, "
+            "completions_after_stop=0, staged_copy_bytes=412800, "
+            "staged_copy_ns_total=9000, receive_publication_ns_p50=31, "
+            "receive_publication_ns_p95=63, receive_thread_cpu_ns=50000, "
+            "raw_ring_used_bytes_high_watermark=52838400, "
+            "raw_block_acquire_wait_ns_total=400, "
+            "raw_block_acquire_wait_ns_max=200, "
+            "exit_reason=DRAIN_DEADLINE\n"
+        )
+        parsed = MODULE._parse_receiver_statistics(receiver)
+        self.assertEqual(parsed["placement_mode"], "STAGED_COPY")
+        self.assertEqual(parsed["direct"]["staged_copy_bytes"], 412800)
+        self.assertEqual(parsed["direct"]["receive_publication_ns_p95"], 63)
+        self.assertEqual(
+            parsed["direct"]["raw_ring_used_bytes_high_watermark"],
+            52838400,
+        )
 
     def test_unpack_stage_dbnull_statistics_do_not_require_gpu_marker(self):
         plan = make_plan(

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -209,6 +210,54 @@ void TestDirectRawOutstandingBlockOrder() {
            "direct raw drains outstanding ring blocks in order");
 }
 
+void TestStagedCopyRecordPolicy() {
+    namespace rdma = rdma_dada::io::rdma;
+    const std::size_t record_bytes = 8;
+    std::vector<unsigned char> frame(
+        rdma::kDirectRawHeaderBytes + record_bytes, 0);
+    for (std::size_t index = 0; index < record_bytes; ++index) {
+        frame[rdma::kDirectRawHeaderBytes + index] =
+            static_cast<unsigned char>(index + 1);
+    }
+    std::vector<unsigned char> record(record_bytes, 0);
+    std::uint32_t consecutive = 0;
+
+    Expect(rdma::CopyStagedRawRecord(
+               frame.data(), frame.size(), record_bytes, record.data(),
+               &consecutive) == rdma::StagedRawCopyAction::kCopied,
+           "staged reference copies one Project VDIF record");
+    for (std::size_t index = 0; index < record_bytes; ++index) {
+        Expect(record[index] == static_cast<unsigned char>(index + 1),
+               "staged reference strips the 42-byte network prefix");
+    }
+    Expect(consecutive == 0,
+           "valid staged record resets wrong-length sequence");
+
+    std::memset(record.data(), 0xff, record.size());
+    Expect(rdma::CopyStagedRawRecord(
+               frame.data(), frame.size() - 1U, record_bytes, record.data(),
+               &consecutive) == rdma::StagedRawCopyAction::kZeroed,
+           "isolated staged wrong length zero-fills one raw slot");
+    Expect(std::all_of(record.begin(), record.end(),
+                       [](unsigned char value) { return value == 0; }),
+           "staged wrong-length record is completely zeroed");
+}
+
+void TestReceiveLatencyHistogram() {
+    namespace rdma = rdma_dada::io::rdma;
+    rdma::ReceiveLatencyHistogram histogram;
+    histogram.Observe(10);
+    histogram.Observe(20);
+    histogram.Observe(30);
+    histogram.Observe(40);
+    Expect(histogram.count() == 4,
+           "receive latency histogram counts CQ batches");
+    Expect(histogram.Percentile(50) >= 20 && histogram.Percentile(50) <= 31,
+           "receive latency histogram reports bounded P50");
+    Expect(histogram.Percentile(95) >= 40,
+           "receive latency histogram reports bounded P95");
+}
+
 }  // namespace
 
 int main() {
@@ -220,6 +269,8 @@ int main() {
     TestDirectRawDrainPolicy();
     TestDirectRawBlockProgress();
     TestDirectRawOutstandingBlockOrder();
+    TestStagedCopyRecordPolicy();
+    TestReceiveLatencyHistogram();
     if (failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", failures);
         return 1;

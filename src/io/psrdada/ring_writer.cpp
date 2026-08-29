@@ -142,7 +142,20 @@ void PsrdadaRingBuf::ResetAfterInitFailure(bool write_locked)
 int PsrdadaRingBuf::AcquireWriteBlock(WriteBlockLease *lease)
 {
     std::lock_guard<std::mutex> lock(ring_mutex_);
-    if (!is_initialized || !lease || !use_block_registration ||
+    return AcquireWriteBlockInternal(lease, true);
+}
+
+int PsrdadaRingBuf::AcquireHostWriteBlock(WriteBlockLease *lease)
+{
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    return AcquireWriteBlockInternal(lease, false);
+}
+
+int PsrdadaRingBuf::AcquireWriteBlockInternal(
+    WriteBlockLease *lease, bool require_registered_mr)
+{
+    if (!is_initialized || !lease ||
+        (require_registered_mr && !use_block_registration) ||
         outstanding_blocks_.size() >= 2U) {
         return -1;
     }
@@ -165,7 +178,7 @@ int PsrdadaRingBuf::AcquireWriteBlock(WriteBlockLease *lease)
             break;
         }
     }
-    if (!mr) {
+    if (require_registered_mr && !mr) {
         fprintf(stderr, "No registered MR for acquired PSRDADA block\n");
         return -1;
     }

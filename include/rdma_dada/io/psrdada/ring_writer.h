@@ -36,6 +36,7 @@ public:
              uint64_t record_bytes,
              const rdma_dada::pipeline::Metadata& runtime_header);
     int AcquireWriteBlock(WriteBlockLease *lease);
+    int AcquireHostWriteBlock(WriteBlockLease *lease);
     int CommitWriteBlock(uint64_t token, uint64_t bytes);
     int StartBlock();
     int StopBlock();
@@ -84,6 +85,8 @@ private:
     void GetBufferStats(uint64_t &free_space, uint64_t &used_space);
     void ResetAfterInitFailure(bool write_locked);
     int CloseOutstandingBlocks();
+    int AcquireWriteBlockInternal(WriteBlockLease *lease,
+                                  bool require_registered_mr);
 
     // 线程安全：互斥锁保护关键方法
     std::mutex ring_mutex_;

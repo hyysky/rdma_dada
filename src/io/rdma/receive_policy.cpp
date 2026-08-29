@@ -89,6 +89,59 @@ bool DirectRawDrainDeadlineReached(std::uint64_t now_ns,
     return now_ns >= deadline_ns;
 }
 
+StagedRawCopyAction CopyStagedRawRecord(
+    const unsigned char* frame, std::size_t frame_bytes,
+    std::size_t record_bytes, unsigned char* destination,
+    std::uint32_t* consecutive_wrong_length) {
+    if (!frame || !destination || !consecutive_wrong_length ||
+        record_bytes == 0U) {
+        return StagedRawCopyAction::kFatal;
+    }
+    const std::size_t expected = kDirectRawHeaderBytes + record_bytes;
+    if (frame_bytes != expected) {
+        ++(*consecutive_wrong_length);
+        if (*consecutive_wrong_length >= kDirectRawMaxConsecutiveWrongLength)
+            return StagedRawCopyAction::kFatal;
+        std::memset(destination, 0, record_bytes);
+        return StagedRawCopyAction::kZeroed;
+    }
+    *consecutive_wrong_length = 0;
+    std::memcpy(destination, frame + kDirectRawHeaderBytes, record_bytes);
+    return StagedRawCopyAction::kCopied;
+}
+
+ReceiveLatencyHistogram::ReceiveLatencyHistogram()
+    : buckets_(), count_(0) {}
+
+void ReceiveLatencyHistogram::Observe(std::uint64_t nanoseconds) {
+    std::size_t bucket = 0;
+    std::uint64_t value = nanoseconds;
+    while (value > 1U && bucket + 1U < buckets_.size()) {
+        value >>= 1U;
+        ++bucket;
+    }
+    ++buckets_[bucket];
+    ++count_;
+}
+
+std::uint64_t ReceiveLatencyHistogram::count() const { return count_; }
+
+std::uint64_t ReceiveLatencyHistogram::Percentile(
+    unsigned int percentile) const {
+    if (count_ == 0U || percentile == 0U || percentile > 100U) return 0U;
+    const std::uint64_t wanted =
+        (count_ * percentile + UINT64_C(99)) / UINT64_C(100);
+    std::uint64_t seen = 0;
+    for (std::size_t bucket = 0; bucket < buckets_.size(); ++bucket) {
+        seen += buckets_[bucket];
+        if (seen >= wanted) {
+            if (bucket == 63U) return UINT64_MAX;
+            return (UINT64_C(1) << (bucket + 1U)) - 1U;
+        }
+    }
+    return UINT64_MAX;
+}
+
 DirectRawBlockProgress::DirectRawBlockProgress(std::size_t slot_count)
     : assigned_(slot_count, 0), completed_(slot_count, 0),
       assigned_count_(0), completed_count_(0) {}

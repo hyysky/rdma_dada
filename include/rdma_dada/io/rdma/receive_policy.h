@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <vector>
 
@@ -75,6 +76,29 @@ bool ShouldRepostDirectRawWr(bool stop_requested,
                              bool drain_deadline_reached);
 bool DirectRawDrainDeadlineReached(std::uint64_t now_ns,
                                    std::uint64_t deadline_ns);
+
+enum class StagedRawCopyAction {
+    kCopied,
+    kZeroed,
+    kFatal
+};
+
+StagedRawCopyAction CopyStagedRawRecord(
+    const unsigned char* frame, std::size_t frame_bytes,
+    std::size_t record_bytes, unsigned char* destination,
+    std::uint32_t* consecutive_wrong_length);
+
+class ReceiveLatencyHistogram {
+  public:
+    ReceiveLatencyHistogram();
+    void Observe(std::uint64_t nanoseconds);
+    std::uint64_t count() const;
+    std::uint64_t Percentile(unsigned int percentile) const;
+
+  private:
+    std::array<std::uint64_t, 64> buckets_;
+    std::uint64_t count_;
+};
 
 class DirectRawBlockProgress {
   public:

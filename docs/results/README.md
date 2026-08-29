@@ -13,3 +13,19 @@ user's explicit approval. Each promoted item also retains the verified
 `origin` object, including the source host and exact absolute remote suite
 path, so the selected evidence remains externally traceable after runtime
 catalogs are cleaned or moved.
+
+## Evidence adjudications
+
+`evidence-adjudications.json` records interpretation corrections without
+modifying immutable suite artifacts. Reporting tasks must look up the exact
+`suite_id` before using a suite. An adjudication applies only when its
+`summary_sha256` and `suite_manifest_sha256` match the imported catalog entry;
+a hash mismatch invalidates the override and must be reported rather than
+guessed around.
+
+When a matching adjudication exists, report `effective_test_result` and
+`decision` as the accepted interpretation while retaining
+`original_test_result` as historical runner output. Continue reading all
+measurements from the original `runs/*.json` and evidence logs. Never edit the
+original `summary.json`, regenerate its manifest, or silently replace its
+recorded result.
