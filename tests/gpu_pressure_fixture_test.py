@@ -86,6 +86,10 @@ class GpuPressureFixtureTest(unittest.TestCase):
 
             self.assertEqual(len(observation["station_ids"]), 469)
             self.assertEqual(len(set(observation["station_ids"])), 469)
+            self.assertEqual(
+                observation["observation_id"],
+                "gpu-pressure-a469-f4-p1-b350",
+            )
             self.assertEqual(observation["nchan"], 4)
             self.assertEqual(observation["npol"], 1)
             self.assertEqual(observation["sample_interval_ps"], 1_000_000)
@@ -134,6 +138,67 @@ class GpuPressureFixtureTest(unittest.TestCase):
             self.assertIn("'descr': '|i1'", header)
             self.assertIn("'shape': (4, 1, 469, 350, 2)", header)
             self.assertEqual(len(payload), 4 * 1 * 469 * 350 * 2)
+            self.assertNotEqual(payload, bytes(len(payload)))
+
+    def test_generates_a469_f2_p2_b350_coherency_fixture(self):
+        """Catches a generator that cannot express the production Stokes mode."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(GENERATOR),
+                    "--output-dir",
+                    str(output),
+                    "--product",
+                    "coherency",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            config_path = output / "gpu-pressure-a469-f2-p2-b350-coherency.json"
+            weights_path = output / "gpu-pressure-f2-p2-a469-b350-i8.npy"
+            config = json.loads(config_path.read_text())
+            observation = config["observation"]
+            modules = config["processing"]["modules"]
+
+            self.assertEqual(observation["nchan"], 2)
+            self.assertEqual(observation["npol"], 2)
+            self.assertEqual(
+                [module["type"] for module in modules],
+                ["beamform", "stokes", "integrate"],
+            )
+            self.assertEqual(modules[0]["weights_file"], weights_path.name)
+            self.assertEqual(
+                modules[2],
+                {"type": "integrate", "length": 128, "operation": "MEAN"},
+            )
+
+            signal_payload_gbps = (
+                len(observation["station_ids"])
+                * observation["nchan"]
+                * observation["npol"]
+                * 2
+                * 8
+                * 1_000_000
+                / 1_000_000_000
+            )
+            self.assertAlmostEqual(signal_payload_gbps, 30.016)
+
+            samples_per_block = (
+                config["blocks"]["groups_per_block"]
+                * config["wire"]["samples_per_packet"]
+            )
+            integrated_samples = samples_per_block // modules[2]["length"]
+            output_block_bytes = integrated_samples * 2 * 350 * 4 * 4
+            self.assertEqual(output_block_bytes, 1_164_800)
+
+            header, payload = read_npy_v1(weights_path)
+            self.assertIn("'shape': (2, 2, 469, 350, 2)", header)
+            self.assertEqual(len(payload), 2 * 2 * 469 * 350 * 2)
             self.assertNotEqual(payload, bytes(len(payload)))
 
     @unittest.skipIf(COMPILER is None, "observation_config_compile not supplied")
@@ -200,6 +265,78 @@ class GpuPressureFixtureTest(unittest.TestCase):
                 self.assertEqual(len(header), 4096)
                 self.assertNotIn(b"STATION_IDS ", header)
                 self.assertIn(b"NANT 469\n", header)
+
+    @unittest.skipIf(COMPILER is None, "observation_config_compile not supplied")
+    def test_compiler_accepts_production_full_coherency_fixture(self):
+        """Catches loss of the P=2 polarization labels before Stokes."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            generated = subprocess.run(
+                [
+                    sys.executable,
+                    str(GENERATOR),
+                    "--output-dir",
+                    str(output),
+                    "--project-root",
+                    str(ROOT),
+                    "--product",
+                    "coherency",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+
+            compiled = subprocess.run(
+                [
+                    str(COMPILER),
+                    "--config",
+                    str(output / "gpu-pressure-a469-f2-p2-b350-coherency.json"),
+                    "--budget-payload-gbps",
+                    "30",
+                    "--output-dir",
+                    str(output / "artifacts"),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            report = json.loads(compiled.stdout)
+            self.assertTrue(report["valid"])
+            self.assertEqual(
+                report["stage_headers"],
+                [
+                    "RAW",
+                    "UNPACKED",
+                    "CONVERTED",
+                    "BEAMFORMED",
+                    "POLARIZATION_PRODUCTS_INTEGRATED",
+                ],
+            )
+            self.assertEqual(
+                report["gpu_pipeline_budget"]["block_bytes"],
+                {
+                    "compute": 49_946_624,
+                    "converted": 199_786_496,
+                    "beamformed": 149_094_400,
+                    "product": 149_094_400,
+                    "output": 1_164_800,
+                },
+            )
+            for name in (
+                "raw.header",
+                "unpacked.header",
+                "converted.header",
+                "beamformed.header",
+                "output.header",
+            ):
+                header = (output / "artifacts" / name).read_bytes()
+                self.assertEqual(len(header), 4096)
+                self.assertNotIn(b"STATION_IDS ", header)
+                self.assertIn(b"NANT 469\n", header)
+                self.assertIn(b"POL_LABELS X,Y\n", header)
 
 
 if __name__ == "__main__":

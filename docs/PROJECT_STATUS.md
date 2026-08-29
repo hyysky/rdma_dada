@@ -57,7 +57,7 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 | `fpga_sender_sim` | 已验收 | 多服务器模拟 Station；Project VDIF；source port；`sendmmsg`；定速及错误注入 | 用于重复速率和异常观测验收 |
 | `rdma2dada` | 30 Gbps 正式重复门禁已通过 | destination-only flow；1 QP/CQ/线程；NSGE=2 直接写 raw ring；固定 1 秒 drain | 保留 35 Gbps 未通过边界，后续只在接收实现变化时重跑正式基线 |
 | `vdif_unpack_worker` | 30 Gbps 正式重复门禁已通过 | coordinator + 固定 parser worker pool + 单 compute writer；有界队列和 window lease/ACK；Station→A、补零、partial/EOD | 完整 GPU 链复用已验收 profile，不重复把 unchanged ingest/unpack 当新模块测试 |
-| `pipeline_worker` | 469-Station Full Power 约 30 Gbps 正式重复门禁已通过 | 保留 `SYNCHRONOUS_DIRECT/1`；新增 1–4 个有界 staged slots，每 slot 独占 output pinned staging、device buffers、non-blocking stream 和事件；compute ring 由 CUDA 直接注册，单 writer 按 block sequence 写 output ring；读取以 compute-ring EOD 收口 | 后续只在明确实验中做 direct/staged 或 slot-count 匹配对照；GPU-only 暂缓 |
+| `pipeline_worker` | 469-Station Full Power 与 coherency/Stokes 约 30 Gbps 正式重复门禁均已通过 | 保留 `SYNCHRONOUS_DIRECT/1`；新增 1–4 个有界 staged slots，每 slot 独占 output pinned staging、device buffers、non-blocking stream 和事件；compute ring 由 CUDA 直接注册，单 writer 按 block sequence 写 output ring；读取以 compute-ring EOD 收口 | 后续只在明确实验中做 direct/staged 或 slot-count 匹配对照；GPU-only 暂缓 |
 | 分阶段测试控制器 | full profile 集成及正式重复门禁已通过 | 支持 `receive`、`unpack`、`gpu`、`full`；full 继承 qths1 unpack profile，固定 CPU/NUMA、queue、ring/window、source port 和 1 秒 preparation；Full 汇总使用 sender aggregate payload rate | 保持通过配置为基线；只有实现或实验参数变化时才重跑相关拓扑 |
 | 测试结果 Catalog | 已完成服务器验收 | 原子导入 compact suite；确定性 JSON/CSV；按拓扑/速率/结果/日期/profile 查询；显式证据提升；测试任务只回传开发任务 | 开发任务维护汇总表；“总结成文”在更新论文时按需查询 |
 | `dada2rdma` | 待开发 | 已定义职责边界 | 完成整链验收后设计 processed packetization 与发送路径 |
@@ -90,6 +90,7 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 | ATFP unpack 功能与 ring integration | 已通过 | full/partial/连续 transfer、补零、ATFP bytes、header/EOD |
 | 旧串行/TFPA 路径 | 已淘汰 | 实时性不足，已由 ATFP + 并行 unpack + direct receive 替代 |
 | 30 Gbps receive-only，60 s | 正式通过 | 1 warm-up + 3 measured；每轮 accepted=published=54,505,814，CQ/repost/长度错误为 0，固定端口、EOD、cleanup 通过 |
+| RDMA placement 对照，30 Gbps/60 s | 已完成 | `NSGE=2` direct suite `rdma2dada-30Gbps-60s-20260829T054121Z` 四轮精确闭合；staged-copy suite `rdma2dada-30Gbps-60s-20260829T055947Z` 四轮均出现约 0.54% receiver deficit，作为受控性能失败边界保留，并由 `evidence-adjudications.json` 覆盖旧 runner 的 PASS 判定 |
 | 30 Gbps receive + unpack，60 s | 正式通过 | 1 warm-up + 3 measured；固定 receiver CPU13、worker CPU14--19、sink CPU20、NUMA1、1 秒 preparation；sender/receiver/unpack/dbnull 精确闭合，missing/late/duplicate/header error 为 0 |
 | Receiver 停止排空 | 已通过服务器验收 | 固定 1 秒 drain；四轮 drain 约 1.000 秒，期间 completion/repost 正常，`completions_after_stop=0` |
 | 35 Gbps unpack-only，60 s | 未通过 | receiver 接收量约为计划的一半；尚未证明 unpack 是首个饱和阶段 |
@@ -100,22 +101,23 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 | 低速完整 GPU pipeline | 已通过服务器验收 | 0.1 Gbps，1 warm-up + 3 measured；双 Station sender、receiver、unpack、GPU、output header/EOD 和 cleanup 每轮精确闭合 |
 | 30 Gbps 完整 GPU pipeline，60 s | 原型正式通过 | `A=2` 小几何，1 warm-up + 3 measured；sender、receiver、unpack、三 slot CUDA、output、dbnull/EOD 和 cleanup 每轮闭合；不能替代论文 `A=469` 主几何验收 |
 | 469-Station full Power | 正式通过 | suite `full-30.2505Gbps-60s-20260829T033639Z`；`A=469,F=4,P=1,B=350`、`STAGED_PIPELINE/3`、Beamform→Power→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563937–30.248563939 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合 |
-| 469-Station full coherency/Stokes | 待正式验收 | 输出 `AA/BB/AB_REAL/AB_IMAG`；reference 同时核对 I/Q/U/V 推导，工程不单独发布 I/Q/U/V 数组 |
+| 469-Station full coherency/Stokes | 正式通过 | suite `full-30.2505Gbps-60s-20260829T075447Z`；`A=469,F=2,P=2,B=350`、`STAGED_PIPELINE/3`、Beamform→Stokes→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563934–30.248563938 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合；输出 `AA/BB/AB_REAL/AB_IMAG`，reference 另行核对 I/Q/U/V 推导 |
 | 500-Station 完整 GPU pipeline | 待输入能力 | 必须由多 Station sender 或合法 raw-VDIF generator 提供约 500 个 Station，覆盖 Station-ID→A、unpack、GPU 和 output；不能用双 Station 结果替代 |
 | 低错误率/长时间连续观测 | 待执行 | 错误率目标 0.001%–0.1%；还需 Station 失败、资源恢复和稳态验证 |
 | 论文第3章模块证据闭环 | 部分完成 | receive/unpack 正式基线已具备；仍需 GPU 模块 suite 收口、unpack 指标补齐及 1/2/4 worker 匹配比较 |
 
 因此当前最准确的表述是：**30 Gbps receive-only、receive+unpack，以及生产几何
-`A=469,F=4,P=1,B=350` Full Power pipeline 均已完成 60 秒、1 warm-up + 3 measured
-的正式重复门禁。** 论文 Power 完整链主验收已有权威证据；coherency/Stokes GPU-only
-和 full 正式结果仍待完成。
+Full Power（`A=469,F=4,P=1,B=350`）与 Full coherency/Stokes
+（`A=469,F=2,P=2,B=350`）pipeline 均已完成 60 秒、1 warm-up + 3 measured
+的正式重复门禁。** 论文两种产品模式的完整链主验收均已有权威 compact 证据；
+GPU-only 持续压力和论文决定性利用率/headroom 指标仍待补齐。
 详细证据与边界见 [`VDIF_UNPACK_STATUS.md`](VDIF_UNPACK_STATUS.md)。
 
 ## 下一阶段顺序
 
-1. 冻结并复用已通过的 469-Station Full Power profile、source port、CPU/NUMA、preparation、ring/window 和 binary identity；不重复测试未变化的 ingest/unpack。
-2. 提交当前 Full Power 实现后，在独立分支 `codex/rdma-staged-copy-ablation` 执行 RDMA staged-copy 与 NSGE=2 direct placement 的匹配对照。
-3. 返回主开发分支继续 coherency/Stokes GPU-only/full 正式验收、论文决定性指标补齐和 module registry。
+1. 冻结并复用已通过的 469-Station Full Power 与 coherency/Stokes profile、source port、CPU/NUMA、preparation、ring/window 和 binary identity；不重复测试未变化的 ingest/unpack。
+2. 保留已完成的 RDMA staged-copy 与 NSGE=2 direct placement 匹配对照及其证据裁决，不再为同一结论重跑。
+3. 按论文缺口补 GPU-only 匹配性能、阶段 P50/P95、利用率、headroom 和 first-saturated-stage；随后再推进 module registry。
 
 具体可执行任务见
 [`docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md`](superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md)。

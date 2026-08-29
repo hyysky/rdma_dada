@@ -63,7 +63,8 @@ ctest --test-dir build-linux --output-on-failure
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault、schema v2 单 Station PACED，以及 schema v3 单 socket/固定 source port 多 Station 轮换顺序与逐 Station 统计 | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 4 Station/64 packet、16-packet batch、固定 source port、轮换顺序、逐 Station 计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
 | `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用 `dada_junkdb` 按任意目标 payload 速率向上取整为整 compute blocks/s，严格核对逐 block 输入/输出；并覆盖基线漂移、preflight、进程账本、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
-| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 `A=469,F=4,P=1,B=350` 的 `STAGED_PIPELINE/3` Beamform→Power→MEAN Integration（K=128）Observation 与确定性 FPAB2 int8 NPY 权重；使用配置编译器实际写出五个 4096-byte stage headers，核对其不重复 `STATION_IDS`、保留 `NANT=469`，并检查各级 block bytes、582,400-byte output block、受管的 sender/unpack 配置及双速率口径 | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
+| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 Power `A=469,F=4,P=1,B=350` 与 coherency `A=469,F=2,P=2,B=350` 的 `STAGED_PIPELINE/3` Observation 和确定性 FPAB2 int8 NPY 权重；使用配置编译器实际写出五个 4096-byte stage headers，核对 `NANT=469`、固定 `POL_LABELS X,Y`、各级 block bytes，以及 582,400/1,164,800-byte 积分输出 block | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
+| `coherency_numerical_evidence_test` | `coherency_numerical_evidence_test.py` | 验证 Stokes CPU/CUDA 测试写出的机器可读 shape/bytes、`AA/BB/AB_REAL/AB_IMAG`、容差、max abs/rel error、NaN/Inf 与 reference-only I/Q/U/V 推导误差；不改变工程输出契约 | CPU：`BUILD_TESTING=ON`；CUDA：`USE_CUDA=ON` |
 | `task8c_profiles_test` | `task8c_profiles_test.py` | 验证 passing profile 严格 schema、原文件 SHA、默认填充、显式覆盖和逐字段 drift | 找到 Python 3 |
 | `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
 | `task8c_catalog_test` | `task8c_catalog_test.py` | 验证 compact suite 的严格 manifest/路径检查、原子导入、确定性 JSON/CSV Catalog、选择性查询和显式证据提升 | 找到 Python 3；不访问网络或 Git |
@@ -92,8 +93,8 @@ ctest --test-dir build-linux --output-on-failure
 | `complex_convert_cuda_test` | `complex_convert_cuda_test.cpp` | 在 caller-owned non-default stream 上验证融合 ATFP→TFPA 转置、CI8/CI16→CF32、scale、partial/non-tile/大矩阵、CPU oracle 精确一致及错误 context | `USE_CUDA=ON` |
 | `power_module_test` | `power_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFPB/F32`、header/byte rate、两帧数值结果和错误路径 | `BUILD_TESTING=ON` |
 | `power_cuda_test` | `power_cuda_test.cpp` | 在 worker 风格 non-blocking stream 上验证异步 Power kernel 与 CPU 已知结果一致 | `USE_CUDA=ON` |
-| `stokes_module_test` | `stokes_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFBS/F32`、四个相关产物、双偏振约束、header 和错误路径 | `BUILD_TESTING=ON` |
-| `stokes_cuda_test` | `stokes_cuda_test.cpp` | 在 non-blocking stream 上验证异步 Stokes kernel 与 CPU 已知结果一致 | `USE_CUDA=ON` |
+| `stokes_module_test` | `stokes_module_test.cpp` | 验证 CPU reference 的 `TFPB/CF32→TFBS/F32`、四个相关产物、双偏振约束、header 和错误路径；`--result-json` 生成数值证据 | `BUILD_TESTING=ON` |
+| `stokes_cuda_test` | `stokes_cuda_test.cpp` | 在 non-blocking stream 上验证异步 Stokes kernel 与 CPU 已知结果一致；`--result-json` 生成数值证据 | `USE_CUDA=ON` |
 | `time_integrate_module_test` | `time_integrate_module_test.cpp` | 验证 TFPB/TFBS 的 SUM/MEAN、累计积分 header、block 缩短、容量/整除/重叠等错误路径 | `BUILD_TESTING=ON` |
 | `time_integrate_cuda_test` | `time_integrate_cuda_test.cpp` | 在 worker 风格 non-blocking stream 上验证异步时间积分与已知结果一致 | `USE_CUDA=ON` |
 | `transfer_cuda_roundtrip_test` | `transfer_cuda_roundtrip_test.cpp` | 将确定性字节块依次通过 H2D 和 D2H，检查 header、size、sequence 与最终逐字节结果 | `USE_CUDA=ON` |
@@ -566,19 +567,26 @@ CPU reference：
 
 ```bash
 ./build/stokes_module_test
+./build/stokes_module_test --result-json /tmp/stokes-cpu.json
 ctest --test-dir build -R '^stokes_module_test$' --output-on-failure
+ctest --test-dir build -R '^coherency_numerical_evidence_test$' --output-on-failure
 ```
 
 CUDA：
 
 ```bash
 ./build-cuda/stokes_cuda_test
+./build-cuda/stokes_cuda_test --result-json /tmp/stokes-cuda.json
 ctest --test-dir build-cuda -R '^stokes_cuda_test$' --output-on-failure
+ctest --test-dir build-cuda \
+  -R '^coherency_cuda_numerical_evidence_test$' --output-on-failure
 ```
 
 两个测试使用相同的 `T=2、F=2、P=2、B=2` 输入，逐项检查
 `AA、BB、AB_REAL、AB_IMAG`。CUDA 测试使用 worker 风格 non-blocking stream；
-没有可用 CUDA device 时返回 77，由 CTest 标记为 skipped。
+数值证据另外记录 shape/bytes、abs/rel tolerance、max error、NaN/Inf，并只在
+reference check 中推导 I/Q/U/V。没有可用 CUDA device 时返回 77，由 CTest 标记为
+skipped。
 
 ### H2D/D2H round-trip 测试
 

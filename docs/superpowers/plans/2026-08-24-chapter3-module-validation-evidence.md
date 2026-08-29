@@ -43,22 +43,25 @@ Power uses `A=469,F=4,P=1,B=350`. The initial coherency/Stokes profile uses
 30-Gbps aggregate signal load. Exact physical, UDP and signal rates remain
 compiler-derived result fields.
 
-An `A=2` Power full-chain PASS is prototype evidence only. Production Power has
-now passed at the selected approximately 30-Gbps point for 60 seconds with one
-warm-up and three measured repetitions; suite
-`full-30.2505Gbps-60s-20260829T033639Z` is imported and promoted. Final
-coherency/Stokes claims and any optional full rate ladder remain pending.
+An `A=2` Power full-chain PASS is prototype evidence only. Production Power and
+coherency/Stokes have now both passed at the selected approximately 30-Gbps
+point for 60 seconds with one warm-up and three measured repetitions. Suites
+`full-30.2505Gbps-60s-20260829T033639Z` (Power) and
+`full-30.2505Gbps-60s-20260829T075447Z` (coherency/Stokes) are imported and
+promoted. Any optional full rate ladder remains pending.
 
 The minimum ordered backlog is:
 
 - **P1 — evidence custody:** import the accepted 469-Station unpack suite into
   the local catalog and verify its compact manifest before pruning its remote
   copy.
-- **P2a — RDMA placement mechanism:** compare the historical staged payload
-  copy path with `NSGE=2` direct raw-ring placement at the receive-only
-  boundary. Change only placement mode and report
-  receiver CPU-seconds/GB, receive/publication service P50/P95, raw-ring HWM or
-  backpressure, copy bytes/memory traffic, loss/deficit and headroom.
+- **P2a — RDMA placement mechanism (completed):** matched 30-Gbps/60-second
+  warm-up+3 suites compare staged payload copy with `NSGE=2` direct raw-ring
+  placement at the receive-only boundary. Direct closed every packet count;
+  staged copy lost about 0.54% before publication despite exact sender counts.
+  The original staged runner PASS is preserved, with the effective
+  `PERFORMANCE_FAIL/COUNT_CLOSURE_FAIL` interpretation recorded in
+  `docs/results/evidence-adjudications.json`.
 - **P2b — GPU numerical evidence:** emit machine-readable shape/byte counts,
   tolerance, maximum absolute/relative error, and NaN/Inf counts for conversion,
   beamforming, Power, coherency and SUM/MEAN integration. Verify the I/Q/U/V
@@ -66,9 +69,9 @@ The minimum ordered backlog is:
 - **P3 — GPU-only performance:** run 469-Station Power and coherency modes and
   the minimum matched `SYNCHRONOUS_DIRECT/1` versus `STAGED_PIPELINE/3`
   comparison needed to quantify the optimization.
-- **P4 — full pipeline:** production-geometry full Power is accepted at the
-  approximately 30-Gbps/60-second protocol. Formally accept full coherency at
-  the matched protocol; existing `A=2` full results remain prototype evidence.
+- **P4 — full pipeline:** production-geometry full Power and full coherency are
+  accepted at the matched approximately 30-Gbps/60-second protocol; existing
+  `A=2` full results remain prototype evidence.
 - **P5 — decisive metrics:** retain per-stage P50/P95, block arrival interval,
   minimum stage headroom, ring/queue HWM or backpressure, CPU/GPU/PCIe
   utilization, and the evidence-backed first saturated stage.
@@ -89,9 +92,9 @@ requested or when promoting evidence for a paper claim.
 | Chapter 3 module family | Reusable implementation/tests | Evidence gap before paper acceptance |
 | --- | --- | --- |
 | Observation/config identity/Project VDIF | `observation_config_test`, `resolved_observation_plan_test`, `config_identity_test`, `packet_format_config_test`, `project_vdif_v1_test`, `observation_artifacts_test`, `observation_config_compile_test` | Existing tests are individually useful, but need one three-repetition suite with exact binary/config identity and compact JSON output |
-| RDMA receive/raw-ring boundary | `rdma_receive_policy_test`; controller `receive` stage; 30 Gbps/60 s warm-up+3 formal `NSGE=2` PASS with CQ/repost/accepted/published counters | No matched 469-Station staged-copy reference exists; direct versus staged payload placement is a required Section 3 mechanism experiment |
+| RDMA receive/raw-ring boundary | `rdma_receive_policy_test`; controller `receive` stage; matched 30 Gbps/60 s warm-up+3 suites `rdma2dada-30Gbps-60s-20260829T054121Z` (NSGE=2 exact closure) and `rdma2dada-30Gbps-60s-20260829T055947Z` (staged-copy effective performance failure with about 0.54% deficit); CQ/repost, CPU, copy bytes/time, publication latency and raw HWM retained | Remaining limitation is metric interpretation/plotting, not another placement data run; use the adjudication instead of the staged suite's historical runner PASS |
 | Parallel VDIF unpack | config/header/timeline/engine/ATFP/writer unit tests, `vdif_unpack_worker_integration_test`; 30 Gbps/60 s warm-up+3 formal PASS | Need three-repetition module-suite packaging plus parse/copy/raw-block service timing, process CPU usage and worker-count comparison |
-| GPU format/beam/product/integration/transfer | CPU and CUDA tests for conversion, Beamform, Power, Stokes, integration and transfer; CUDA chain/product tests; production Full Power suite `full-30.2505Gbps-60s-20260829T033639Z` passed warm-up+3 | Need one authoritative three-repetition module suite with machine-readable numerical error fields and the production coherency/Stokes performance result. Stokes output remains `AA`, `BB`, `AB_REAL`, `AB_IMAG`; the reference also checks the derived I/Q/U/V equations without publishing separate arrays |
+| GPU format/beam/product/integration/transfer | CPU and CUDA tests for conversion, Beamform, Power, Stokes, integration and transfer; machine-readable CPU/CUDA coherency evidence reports shape/bytes, tolerances, max abs/rel error and NaN/Inf; production Full Power suite `full-30.2505Gbps-60s-20260829T033639Z` and Full coherency suite `full-30.2505Gbps-60s-20260829T075447Z` both passed warm-up+3 | Need the authoritative three-repetition module-suite packaging and GPU-only matched performance/utilization evidence. Stokes output remains `AA`, `BB`, `AB_REAL`, `AB_IMAG`; the reference also checks the derived I/Q/U/V equations without publishing separate arrays |
 | Result artifacts | `task8c_artifacts.py`, suite `preflight.json`, `summary.json`, `runs/*.json`, evidence logs and first-failure debug contract | CTest module tests do not yet have an equivalent compact suite controller; unpack comparison metrics are not yet complete |
 | Matched optimization comparison | versioned profiles, named experiments, worker CPU list, writer queue HWM/waits | No accepted worker-count 1/2/4 comparison exists. A one-worker coordinator/worker/writer run is not a serial-reference implementation and must be described as worker-count scaling |
 
@@ -518,5 +521,6 @@ Chapter 3 may report module numerical correctness, receive/unpack module perform
   approximately 30-Gbps primary point; an optional wider physical-wire ladder
   is not required to preserve that result and remains a separate decision.
 - Claim boundary: worker-count comparison is not a serial-reference speedup;
-  `A=2` full-chain evidence is prototype-only; production Power is accepted,
-  while production coherency/Stokes and GPU-only claims remain pending P3/P4.
+  `A=2` full-chain evidence is prototype-only; production Power and
+  coherency/Stokes full chains are accepted, while GPU-only performance claims
+  remain pending P3.

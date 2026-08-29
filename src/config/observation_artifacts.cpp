@@ -117,6 +117,9 @@ pipeline::Metadata BuildRawHeader(const ResolvedObservationPlan& plan,
     header.SetUint64("NANT", plan.nant);
     header.SetUint64("NCHAN", plan.source.nchan);
     header.SetUint64("NPOL", plan.source.npol);
+    if (plan.source.npol == 2U) {
+        header.SetString("POL_LABELS", "X,Y");
+    }
     header.SetUint64("NBIT", 16U);
     header.SetString("SAMPLE_FORMAT", "CI8");
     header.SetString("SAMPLE_ENCODING", "TWOS_COMPLEMENT");

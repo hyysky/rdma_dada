@@ -148,6 +148,10 @@ the compiler and sender plan must derive and record the exact physical, UDP and
 signal rates rather than copying a nominal value. Power retains
 `A=469,F=4,P=1,B=350`.
 
+For Project Observation v1, `NPOL=2` has the fixed polarization order `X,Y`.
+The compiler writes `POL_LABELS X,Y` into the stage-header chain automatically;
+the Observation JSON does not carry a separately configurable label list.
+
 The paper's formal duration and rate-point schedule are still an explicit
 campaign decision. Until that decision is recorded, retain the existing
 30-second `1/5/10/20/30/35/40` physical-wire campaign unchanged and do not use

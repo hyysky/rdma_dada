@@ -3,12 +3,23 @@
 
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace {
 
 int failures = 0;
+const float kAbsoluteTolerance = 1.0e-6f;
+const float kRelativeTolerance = 1.0e-6f;
+
+struct ErrorEvidence {
+    float max_absolute;
+    float max_relative;
+    std::uint64_t nan_count;
+    std::uint64_t inf_count;
+};
 
 void Expect(bool condition, const std::string& message) {
     if (!condition) {
@@ -18,11 +29,78 @@ void Expect(bool condition, const std::string& message) {
 }
 
 void ExpectNear(float actual, float expected, const std::string& message) {
-    if (std::fabs(actual - expected) > 1.0e-6f) {
+    if (std::fabs(actual - expected) > kAbsoluteTolerance) {
         std::cerr << "FAIL: " << message << ": expected " << expected
                   << ", got " << actual << '\n';
         ++failures;
     }
+}
+
+ErrorEvidence MeasureErrors(
+    const float* actual, const float* expected, std::size_t count) {
+    ErrorEvidence evidence = {0.0f, 0.0f, 0, 0};
+    for (std::size_t i = 0; i < count; ++i) {
+        if (std::isnan(actual[i])) {
+            ++evidence.nan_count;
+            continue;
+        }
+        if (std::isinf(actual[i])) {
+            ++evidence.inf_count;
+            continue;
+        }
+        const float absolute = std::fabs(actual[i] - expected[i]);
+        float relative = 0.0f;
+        if (expected[i] != 0.0f) {
+            relative = absolute / std::fabs(expected[i]);
+        } else if (absolute != 0.0f) {
+            relative = std::numeric_limits<float>::infinity();
+        }
+        if (absolute > evidence.max_absolute) {
+            evidence.max_absolute = absolute;
+        }
+        if (relative > evidence.max_relative) {
+            evidence.max_relative = relative;
+        }
+    }
+    return evidence;
+}
+
+bool WriteEvidence(
+    const std::string& path,
+    const ErrorEvidence& product_errors,
+    const ErrorEvidence& derived_errors) {
+    std::ofstream output(path.c_str(), std::ios::out | std::ios::trunc);
+    if (!output) return false;
+    output << "{\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"test_result\": \""
+           << (failures == 0 ? "PASS" : "FAIL") << "\",\n"
+           << "  \"module\": \"stokes\",\n"
+           << "  \"backend\": \"CPU_REFERENCE\",\n"
+           << "  \"input\": {\"order\": \"TFPB\", "
+              "\"sample_format\": \"CF32\", \"shape\": [2, 2, 2, 2], "
+              "\"bytes\": 128},\n"
+           << "  \"output\": {\"order\": \"TFBS\", "
+              "\"sample_format\": \"F32\", "
+              "\"products\": [\"AA\", \"BB\", \"AB_REAL\", "
+              "\"AB_IMAG\"], \"shape\": [2, 2, 2, 4], "
+              "\"bytes\": 128},\n"
+           << "  \"integration\": {\"enabled\": false},\n"
+           << "  \"errors\": {\"absolute_tolerance\": 0.000001, "
+              "\"relative_tolerance\": 0.000001, "
+              "\"max_absolute\": " << product_errors.max_absolute
+           << ", \"max_relative\": " << product_errors.max_relative
+           << ", \"nan_count\": " << product_errors.nan_count
+           << ", \"inf_count\": " << product_errors.inf_count << "},\n"
+           << "  \"derived_reference\": {\"products\": "
+              "[\"I\", \"Q\", \"U\", \"V\"], "
+              "\"shape\": [2, 2, 2, 4], \"errors\": {"
+              "\"max_absolute\": " << derived_errors.max_absolute
+           << ", \"max_relative\": " << derived_errors.max_relative
+           << ", \"nan_count\": " << derived_errors.nan_count
+           << ", \"inf_count\": " << derived_errors.inf_count << "}}\n"
+           << "}\n";
+    return output.good();
 }
 
 rdma_dada::pipeline::Metadata MakeInputHeader() {
@@ -49,7 +127,14 @@ rdma_dada::pipeline::StageParameters MakeHostParameters() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::string result_json;
+    if (argc == 3 && std::string(argv[1]) == "--result-json") {
+        result_json = argv[2];
+    } else if (argc != 1) {
+        std::cerr << "Usage: " << argv[0] << " [--result-json PATH]\n";
+        return 2;
+    }
     typedef rdma_dada::pipeline::Complex32 Complex32;
     rdma_dada::modules::stokes::StokesModule module;
     const rdma_dada::pipeline::Metadata input_header = MakeInputHeader();
@@ -136,6 +221,45 @@ int main() {
     for (std::size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
         ExpectNear(output_data[i], expected[i], "known coherency product");
     }
+    const ErrorEvidence product_errors = MeasureErrors(
+        output_data, expected, sizeof(expected) / sizeof(expected[0]));
+    Expect(product_errors.max_absolute <= kAbsoluteTolerance,
+           "coherency-product absolute error is within tolerance");
+    Expect(product_errors.max_relative <= kRelativeTolerance,
+           "coherency-product relative error is within tolerance");
+    Expect(product_errors.nan_count == 0 && product_errors.inf_count == 0,
+           "coherency products contain no NaN or Inf");
+
+    const float expected_derived[] = {
+        66.0f, -56.0f, 34.0f, -8.0f,
+        138.0f, -88.0f, 106.0f, -8.0f,
+        6.25f, -2.25f, -3.0f, 5.0f,
+        29.25f, -20.75f, -16.0f, 13.0f,
+        25.0f, -25.0f, 0.0f, 0.0f,
+        102.0f, 98.0f, -4.0f, -28.0f,
+        174.0f, -164.0f, -38.0f, -44.0f,
+        0.9375f, 0.3125f, 0.125f, 0.875f
+    };
+    float actual_derived[32] = {};
+    for (std::size_t frame = 0; frame < 8; ++frame) {
+        const float aa = output_data[frame * 4];
+        const float bb = output_data[frame * 4 + 1];
+        const float ab_real = output_data[frame * 4 + 2];
+        const float ab_imag = output_data[frame * 4 + 3];
+        actual_derived[frame * 4] = aa + bb;
+        actual_derived[frame * 4 + 1] = aa - bb;
+        actual_derived[frame * 4 + 2] = 2.0f * ab_real;
+        actual_derived[frame * 4 + 3] = -2.0f * ab_imag;
+    }
+    const ErrorEvidence derived_errors = MeasureErrors(
+        actual_derived, expected_derived,
+        sizeof(expected_derived) / sizeof(expected_derived[0]));
+    Expect(derived_errors.max_absolute <= kAbsoluteTolerance,
+           "derived I/Q/U/V absolute error is within tolerance");
+    Expect(derived_errors.max_relative <= kRelativeTolerance,
+           "derived I/Q/U/V relative error is within tolerance");
+    Expect(derived_errors.nan_count == 0 && derived_errors.inf_count == 0,
+           "derived I/Q/U/V contains no NaN or Inf");
 
     rdma_dada::pipeline::OutputBlock short_output = output;
     short_output.capacity -= sizeof(float);
@@ -219,6 +343,12 @@ int main() {
     status = module.ProcessBlock(input, &output, host_context);
     Expect(!status.ok(), "Stokes cannot process after Finish");
 
+    if (!result_json.empty() &&
+        !WriteEvidence(result_json, product_errors, derived_errors)) {
+        std::cerr << "FAIL: cannot write numerical evidence "
+                  << result_json << '\n';
+        ++failures;
+    }
     if (failures != 0) return 1;
     std::cout << "stokes_module_test passed\n";
     return 0;

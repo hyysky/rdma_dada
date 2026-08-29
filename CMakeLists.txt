@@ -542,6 +542,11 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_pressure_fixture_test.py
                     $<TARGET_FILE:observation_config_compile>)
         add_test(
+            NAME coherency_numerical_evidence_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/coherency_numerical_evidence_test.py
+                    $<TARGET_FILE:stokes_module_test>)
+        add_test(
             NAME task8c_rate_point_test
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/task8c_rate_point_test.py)
@@ -610,6 +615,12 @@ if(BUILD_TESTING)
             COMMAND complex_convert_cuda_test)
         add_test(NAME power_cuda_test COMMAND power_cuda_test)
         add_test(NAME stokes_cuda_test COMMAND stokes_cuda_test)
+        add_test(
+            NAME coherency_cuda_numerical_evidence_test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/coherency_numerical_evidence_test.py
+                    $<TARGET_FILE:stokes_module_test>
+                    $<TARGET_FILE:stokes_cuda_test>)
         add_test(NAME time_integrate_cuda_test COMMAND time_integrate_cuda_test)
         add_test(
             NAME transfer_cuda_roundtrip_test
@@ -650,6 +661,7 @@ if(BUILD_TESTING)
             complex_convert_cuda_test
             power_cuda_test
             stokes_cuda_test
+            coherency_cuda_numerical_evidence_test
             time_integrate_cuda_test
             transfer_cuda_roundtrip_test
             pipeline_worker_cuda_chain_test

@@ -134,9 +134,14 @@ Task 8C controller 对多 Station Observation 生成 schema v3 配置，不另�
   用于低速 warm-up+3 流程验收；
 - `testing/multi-station-sender-production.json`：`A=469,F=4,P=1`，每个 F 为
   1 MHz，仅用于 sender/receive/unpack 压力计划；GPU `B=350` 权重仍由
-  `generate_gpu_pressure_fixture.py` 独立生成。该生成器同时产出
-  `STAGED_PIPELINE/3` 的 Beamform→Power→MEAN Integration（K=128）Full
-  Observation，供生产几何完整链测试使用，不改变 sender/unpack 配置。
+  `generate_gpu_pressure_fixture.py` 独立生成。该生成器默认产出
+  `A=469,F=4,P=1,B=350` 的 Beamform→Power→MEAN Integration（K=128）
+  Full Observation；传入 `--product coherency` 时产出输入规模相同的
+  `A=469,F=2,P=2,B=350` Beamform→Stokes→MEAN Integration 配置。两种配置
+  都使用 `STAGED_PIPELINE/3`，不改变 sender/unpack 配置。
+
+`NPOL=2` 使用项目固定极化顺序 `X,Y`。Observation 无需重复配置标签；配置编译器
+自动将 `POL_LABELS X,Y` 写入 RAW header，后续 unpack 和 GPU stage header 原样传播。
 
 生产几何的天文采样 payload 为 30.016 Gbps；计入每个 packet 的 32-byte VDIF
 header 后，sender 的 UDP datagram payload 目标为 30.2505 Gbps。controller 以后者
