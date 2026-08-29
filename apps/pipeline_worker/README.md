@@ -242,9 +242,20 @@ compute-ring CUDA 直注册和三 slot staged pipeline 实现后，双 Station �
 `full-30.2505Gbps-60s-20260829T033639Z` 和
 `full-30.2505Gbps-60s-20260829T075447Z`。
 
-GPU-only 生产几何压力暂缓。恢复时需使用 repository-owned 严格 header/完整-block
-pacing writer，分别复用已通过的 Power `A=469,F=4,P=1,B=350` 与 coherency/Stokes
-`A=469,F=2,P=2,B=350` 配置；现有 `dada_junkdb` 路径不作为正式验收入口。该测试不经过
-Station-ID 聚合，也不能替代多 Station sender 驱动的 full-stage 验收。
+GPU-only 生产几何压力由 repository-owned `gpu_pressure_writer` 驱动：它原样发布编译器
+生成的 `unpacked.header`，按单调时钟 deadline 写完整 compute block，并记录精确计数、
+等待、迟到和 EOD。测试分别复用 Power `A=469,F=4,P=1,B=350` 与 coherency/Stokes
+`A=469,F=2,P=2,B=350` 配置，可匹配比较 direct/1 与 staged/N；该测试不经过 Station-ID
+聚合，也不能替代多 Station sender 驱动的 full-stage 验收。
+
+Power 生产几何的正式匹配结果为 direct/1 suite
+`gpu-30Gbps-60s-20260829T113850Z` 与 staged/3 suite
+`gpu-30Gbps-60s-20260829T114602Z`。两者均完成 60 秒、1 warm-up + 3 measured；staged
+记录 `max_inflight=3`，证明三个 slot 在压力链中实际并发使用。
+
+在 direct/1 中，metrics 的 `blocks`、输入/输出 bytes、transfer elapsed 及 CUDA
+H2D/algorithm/D2H totals 是处理闭合证据；submitted/completed/published、max-inflight
+和 active-window 是 staged 调度器指标，direct 中为 0 属于未启用该调度器，而不是未处理
+数据。显存和 deadline 预算以 compiler `gpu_pipeline_budget` 为权威来源。
 
 macOS 只构建并测试 worker core；PSRDADA/CUDA 可执行文件需要在 Linux 服务器构建。

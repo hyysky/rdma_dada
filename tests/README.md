@@ -62,8 +62,9 @@ ctest --test-dir build-linux --output-on-failure
 | `udp_vdif_sender_test` | `udp_vdif_sender_test.cpp` | 校验最终 sender JSON 统计可解析且 packet/byte/backend/source/payload prefix 字段一致 | `BUILD_TESTING=ON` |
 | `fpga_sender_sim_loopback_test` | `fpga_sender_sim_loopback_test.py` | 在 127.0.0.1 验证 schema v1 fault、schema v2 单 Station PACED，以及 schema v3 单 socket/固定 source port 多 Station 轮换顺序与逐 Station 统计 | 找到 Python 3 |
 | `fpga_sender_sim_linux_batch_test` | `fpga_sender_sim_linux_batch_test.py` | Linux loopback 验证 4 Station/64 packet、16-packet batch、固定 source port、轮换顺序、逐 Station 计数及 `SENDMMSG` backend | Linux 且找到 Python 3 |
-| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用 `dada_junkdb` 按任意目标 payload 速率向上取整为整 compute blocks/s，严格核对逐 block 输入/输出；并覆盖基线漂移、preflight、进程账本、状态、计数、结果分类和定向清理 | 找到 Python 3；不连接远端服务器 |
-| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 Power `A=469,F=4,P=1,B=350` 与 coherency `A=469,F=2,P=2,B=350` 的 `STAGED_PIPELINE/3` Observation 和确定性 FPAB2 int8 NPY 权重；使用配置编译器实际写出五个 4096-byte stage headers，核对 `NANT=469`、固定 `POL_LABELS X,Y`、各级 block bytes，以及 582,400/1,164,800-byte 积分输出 block | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
+| `gpu_pressure_plan_test` | `gpu_pressure_plan_test.cpp` | 验证任意正目标速率向上取整到完整 compute blocks/s、有限 block/byte 总量、溢出拒绝和无累计漂移的单调时钟 deadline | `BUILD_TESTING=ON` |
+| `task8c_rate_point_test` | `task8c_rate_point_test.py` | 验证 receive/unpack/gpu/full 四种拓扑；GPU-only 用仓库内 `gpu_pressure_writer` 原样发布编译器 header，并按整 compute blocks/s 平滑施压，严格核对 writer/GPU/output 逐 block 计数；同时锁定 Full 拓扑不启动该 writer | 找到 Python 3；不连接远端服务器 |
+| `gpu_pressure_fixture_test` | `gpu_pressure_fixture_test.py` | 生成并校验生产压力几何 Power `A=469,F=4,P=1,B=350` 与 coherency `A=469,F=2,P=2,B=350` 的确定性 FPAB2 int8 NPY 权重；同一产品可生成只改变 CUDA 执行模式的 `SYNCHRONOUS_DIRECT/1` 与 `STAGED_PIPELINE/N` Observation；编译器门禁核对五个 4096-byte stage headers、`NANT=469`、固定偏振顺序、各级 block bytes 及积分输出 block | 找到 Python 3；注册 CTest 还传入 `observation_config_compile`；不连接远端服务器 |
 | `coherency_numerical_evidence_test` | `coherency_numerical_evidence_test.py` | 验证 Stokes CPU/CUDA 测试写出的机器可读 shape/bytes、`AA/BB/AB_REAL/AB_IMAG`、容差、max abs/rel error、NaN/Inf 与 reference-only I/Q/U/V 推导误差；不改变工程输出契约 | CPU：`BUILD_TESTING=ON`；CUDA：`USE_CUDA=ON` |
 | `task8c_profiles_test` | `task8c_profiles_test.py` | 验证 passing profile 严格 schema、原文件 SHA、默认填充、显式覆盖和逐字段 drift | 找到 Python 3 |
 | `task8c_artifacts_test` | `task8c_artifacts_test.py` | 验证紧凑结果文件集、完整进程生命周期、角色数量和 SHA256 manifest | 找到 Python 3 |
@@ -329,7 +330,7 @@ python3 -u scripts/task8c_rate_point.py \
 | --- | --- | --- |
 | `receive` | raw | 双 Station sender → `rdma2dada` → sink |
 | `unpack` | raw、compute | 双 Station sender → `rdma2dada` → `vdif_unpack_worker` → sink |
-| `gpu` | compute、output | `dada_junkdb` 定速整 block producer → `pipeline_worker` → sink；不连接 sender、不启动 RDMA、不设置 `CAP_NET_RAW` |
+| `gpu` | compute、output | `gpu_pressure_writer` 原样发布 compiler header，并按单调时钟定速写完整 block → `pipeline_worker` → sink；不连接 sender、不启动 RDMA、不设置 `CAP_NET_RAW` |
 | `full` | raw、compute、output | 双 Station sender → `rdma2dada` → `vdif_unpack_worker` → `pipeline_worker` → sink |
 
 GPU 独立正确性入口示例：
@@ -355,10 +356,17 @@ python3 -u scripts/task8c_rate_point.py \
 
 `aggregate-gbps` 可取任意正目标值，不固定为 30。第一版要求 duration 为整数秒，控制器
 计算 `ceil(target_Bps / compute_block_bytes)` 个 block/s，再得到实际注入 B/s 和总 block
-数；实际速率会略高于或等于目标值，并同时写入 plan/result。当前 `gpu` 拓扑中的
-`dada_junkdb` 只用于诊断持续 block 压力和 backpressure，不作为论文 GPU-only 正式
-性能入口；正式入口需由版本化 writer 原样发布编译器 header，并从单调时钟 epoch 平滑
-发送完整 block。最终实时结论仍必须由 `full` 阶段按 passing profile、warm-up+3 验收。
+数；实际速率会略高于或等于目标值，并同时写入 plan/result。`gpu_pressure_writer` 原样
+发布 `unpacked.header`，每个 deadline 提交一个完整 compute block，并记录实际 blocks、
+bytes、elapsed、rate、等待、迟到和 EOD。PASS 还要求实际 writer rate 在 block-aligned
+计划的 2% 内且 elapsed 不超过计划时长 2%，避免反压后的最终计数闭合被误判为实时通过。
+summary 的正式实测速率只取 writer 的 `actual_payload_gbps`，并显式记录
+`actual_aggregate_gbps_source=input_writer.actual_payload_gbps`；计划速率仅作为计划字段；
+compact plan 同时保留 compiler `gpu_pipeline_budget`。direct/1 以 `blocks`、输入/输出
+bytes、transfer elapsed 和 CUDA stage totals 闭合，不能把仅 staged 调度器记录的
+submitted/completed/published/max-inflight 零值解释成未处理 block。
+该边界用于 GPU 饱和点与 direct/1、staged/N 匹配对照；最终
+天文实时链结论仍由 `full` 阶段按 passing profile、warm-up+3 验收。
 profile 文件只能由已保留的远程
 PASS 证据生成；仓库尚无 GPU accepted profile 时，只允许显式
 `--experiment-name bootstrap-gpu-v1`，不能伪造示例 profile 后直接正式验收。
@@ -368,8 +376,11 @@ bootstrap 与后续 accepted GPU profile 都必须显式设置 `--gpu-worker-cpu
 生产 Power fixture 使用 `A=469,F=4,P=1,B=350`，output block 为 582,400 bytes；
 生产 coherency/Stokes fixture 使用 `A=469,F=2,P=2,B=350`，output block 为
 1,164,800 bytes。两者均为 `STAGED_PIPELINE/3`、K128 MEAN，并已通过版本化多 Station
-sender 的约 30 Gbps、60 秒 Full warm-up+3。它们仍需分别完成 GPU-only 的 direct/1 与
-staged/3 匹配性能测试；Full PASS 不替代该模块级对照。
+sender 的约 30 Gbps、60 秒 Full warm-up+3。Power 已完成 GPU-only direct/1 与 staged/3
+匹配性能门禁；对应 suite 为 `gpu-30Gbps-60s-20260829T113850Z` 与
+`gpu-30Gbps-60s-20260829T114602Z`，两者均为 60 秒 warm-up+3 且 writer 实测速率约
+30.36751 Gbps，staged `max_inflight=3`。coherency GPU-only 仍待执行；Full PASS 不替代
+该模块级对照。
 
 ### 紧凑结果 Catalog
 

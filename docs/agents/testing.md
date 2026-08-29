@@ -79,12 +79,11 @@ creates no raw ring, network receiver or sender and requires no `CAP_NET_RAW`.
 The configurable target always means aggregate payload rate at the selected
 boundary.
 
-The current controller can use `dada_junkdb` as a diagnostic block producer,
-but that path is not accepted for paper-facing GPU-only performance. Formal
-GPU-only acceptance waits for the repository-owned writer that publishes the
-compiler-generated header unchanged and paces complete blocks from one
-monotonic epoch. For any positive configured target rate, not only 30 Gbps,
-the block plan is:
+The GPU boundary uses the repository-owned `gpu_pressure_writer`. It publishes
+the compiler-generated `unpacked.header` unchanged, paces complete compute
+blocks from one monotonic epoch, and records exact writer block/byte/EOD and
+wait/lateness metrics. Stock `dada_junkdb` is not an accepted formal producer.
+For any positive configured target rate, not only 30 Gbps, the block plan is:
 
 ```text
 target_bytes_per_second = target_payload_bits_per_second / 8
@@ -93,12 +92,28 @@ actual_bytes_per_second = blocks_per_second * compute_block_bytes
 total_blocks = blocks_per_second * duration_seconds
 ```
 
-The result records target rate, block-aligned configured injection rate, and
-worker-measured input rate from processed bytes / active transfer elapsed time.
-Because of upward rounding, the configured injection rate is never lower than
-the target. This tests
-sustained block pressure and backpressure; it does not claim smooth packet
-pacing, so `full` remains the final astronomical data-flow acceptance.
+The result records target rate, block-aligned configured injection rate,
+writer-measured publication rate (`published_bytes / active_elapsed_ns`), and
+worker-measured active processing rate separately. Suite summary records
+`actual_aggregate_gbps_source=input_writer.actual_payload_gbps`; the configured
+block-aligned rate is never presented as measured throughput. PASS requires the writer
+rate to remain within 2% of the block-aligned plan and the finite transfer to
+finish within 102% of the planned duration; eventual count closure after
+backpressure is not a performance PASS. Because of upward rounding, the
+configured injection rate is never lower than the target. This tests
+sustained block pressure and backpressure. The same product fixture can select
+`SYNCHRONOUS_DIRECT/1` or `STAGED_PIPELINE/N`; a matched comparison changes
+only those CUDA execution fields. `full` remains the final astronomical
+data-flow acceptance and must not start `gpu_pressure_writer`.
+
+For `SYNCHRONOUS_DIRECT/1`, `blocks`, `input_bytes`, `output_bytes`, transfer
+elapsed time and CUDA stage totals are the authoritative worker closure and
+timing fields. The scheduler lifecycle fields `submitted_blocks`,
+`completed_blocks`, `published_blocks`, `max_inflight` and active-window fields
+belong to `STAGED_PIPELINE/N` and remain zero in the direct reference path;
+they must not be interpreted as zero processed blocks. The compact plan also
+retains the compiler's `gpu_pipeline_budget`, so memory/deadline parameters do
+not depend on the direct runtime metrics object's staged-only fields.
 
 The production-pressure geometry is `A=469,F=4,P=1,B=350`, CI8 complex, with
 every `F` representing exactly 1 MHz. Its astronomical signal payload is

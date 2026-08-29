@@ -42,7 +42,7 @@ CLEANUP_RESULTS = {"PASS", "FAIL", "NOT_APPLICABLE"}
 MODULES_BY_TOPOLOGY = {
     "receive": ["rdma2dada", "dada_dbnull"],
     "unpack": ["rdma2dada", "vdif_unpack_worker", "dada_dbnull"],
-    "gpu": ["dada_junkdb", "pipeline_worker", "dada_dbnull"],
+    "gpu": ["gpu_pressure_writer", "pipeline_worker", "dada_dbnull"],
     "full": [
         "rdma2dada", "vdif_unpack_worker", "pipeline_worker", "dada_dbnull"
     ],
