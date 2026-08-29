@@ -48,8 +48,9 @@ b73847ab82c57ee16f3fa321aec2d3191aca73a6ad4bef3bb3712b44abff85a2  ./docs/PROJECT
 a5781c0f6f6375cbaa9094a5a8f0173af1a82dad11809f388debc7f0ff4d4748  ./docs/agents/issue-tracker.md
 d1589f246de06e29ac197ef01e4a2658d473cb0cb591a7e9efaea349d3feecaf  ./docs/agents/testing.md
 722c2691073337dab61d9b8a4f0ed6288c176d9a5930f3ba40582fec30857a7d  ./docs/parameter-dependency-mindmap.svg
-6b3b9f3d033765633464c712e303cf7b35766ca93235e71ff89152e0efd9dbb3  ./docs/results/README.md
+3213e88d9ef2005a2a8271a8c81ed3b23ef2c0f34fec1ea0724df39169a64ab0  ./docs/results/README.md
 a6207bc65125f754a19c8eb36fa5c995953dbbaae1a12677cb4fb1e511ca75b7  ./docs/results/accepted-results.json
+b8e5e13e8b7b1f0bee32340c0d635b92db9800d154c378d3f3cf23d539158a79  ./docs/results/evidence-adjudications.json
 e77418534491a080d04ebd8d793bf9dd9863f003e446b2030a120e47ffde410f  ./docs/superpowers/plans/2026-08-05-project-vdif-v1.md
 eceba916a73cdd58836ca267d0ddeffe9af6332d55ad530e82c1c4c4a3574617  ./docs/superpowers/plans/2026-08-06-vdif-unpack-and-sender-simulation.md
 ef8c0e699044388e70f40349c2124559b9a5c5930538fa8d43fcdf6d360106fe  ./docs/superpowers/plans/2026-08-07-cross-thread-test-callback.md
