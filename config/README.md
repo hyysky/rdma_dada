@@ -138,7 +138,9 @@ Task 8C controller 对多 Station Observation 生成 schema v3 配置，不另�
   `A=469,F=4,P=1,B=350` 的 Beamform→Power→MEAN Integration（K=128）
   Full Observation；传入 `--product coherency` 时产出输入规模相同的
   `A=469,F=2,P=2,B=350` Beamform→Stokes→MEAN Integration 配置。两种配置
-  都使用 `STAGED_PIPELINE/3`，不改变 sender/unpack 配置。
+  都使用 `STAGED_PIPELINE/3`。Power 和 coherency/Stokes 已分别通过约 30 Gbps、
+  60 秒、1 warm-up + 3 measured 的生产 Full 验收；GPU-only direct/1 与 staged/3
+  模块性能对照仍待执行。
 
 `NPOL=2` 使用项目固定极化顺序 `X,Y`。Observation 无需重复配置标签；配置编译器
 自动将 `POL_LABELS X,Y` 写入 RAW header，后续 unpack 和 GPU stage header 原样传播。

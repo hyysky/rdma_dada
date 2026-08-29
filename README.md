@@ -150,12 +150,14 @@ full 则在现有 sender→`rdma2dada`→unpack 链后复用同一个 `pipeline_
 ## 当前限制
 
 - Linux RDMA 构建、CQ 错误路径、NIC flow steering 和有限 transfer 已有服务器验证；
-  新 ATFP 完整链已通过 0.1 Gbps warm-up+3 正确性验收；目标速率、持续运行和实际
-  headroom 仍待速率阶梯验证。
+  receive-only 与 receive+unpack 已完成约 30 Gbps、60 秒、1 warm-up + 3 measured
+  正式验收。`NSGE=2` direct placement 在同档位精确闭合；staged-copy 对照出现约
+  0.54% receiver deficit，作为受控性能失败边界保留。
 - `beamform` 已有 NPY 权重加载、host FP32 reference 和异步 CUDA FP32/TF32
   backend；`power`、`stokes`、`time_integrate` 已有 host FP32 reference 和异步
   CUDA kernel。独立 CUDA correctness、GPU 数值组合链和 Resolved Plan 驱动的
-  PSRDADA/CUDA ring integration 已在目标服务器通过；整链持续性能仍需继续验证。
+  PSRDADA/CUDA ring integration 已在目标服务器通过。生产几何 Full Power 和 Full
+  coherency/Stokes 均已完成约 30 Gbps、60 秒、1 warm-up + 3 measured 正式验收。
 - `host_to_device`、`device_to_host` 已实现为无 buffer 所有权的异步 CUDA 传输
   模块，并已接入 worker。CUDA worker 在 transfer 生命周期内用 `dada_cuda_dbregister`
   注册整个 compute ring，H2D 直接读取当前 ring block，不再执行 ring→pinned input copy；
@@ -169,14 +171,17 @@ full 则在现有 sender→`rdma2dada`→unpack 链后复用同一个 `pipeline_
   `STAGED_PIPELINE`：每个 slot 独占 output pinned staging、device buffers、non-blocking
   stream 和完成事件，输入直接来自已注册的 compute ring；单 writer 按 block sequence
   发布 output ring。模块/CUDA 门禁、1 Gbps 重复正确性和双 Station 小几何 30 Gbps、
-  60 秒完整链重复门禁均已通过。
+  60 秒完整链重复门禁均已通过；生产 Power `A=469,F=4,P=1,B=350` 与生产
+  coherency/Stokes `A=469,F=2,P=2,B=350` 也已分别通过同一重复协议。
 - GPU-only 压力路径暂缓。现有 `dada_junkdb` 路径和计划中的版本化压力 writer 不作为
   当前完成项，也不影响已经通过的 full-chain 验收；恢复该工作时需重新确认严格 header、
-  block pacing 和生产几何契约。
+  block pacing 和生产几何契约，并完成 `SYNCHRONOUS_DIRECT/1` 与
+  `STAGED_PIPELINE/3` 的受控比较。
 - Project VDIF v1 已固定 32-byte header、TFP/IQ payload 和 Station-ID 聚合契约；
   unpack 采用 coordinator、固定 parser worker pool 和单 compute writer，并支持显式线程
   affinity。receive-only 与 unpack 已使用固定 CPU/NUMA、source port、ring/window 和
   1 秒 preparation 配置，分别通过 30 Gbps、60 秒、1 warm-up + 3 measured；35 Gbps
-  尚未通过。完整链当前通过的是双 Station 小几何 30 Gbps 基线；低错误率、生产规模
-  Station/A/B 几何和额外 headroom 仍未完成。
-- `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；当前使用 PSRDADA 的 `dada_dbdisk`。
+  尚未通过。生产规模 Station→A、Power 与 coherency/Stokes 完整链已经通过；低错误率、
+  GPU-only 模块性能、阶段 P50/P95、利用率和额外 headroom 仍未完成。
+- `DumpToDada()` 仍是旧实现，不应用作 pipeline sink；性能 drain 使用
+  `dada_dbnull -s -z`，只有需要物化检查数据时才使用 `dada_dbdisk`。

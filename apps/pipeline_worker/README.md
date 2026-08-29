@@ -29,8 +29,9 @@ block。旧的一参数调用保持兼容。
 | `POWER` | ComplexConvert → Beamform → Power | `TFPB/F32` |
 | `STOKES` | ComplexConvert → Beamform → Stokes | `TFBS/F32`，产物顺序为 `AA,BB,AB_REAL,AB_IMAG` |
 
-Power 和 Stokes 是互斥的兄弟分支，不会串联。Stokes 要求 `NPOL=2` 和两个明确的
-`POL_LABELS`。`integration.enabled=true` 时，Power 或 Stokes 后追加
+Power 和 Stokes 是互斥的兄弟分支，不会串联。Stokes 要求 `NPOL=2`；Project
+Observation v1 的偏振顺序固定为 `X,Y`，配置编译器自动写入 `POL_LABELS X,Y`。
+`integration.enabled=true` 时，Power 或 Stokes 后追加
 TimeIntegrate；`BEAMFORMED` 不允许直接积分。
 
 ## 参数来源
@@ -218,7 +219,7 @@ Observation 自身推导的 payload 速率；吞吐测试必须显式传入目�
   --budget-payload-gbps 30
 ```
 
-当前 30 Gbps 小几何测试链为 Beamform → Power → Integrate(K=128, MEAN)。compute block
+历史 30 Gbps 小几何测试链为 Beamform → Power → Integrate(K=128, MEAN)。compute block
 含 6,553,600 个时间采样，能被 128 整除；积分后 `T=51,200`。compute、Beamform、
 Power 和最终 output block 分别为 52,428,800、209,715,200、104,857,600 和 819,200 B，
 block 到达间隔 13,981,013 ns。保留 20% 余量后，单 stream 整链 deadline 为
@@ -235,11 +236,15 @@ block 到达间隔 13,981,013 ns。保留 20% 余量后，单 stream 整链 dead
 11.185 ms 的安全 deadline；平均 H2D/算法/D2H 分别约 12.077/3.873/0.260 ms，output
 wait 平均约 0.0013 ms。该结果定位了旧 pageable-ring/逐 block 同步路径的性能问题。
 compute-ring CUDA 直注册和三 slot staged pipeline 实现后，双 Station 小几何 full-chain
-已通过 30 Gbps、60 秒、1 warm-up + 3 measured 正式门禁。
+已通过 30 Gbps、60 秒、1 warm-up + 3 measured 原型门禁。生产 Full Power
+`A=469,F=4,P=1,B=350` 与 Full coherency/Stokes `A=469,F=2,P=2,B=350` 随后也分别
+完成约 30 Gbps、60 秒、1 warm-up + 3 measured 正式门禁；权威 suite 为
+`full-30.2505Gbps-60s-20260829T033639Z` 和
+`full-30.2505Gbps-60s-20260829T075447Z`。
 
-GPU-only 生产几何压力暂缓。恢复时需使用 repository-owned 严格 header/完整-block pacing
-writer 和匹配的 `A≈500,F=4,P=1,B≈350` FPAB 权重；现有 `dada_junkdb` 路径不作为
-正式验收入口。该测试不经过 Station-ID 聚合，也不能替代多 Station sender 驱动的
-full-stage 验收。
+GPU-only 生产几何压力暂缓。恢复时需使用 repository-owned 严格 header/完整-block
+pacing writer，分别复用已通过的 Power `A=469,F=4,P=1,B=350` 与 coherency/Stokes
+`A=469,F=2,P=2,B=350` 配置；现有 `dada_junkdb` 路径不作为正式验收入口。该测试不经过
+Station-ID 聚合，也不能替代多 Station sender 驱动的 full-stage 验收。
 
 macOS 只构建并测试 worker core；PSRDADA/CUDA 可执行文件需要在 Linux 服务器构建。

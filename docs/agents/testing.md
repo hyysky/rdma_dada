@@ -71,7 +71,7 @@ The controller exposes exactly four formal boundaries:
 | --- | --- |
 | `receive` | UDP senders → `rdma2dada` → raw ring consumer |
 | `unpack` | UDP senders → `rdma2dada` → raw ring → `vdif_unpack_worker` → compute ring consumer |
-| `gpu` | `dada_junkdb` → compute ring → `pipeline_worker` → output ring consumer |
+| `gpu` | block producer → compute ring → `pipeline_worker` → output ring consumer |
 | `full` | UDP senders → `rdma2dada` → unpack → compute ring → GPU worker → output ring consumer |
 
 `unpack` is intentionally not a synthetic stand-alone input mode. GPU-only
@@ -79,8 +79,12 @@ creates no raw ring, network receiver or sender and requires no `CAP_NET_RAW`.
 The configurable target always means aggregate payload rate at the selected
 boundary.
 
-For GPU-only pressure, the producer works in whole compute blocks per whole
-second. For any positive configured target rate, not only 30 Gbps, the plan is:
+The current controller can use `dada_junkdb` as a diagnostic block producer,
+but that path is not accepted for paper-facing GPU-only performance. Formal
+GPU-only acceptance waits for the repository-owned writer that publishes the
+compiler-generated header unchanged and paces complete blocks from one
+monotonic epoch. For any positive configured target rate, not only 30 Gbps,
+the block plan is:
 
 ```text
 target_bytes_per_second = target_payload_bits_per_second / 8
@@ -90,7 +94,7 @@ total_blocks = blocks_per_second * duration_seconds
 ```
 
 The result records target rate, block-aligned configured injection rate, and
-worker-measured input rate from processed bytes / transfer elapsed time.
+worker-measured input rate from processed bytes / active transfer elapsed time.
 Because of upward rounding, the configured injection rate is never lower than
 the target. This tests
 sustained block pressure and backpressure; it does not claim smooth packet
@@ -152,13 +156,19 @@ For Project Observation v1, `NPOL=2` has the fixed polarization order `X,Y`.
 The compiler writes `POL_LABELS X,Y` into the stage-header chain automatically;
 the Observation JSON does not carry a separately configurable label list.
 
-The paper's formal duration and rate-point schedule are still an explicit
-campaign decision. Until that decision is recorded, retain the existing
-30-second `1/5/10/20/30/35/40` physical-wire campaign unchanged and do not use
-it as evidence that the paper author selected 30 seconds or the complete
-ladder. The minimum pending protocol choice is between a single primary
-30-Gbps, 60-second warm-up-plus-three gate and the documented 30-second ladder;
-any additional saturation points must be named separately.
+The paper's primary gate is the nominal 30-Gbps campaign for 60 seconds with
+one warm-up and three measured repetitions. Report the measured or uniformly
+derived physical Ethernet line rate as the result value while retaining UDP
+record and astronomical signal rates in the compact artifacts. The historical
+30-second `1/5/10/20/30/35/40` ladder remains an optional saturation campaign,
+not a prerequisite for the accepted primary point.
+
+Production Full Power suite `full-30.2505Gbps-60s-20260829T033639Z` and Full
+coherency/Stokes suite `full-30.2505Gbps-60s-20260829T075447Z` satisfy this
+primary repetition protocol. Reuse their source ports, one-second preparation,
+CPU/NUMA placement, queue and ring geometry for comparable work. Rerun an
+unchanged upstream boundary only when a product change or a named experiment
+affects it.
 
 Section 3 requires a receive-only matched placement experiment between staged
 payload copy and `NSGE=2` direct raw-ring placement. Its boundary is
@@ -175,6 +185,15 @@ loss/deficit, receive-to-publication service P50/P95, receiver CPU-seconds/GB,
 raw-ring HWM/backpressure, copy bytes/memory traffic and minimum headroom. If
 copy fails while direct passes, retain the effective failure boundary and first
 saturated boundary; sender rate alone cannot establish either result.
+
+This experiment is complete. Direct suite
+`rdma2dada-30Gbps-60s-20260829T054121Z` closed all counts; staged-copy suite
+`rdma2dada-30Gbps-60s-20260829T055947Z` retained an approximately 0.54%
+receiver deficit. Reporting must apply the matching entry in
+`docs/results/evidence-adjudications.json`, which preserves the original runner
+PASS while exposing the effective `PERFORMANCE_FAIL/COUNT_CLOSURE_FAIL`
+decision. Do not rerun this comparison unless placement code or a matched
+control parameter changes.
 
 Rate-point result directories use
 `<pipeline-stage>-<aggregate-rate>Gbps-<duration>s-<UTC timestamp>` so rate and

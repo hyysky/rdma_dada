@@ -355,20 +355,21 @@ python3 -u scripts/task8c_rate_point.py \
 
 `aggregate-gbps` 可取任意正目标值，不固定为 30。第一版要求 duration 为整数秒，控制器
 计算 `ceil(target_Bps / compute_block_bytes)` 个 block/s，再得到实际注入 B/s 和总 block
-数；实际速率会略高于或等于目标值，并同时写入 plan/result。GPU-only 用它验证持续
-block 压力和 backpressure，但 `dada_junkdb` 不是网络包级平滑 pacing；最终实时结论仍
-必须由 `full` 阶段按 passing profile、warm-up+3 验收。profile 文件只能由已保留的远程
+数；实际速率会略高于或等于目标值，并同时写入 plan/result。当前 `gpu` 拓扑中的
+`dada_junkdb` 只用于诊断持续 block 压力和 backpressure，不作为论文 GPU-only 正式
+性能入口；正式入口需由版本化 writer 原样发布编译器 header，并从单调时钟 epoch 平滑
+发送完整 block。最终实时结论仍必须由 `full` 阶段按 passing profile、warm-up+3 验收。
+profile 文件只能由已保留的远程
 PASS 证据生成；仓库尚无 GPU accepted profile 时，只允许显式
 `--experiment-name bootstrap-gpu-v1`，不能伪造示例 profile 后直接正式验收。
 bootstrap 与后续 accepted GPU profile 都必须显式设置 `--gpu-worker-cpu`、
 `--sink-cpu-list` 和 `--numa-node`；profile 会在创建 ring 前恢复并核对这些值。
 
-生产几何 fixture 使用 `A=469,F=4,P=1,B=350` 的 Observation、ATFP block 和 FPAB
-权重，模块链为 Convert/Transpose→Beamform→Power→MEAN Integration（K=128），CUDA
-执行模式为 `STAGED_PIPELINE/3`。每 block 的输入 T=13,312，可被 K 整除，积分后
-T=104，output block 为 582,400 bytes。该 fixture 可用于 GPU-only 压力，也可与版本化
-多 Station sender 组合成 Full 测试；只有后者完成 sender→output 全计数闭合后才称为
-生产几何完整链 PASS。
+生产 Power fixture 使用 `A=469,F=4,P=1,B=350`，output block 为 582,400 bytes；
+生产 coherency/Stokes fixture 使用 `A=469,F=2,P=2,B=350`，output block 为
+1,164,800 bytes。两者均为 `STAGED_PIPELINE/3`、K128 MEAN，并已通过版本化多 Station
+sender 的约 30 Gbps、60 秒 Full warm-up+3。它们仍需分别完成 GPU-only 的 direct/1 与
+staged/3 匹配性能测试；Full PASS 不替代该模块级对照。
 
 ### 紧凑结果 Catalog
 

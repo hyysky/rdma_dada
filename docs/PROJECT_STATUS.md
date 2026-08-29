@@ -70,7 +70,7 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 
 | 模块 | 输入 → 输出 | 状态 | 备注 |
 | --- | --- | --- | --- |
-| `vdif_unpack` | raw VDIF/TFP → payload-only ATFP/CI8 | 功能已验收，性能验收中 | CPU 并行解析、单 writer 保序发布 |
+| `vdif_unpack` | raw VDIF/TFP → payload-only ATFP/CI8 | 功能与约 30 Gbps 性能已正式验收 | CPU 并行解析、单 writer 保序发布；1/2/4 worker-count 对照仍待执行 |
 | `host_to_device` | host bytes → device bytes | 已验收 | 异步 CUDA copy，由 worker stream 调用 |
 | `complex_convert` | ATFP CI8/CI16 → TFPA CF32 | 已验收 | CUDA fused transpose/convert/scale；worker 第一版输入 CI8 |
 | `beamform` | TFPA CF32 + FPAB weights → TFPB CF32 | 已验收 | CPU oracle；CUDA FP32/TF32；NPY 权重；A→B |
@@ -97,12 +97,12 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 | 完整 GPU pipeline 预算 | 已通过服务器验收 | 编译器报告双速率来源、20% deadline、逐级/合计传输和显存；RTX 3090 Release/CUDA 回归 3/3，30 Gbps 当前 deadline 11.184810 ms；不代表实时速率通过 |
 | GPU-only 正确性 | 旧单-block 路径已通过；新压力路径暂缓 | 旧证据只覆盖 compute ring→CUDA worker→output ring→dbnull 生命周期；`dada_junkdb`/版本化压力 writer 不作为当前验收入口 |
 | GPU-only 持续压力 | 暂缓 | 严格 header、平滑完整-block pacing 和 production geometry writer 尚未收口；恢复前不宣称 ready 或稳定速率 |
-| 生产几何 GPU 压力 | 暂缓 | `A≈500,F=4,P=1,B≈350` 仍是未来单 GPU 资源实验，不属于当前双 Station full-chain 基线 |
+| 生产几何 GPU-only 压力 | 暂缓 | 复用已验收的 Power `A=469,F=4,P=1,B=350` 与 coherency/Stokes `A=469,F=2,P=2,B=350`；待版本化 block writer 后执行 direct/1 与 staged/3 对照 |
 | 低速完整 GPU pipeline | 已通过服务器验收 | 0.1 Gbps，1 warm-up + 3 measured；双 Station sender、receiver、unpack、GPU、output header/EOD 和 cleanup 每轮精确闭合 |
 | 30 Gbps 完整 GPU pipeline，60 s | 原型正式通过 | `A=2` 小几何，1 warm-up + 3 measured；sender、receiver、unpack、三 slot CUDA、output、dbnull/EOD 和 cleanup 每轮闭合；不能替代论文 `A=469` 主几何验收 |
 | 469-Station full Power | 正式通过 | suite `full-30.2505Gbps-60s-20260829T033639Z`；`A=469,F=4,P=1,B=350`、`STAGED_PIPELINE/3`、Beamform→Power→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563937–30.248563939 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合 |
 | 469-Station full coherency/Stokes | 正式通过 | suite `full-30.2505Gbps-60s-20260829T075447Z`；`A=469,F=2,P=2,B=350`、`STAGED_PIPELINE/3`、Beamform→Stokes→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563934–30.248563938 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合；输出 `AA/BB/AB_REAL/AB_IMAG`，reference 另行核对 I/Q/U/V 推导 |
-| 500-Station 完整 GPU pipeline | 待输入能力 | 必须由多 Station sender 或合法 raw-VDIF generator 提供约 500 个 Station，覆盖 Station-ID→A、unpack、GPU 和 output；不能用双 Station 结果替代 |
+| 约 500-Station 扩展实验 | 非当前门槛 | 当前论文生产主几何固定为 A=469；只有未来明确改变科学输入规模时才新增约 500-Station sender/权重/full 验收 |
 | 低错误率/长时间连续观测 | 待执行 | 错误率目标 0.001%–0.1%；还需 Station 失败、资源恢复和稳态验证 |
 | 论文第3章模块证据闭环 | 部分完成 | receive/unpack 正式基线已具备；仍需 GPU 模块 suite 收口、unpack 指标补齐及 1/2/4 worker 匹配比较 |
 
@@ -128,24 +128,36 @@ GPU-only 持续压力和论文决定性利用率/headroom 指标仍待补齐。
 ## 当前限制
 
 - 约 30 Gbps 正式重复证据覆盖 receive-only、receive+unpack，以及 469-Station
-  `rdma2dada -> unpack -> pipeline_worker -> output -> dbnull` Full Power 完整链。
+  `rdma2dada -> unpack -> pipeline_worker -> output -> dbnull` Full Power 与 Full
+  coherency/Stokes 完整链。
 - sender/controller 已支持两台物理 sender 按 235/234 Station 分片，并在完整链中验证
-  Station ID→A 轴映射；coherency/Stokes 的生产几何网络 fixture 尚待正式验收。
+  Station ID→A 轴映射；Power 与 coherency/Stokes 的生产几何网络 fixture 均已正式验收。
 - GPU worker 保留单 stream 同步 direct 基线，并新增有界多 stream staged 路径；worker
   在 transfer 生命周期注册整个 compute ring，H2D 直接读取 ring block，不再经过 pinned
   input staging。每个 slot 保留 pinned output，单 writer 等待逻辑 next sequence 完成后
   写 output ring，禁止 CUDA 完成乱序变成 ring 乱序。
 - 控制器已能把 NIC/raw/receiver 留在 NUMA1，并从 unpack 开始将 compute/output/GPU 路径
   放到 NUMA0；该能力尚需服务器 A/B 验收，不能提前声称 H2D 已改善。
-- 当前 30 Gbps 小几何链为 Beamform → Power → Integrate(K=128, MEAN)：compute/output
-  block 为 52,428,800/819,200 B，输入 `T=6,553,600` 可被 128 整除，输出 `T=51,200`；
-  到达间隔 13.981013 ms，20% 余量后的整链 deadline 为 11.184810 ms；H2D+D2H 合计
-  53,248,000 B/block，最低合计速率 4,760,742,472 B/s。早期单 stream/pageable-ring
+- 生产 Power 链为 `A=469,F=4,P=1,B=350`、Beamform → Power →
+  Integrate(K=128, MEAN)，compute/output block 为 49,946,624/582,400 B；生产
+  coherency/Stokes 链为 `A=469,F=2,P=2,B=350`，output block 为 1,164,800 B，
+  输出 `AA/BB/AB_REAL/AB_IMAG`。早期单 stream/pageable-ring
   诊断的平均 service/H2D/算法/D2H 为 16.243/12.077/3.873/0.260 ms；随后通过 compute-ring
-  CUDA 注册、三 slot staged pipeline 和 active elapsed/summary 口径修复，完成 30 Gbps、
-  60 秒正式重复门禁。旧诊断只作为优化前证据，不再代表当前实现状态。
+  CUDA 注册、三 slot staged pipeline 和 active elapsed/summary 口径修复，两种生产链均
+  完成约 30 Gbps、60 秒正式重复门禁。旧诊断只作为优化前证据，不再代表当前实现状态。
 - worker 只接受 block-scoped `ATFP/CI8`；第一版输出格式自动确定：Beamformed 为 CF32，
   Power/Stokes/Integration 为 F32。
 - Power 与 Stokes 互斥；Stokes 只允许 `NPOL=2`；Beamformed 不直接积分。
 - 增大 ring 只能吸收突发，不能修复稳态服务率不足。
 - `DumpToDada()` 是旧实现，不作为 pipeline sink。
+
+## 剩余测试工作
+
+1. 收口版本化 GPU-only block writer 和严格 header 契约，再对生产 Power 与
+   coherency/Stokes 执行 `SYNCHRONOUS_DIRECT/1` 与 `STAGED_PIPELINE/3` 匹配测试。
+2. 为 unpack 增加低开销 active service、CPU、queue/ring HWM 指标，执行 1/2/4 parser
+   worker 受控比较；该比较称为 worker-count scaling，不称为串行到并行 speedup。
+3. 用统一 Chapter 3 module suite 打包现有 CPU/CUDA 数值门禁的三次重复、身份和误差字段。
+4. 在所有决定性指标稳定后，仅重跑受指标变更影响的 Full Power/coherency suite，补齐
+   stage P50/P95、arrival interval、headroom、利用率和 first saturated stage；未变化的
+   receive/unpack 功能基线直接复用。

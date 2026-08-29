@@ -18,8 +18,9 @@ AB_IMAG = Im(X * conj(Y))
 [AA, BB, AB_REAL, AB_IMAG]
 ```
 
-当前工程和论文验证范围固定为这四个 coherency/correlation products，不包含
-`I/Q/U/V` 的物理输出或推导。
+当前工程输出固定为这四个 coherency/correlation products，不单独发布 `I/Q/U/V`
+数组。数值 reference 额外核对 `I=AA+BB`、`Q=AA-BB`、`U=2*AB_REAL`、
+`V=-2*AB_IMAG`，该推导只属于验证 oracle，不改变工程输出契约。
 
 ## 参数
 
@@ -53,5 +54,11 @@ RESOLUTION=F*B*4*sizeof(float)
 ```
 
 由于两个 CF32 输入恰好对应四个 F32 输出，block 字节数和
-`BYTES_PER_SECOND` 不变。`POL_LABELS` 必须由上游以 `<P0>,<P1>` 格式提供并
-原样保留。输入和输出 buffer 不允许重叠，worker 必须分配独立输出区。
+`BYTES_PER_SECOND` 不变。Project Observation v1 的 `NPOL=2` 顺序固定为 `X,Y`；
+配置编译器写入 `POL_LABELS X,Y`，后续 stage 原样保留。输入和输出 buffer 不允许
+重叠，worker 必须分配独立输出区。
+
+生产验收使用 `A=469,F=2,P=2,B=350`、K128 MEAN、`STAGED_PIPELINE/3`。
+Full suite `full-30.2505Gbps-60s-20260829T075447Z` 已完成约 30 Gbps、60 秒、
+1 warm-up + 3 measured；四轮 sender→receiver→unpack→GPU→output→EOD 与 cleanup
+均闭合。GPU-only direct/1 与 staged/3 模块性能对照仍待执行。

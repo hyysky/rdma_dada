@@ -62,10 +62,11 @@ The minimum ordered backlog is:
   The original staged runner PASS is preserved, with the effective
   `PERFORMANCE_FAIL/COUNT_CLOSURE_FAIL` interpretation recorded in
   `docs/results/evidence-adjudications.json`.
-- **P2b — GPU numerical evidence:** emit machine-readable shape/byte counts,
-  tolerance, maximum absolute/relative error, and NaN/Inf counts for conversion,
-  beamforming, Power, coherency and SUM/MEAN integration. Verify the I/Q/U/V
-  equations in the reference only.
+- **P2b — GPU numerical evidence (partially completed):** coherency CPU/CUDA
+  evidence now records shape/bytes, tolerance, maximum absolute/relative error,
+  NaN/Inf and reference-only I/Q/U/V equations. Package conversion,
+  beamforming, Power and SUM/MEAN integration with the same machine-readable
+  contract in the Chapter 3 module suite.
 - **P3 — GPU-only performance:** run 469-Station Power and coherency modes and
   the minimum matched `SYNCHRONOUS_DIRECT/1` versus `STAGED_PIPELINE/3`
   comparison needed to quantify the optimization.
@@ -84,6 +85,19 @@ report is delivered successfully to the development task. The paper task reads
 the catalog by suite ID/topology/product/result and does not require a separate
 notification for every run; send a direct handoff only when explicitly
 requested or when promoting evidence for a paper claim.
+
+### Next execution order
+
+1. Import and verify the retained production 469-Station unpack compact suite;
+   this is evidence custody, not a data rerun.
+2. Implement the compact Chapter 3 module-suite controller and the low-overhead
+   aggregate metrics required by the remaining comparisons.
+3. Complete the repository-owned GPU block writer, then run matched production
+   Power/coherency `SYNCHRONOUS_DIRECT/1` versus `STAGED_PIPELINE/3` suites.
+4. Run the matched unpack 1/2/4 parser-worker comparison.
+5. After the metric schema is frozen, rerun only the Full suites affected by
+   the new instrumentation to collect P50/P95, utilization, headroom and the
+   first saturated stage. Reuse unchanged receive/unpack acceptance evidence.
 
 ---
 
