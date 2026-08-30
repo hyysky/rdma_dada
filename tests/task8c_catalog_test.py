@@ -370,6 +370,24 @@ class CatalogTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "structured failure"):
                 catalog.validate_suite(missing_failure)
 
+    def test_failed_suite_allows_retained_pipeline_worker_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = make_suite_fixture(
+                pathlib.Path(directory) / "source",
+                test_result="PERFORMANCE_FAIL",
+            )
+            worker_log = (
+                suite / "debug" / "measured-01" / "pipeline-worker.log"
+            )
+            worker_log.write_text("first failing worker evidence\n")
+            task8c_artifacts.write_manifest(suite)
+
+            loaded = catalog.validate_suite(suite)
+
+            self.assertEqual(
+                loaded["summary"]["TEST_RESULT"], "PERFORMANCE_FAIL"
+            )
+
     def test_pass_requires_all_requested_repetitions(self):
         with tempfile.TemporaryDirectory() as directory:
             suite = make_suite_fixture(pathlib.Path(directory) / "source")

@@ -295,6 +295,7 @@ def validate_suite(path, expected_suite_id=None):
             debug_path = "debug/%s/%s" % (run_id, name)
             allowed_debug.add(debug_path)
             expected_files.add(debug_path)
+        allowed_debug.add("debug/%s/pipeline-worker.log" % run_id)
     actual_files = {
         str(path.relative_to(suite))
         for path in suite.rglob("*")

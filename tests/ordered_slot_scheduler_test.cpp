@@ -49,6 +49,22 @@ int main() {
     Expect(!scheduler.MarkPublished(zero).ok(),
            "stale lease cannot publish a reused slot");
 
+    OrderedSlotScheduler rotating(3U);
+    for (std::uint64_t sequence = 0U; sequence < 6U; ++sequence) {
+        SlotLease current = {};
+        Expect(rotating.Acquire(sequence, &current).ok(),
+               "acquire sequential rotation fixture");
+        Expect(current.slot_index == sequence % 3U,
+               "free slot selection rotates across configured slots");
+        Expect(rotating.MarkCompleted(current).ok(),
+               "complete sequential rotation fixture");
+        Expect(rotating.NextPublishable(&lease).ok() &&
+                   lease.sequence == sequence,
+               "sequential rotation fixture is publishable");
+        Expect(rotating.MarkPublished(lease).ok(),
+               "publish sequential rotation fixture");
+    }
+
     OrderedSlotScheduler failed(2U);
     SlotLease before = {};
     SlotLease broken = {};

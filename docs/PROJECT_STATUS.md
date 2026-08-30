@@ -97,7 +97,7 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 | 完整 GPU pipeline 预算 | 已通过服务器验收 | 编译器报告双速率来源、20% deadline、逐级/合计传输和显存；RTX 3090 Release/CUDA 回归 3/3，30 Gbps 当前 deadline 11.184810 ms；不代表实时速率通过 |
 | GPU-only 正确性 | 正式通过 | `gpu_pressure_writer` 原样发布 compiler header；1 Gbps direct/1 与 staged/3 流程闭合，30 Gbps Power 两模式也均完成 writer→GPU→output block/byte/EOD 闭合；Full 路径保持不变 |
 | GPU-only 持续压力 | Power direct/1 与 staged/3 正式通过 | 30 Gbps suites `gpu-30Gbps-60s-20260829T113850Z` 与 `gpu-30Gbps-60s-20260829T114602Z` 均为 60 s、1 warm-up + 3 measured 全 PASS；summary 只使用 writer 实测速率约 30.36751 Gbps |
-| 生产几何 GPU-only 饱和边界 | Power 已完成 | `A=469,F=4,P=1,B=350` 下，direct/1 suite `gpu-47.5Gbps-60s-20260829T123253Z` 与 staged/3 suite `gpu-47.5Gbps-60s-20260829T124003Z` 均完成 60 s、1 warm-up + 3 measured 全 PASS/CLEANUP PASS，实测约 47.54913 Gbps；两模式在 50 Gbps 单次点均为 `PERFORMANCE_FAIL` 且 cleanup PASS，故当前受控边界为 47.5 Gbps 稳定、50 Gbps 不通过（区间约 5.26%） |
+| 生产几何 GPU-only 饱和边界 | Power 已完成 | `A=469,F=4,P=1,B=350` 下，旧 direct/1 suite `gpu-47.5Gbps-60s-20260829T123253Z` 为 60 s、1 warm-up + 3 measured 全 PASS，50 Gbps 单次点失败，因此 direct/1 最高已证稳定点为约 47.54913 Gbps。加入 `ONE_BLOCK_H2D_LOOKAHEAD` 后，staged/3 suite `gpu-90Gbps-60s-20260830T104917Z` 四轮全 PASS/CLEANUP PASS，writer 实测速率 89.84181--90.06016 Gbps；92.1875 Gbps 单次通过但正式 suite `gpu-92.1875Gbps-60s-20260830T110241Z` 在 measured-01 失败，92.5 Gbps 单次也失败。故 staged/3 最高正式稳定点为名义 90 Gbps；不得把单次 92.1875 Gbps PASS 当成稳定验收。 |
 | 低速完整 GPU pipeline | 已通过服务器验收 | 0.1 Gbps，1 warm-up + 3 measured；双 Station sender、receiver、unpack、GPU、output header/EOD 和 cleanup 每轮精确闭合 |
 | 30 Gbps 完整 GPU pipeline，60 s | 原型正式通过 | `A=2` 小几何，1 warm-up + 3 measured；sender、receiver、unpack、三 slot CUDA、output、dbnull/EOD 和 cleanup 每轮闭合；不能替代论文 `A=469` 主几何验收 |
 | 469-Station full Power | 正式通过 | suite `full-30.2505Gbps-60s-20260829T033639Z`；`A=469,F=4,P=1,B=350`、`STAGED_PIPELINE/3`、Beamform→Power→K128 MEAN；60 s、1 warm-up + 3 measured 全部 PASS/CLEANUP PASS，实际 sender aggregate 30.248563937–30.248563939 Gbps，sender/receiver/unpack/GPU/output/EOD 精确闭合 |
@@ -110,7 +110,9 @@ Power fixture、多 CUDA stream、compute-ring CUDA 注册和 EOD 驱动的 work
 Full Power（`A=469,F=4,P=1,B=350`）与 Full coherency/Stokes
 （`A=469,F=2,P=2,B=350`）pipeline 均已完成 60 秒、1 warm-up + 3 measured
 的正式重复门禁。** 论文两种产品模式的完整链主验收均已有权威 compact 证据；
-GPU-only Power 匹配压力与饱和边界已经完成。GPU 细分性能指标不属于本文范围；
+GPU-only Power 匹配压力与饱和边界已经完成：direct/1 最高已证稳定点约为
+47.5 Gbps，具备一块 H2D 前瞻的 staged/3 最高已证稳定点为名义 90 Gbps。
+GPU 细分性能指标不属于本文范围；
 coherency/Stokes 已由生产几何 Full 正式 suite 覆盖，不再重复执行 GPU-only suite。
 详细证据与边界见 [`VDIF_UNPACK_STATUS.md`](VDIF_UNPACK_STATUS.md)。
 
@@ -118,7 +120,7 @@ coherency/Stokes 已由生产几何 Full 正式 suite 覆盖，不再重复执�
 
 1. 冻结并复用已通过的 469-Station Full Power 与 coherency/Stokes profile、source port、CPU/NUMA、preparation、ring/window 和 binary identity；不重复测试未变化的 ingest/unpack。
 2. 保留已完成的 RDMA staged-copy 与 NSGE=2 direct placement 匹配对照及其证据裁决，不再为同一结论重跑。
-3. GPU-only Power 饱和边界已经收口；后续不补 GPU 细分性能指标或重复 coherency GPU-only，直接推进其余论文模块证据与 module registry。
+3. GPU-only Power direct/1 与 staged/3 饱和边界已经收口；复用各自权威 suite，后续不补 GPU 细分性能指标或重复 coherency GPU-only，直接推进其余论文模块证据与 module registry。
 
 具体可执行任务见
 [`docs/superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md`](superpowers/plans/2026-08-19-receiver-admission-and-full-pipeline-acceptance.md)。
@@ -154,7 +156,7 @@ coherency/Stokes 已由生产几何 Full 正式 suite 覆盖，不再重复执�
 
 ## 剩余测试工作
 
-1. Power GPU-only block writer、严格 header 契约、direct/1 对 staged/3 与饱和边界均已收口；
+1. Power GPU-only block writer、严格 header 契约、direct/1 对 staged/3 与各自饱和边界均已收口；
    coherency/Stokes 复用生产几何 Full 正式结果，不再单独运行 GPU-only。
 2. 为 unpack 增加低开销 active service、CPU、queue/ring HWM 指标，执行 1/2/4 parser
    worker 受控比较；该比较称为 worker-count scaling，不称为串行到并行 speedup。

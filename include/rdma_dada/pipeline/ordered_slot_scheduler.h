@@ -49,6 +49,7 @@ private:
                               SlotState expected) const;
 
     std::vector<SlotRecord> slots_;
+    std::size_t next_slot_index_;
     std::uint64_t next_acquire_sequence_;
     std::uint64_t next_publish_sequence_;
     std::uint64_t first_failed_sequence_;

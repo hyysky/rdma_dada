@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -249,6 +250,42 @@ void RunStaged(const std::string& weights_path,
            "registered-ring staged input performs no host staging copy");
     Expect(metrics.output_staging_bytes() == 3U * sizeof(expected),
            "staged output copy byte accounting is exact");
+    const std::string metrics_path = weights_path + ".metrics.json";
+    std::string metrics_error;
+    Expect(metrics.WriteJson(metrics_path, &metrics_error),
+           "write staged stream topology metrics: " + metrics_error);
+    std::ifstream metrics_input(metrics_path.c_str());
+    std::ostringstream metrics_contents;
+    metrics_contents << metrics_input.rdbuf();
+    Expect(metrics_contents.str().find(
+               "\"cuda_h2d_stream_count\": 1") != std::string::npos,
+           "staged pipeline owns one dedicated H2D stream");
+    Expect(metrics_contents.str().find(
+               "\"cuda_compute_stream_count\": " +
+               std::to_string(inflight_blocks)) != std::string::npos,
+           "staged pipeline owns one compute stream per slot");
+    Expect(metrics_contents.str().find(
+               "\"cuda_d2h_stream_count\": " +
+               std::to_string(inflight_blocks)) != std::string::npos,
+           "staged D2H remains on each slot stream");
+    const std::string submission_policy = inflight_blocks == 1U ?
+        "DEPTH_FIRST_SINGLE_SLOT" : "ONE_BLOCK_H2D_LOOKAHEAD";
+    Expect(metrics_contents.str().find(
+               "\"cuda_submission_policy\": \"" + submission_policy +
+               "\"") != std::string::npos,
+           "staged pipeline records its CUDA submission policy");
+    const std::uint64_t lookahead_submissions =
+        inflight_blocks == 1U ? 0U : 2U;
+    const std::uint64_t eod_flushes = inflight_blocks == 1U ? 0U : 1U;
+    Expect(metrics_contents.str().find(
+               "\"h2d_lookahead_submission_count\": " +
+               std::to_string(lookahead_submissions)) != std::string::npos,
+           "lookahead submission accounting matches the slot policy");
+    Expect(metrics_contents.str().find(
+               "\"h2d_lookahead_eod_flush_count\": " +
+               std::to_string(eod_flushes)) != std::string::npos,
+           "lookahead EOD flush accounting matches the slot policy");
+    std::remove(metrics_path.c_str());
     status = pipeline.Finish();
     Expect(status.ok(), "finish staged pipeline: " + status.message());
 }
