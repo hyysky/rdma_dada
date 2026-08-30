@@ -7,6 +7,7 @@ namespace pipeline {
 
 OrderedSlotScheduler::OrderedSlotScheduler(std::uint32_t slots)
     : slots_(slots),
+      next_slot_index_(0U),
       next_acquire_sequence_(0U),
       next_publish_sequence_(0U),
       first_failed_sequence_(std::numeric_limits<std::uint64_t>::max()) {
@@ -24,13 +25,16 @@ StageStatus OrderedSlotScheduler::Acquire(std::uint64_t sequence,
     if (sequence != next_acquire_sequence_) {
         return StageStatus::Error("slot sequence is not the next input sequence");
     }
-    for (std::size_t index = 0; index < slots_.size(); ++index) {
+    for (std::size_t offset = 0; offset < slots_.size(); ++offset) {
+        const std::size_t index =
+            (next_slot_index_ + offset) % slots_.size();
         SlotRecord& slot = slots_[index];
         if (slot.state != SlotState::kFree) continue;
         slot.state = SlotState::kSubmitted;
         slot.sequence = sequence;
         lease->slot_index = static_cast<std::uint32_t>(index);
         lease->sequence = sequence;
+        next_slot_index_ = (index + 1U) % slots_.size();
         ++next_acquire_sequence_;
         return StageStatus::Ok();
     }

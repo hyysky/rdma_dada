@@ -554,6 +554,54 @@ The historical throughput observation remains the
 execution-policy difference is `STAGED_PIPELINE/3`; do not overwrite the
 baseline file or compare runs with unrecorded geometry/placement differences.
 
+For a diagnostic CUDA timeline only, the versioned rate-point runner accepts
+`--pipeline-profiler nsys` with `--pipeline-stage gpu`. It wraps only
+`pipeline_worker` with the Phase-0-verified
+`/usr/local/cuda-12.8/bin/nsys`, traces CUDA/NVTX/OSRT without CPU sampling,
+and preserves the resulting report under `profiles/<run-id>/`. Profiling is
+not a formal performance acceptance result and is rejected for receive,
+unpack, and full topologies. Omitting the option leaves the accepted launch
+path byte-for-byte unchanged.
+
+Staged GPU metrics distinguish queueing from the input-ring callback cadence.
+`slot_submission_counts` records which configured slot accepted each block;
+`slot_acquire_wait_ns_*` covers only waiting for a free slot;
+`h2d_lease_wait_ns_*` covers the CUDA event wait required before releasing the
+PSRDADA input block; and `submit_return_to_next_entry_ns_*` measures the time
+from one successful `SubmitBlock` return to the next call. The latter includes
+the caller's block close/open path and must not be reported as CUDA service
+time. These fields are diagnostic evidence: a configured inflight count alone
+does not prove that multiple CUDA streams were used.
+The staged scheduler uses circular first-fit selection across free slots so a
+temporarily idle pipeline does not collapse indefinitely onto slot zero;
+in-order publication remains governed by block sequence rather than slot ID.
+
+`STAGED_PIPELINE` uses one non-blocking H2D copy stream and one non-blocking
+compute stream per configured slot. Each compute stream waits on its block's
+H2D-complete event before conversion, beamforming, product formation and
+integration. D2H remains on that slot's compute stream, while the host writer
+waits for completion and publishes pinned output to the output ring strictly
+by block sequence. The staged submission policy is
+`ONE_BLOCK_H2D_LOOKAHEAD`: after H2D for block N completes and its input lease
+can be released, H2D for block N+1 is enqueued before the compute/D2H chain for
+block N. Drain submits the final pending compute chain exactly once. This
+ordering keeps the next copy visible to the device scheduler before the prior
+block's full chain and preserves the PSRDADA rule that `SubmitBlock` may return
+only after the current H2D-complete event; it must not wait for that block's
+compute or D2H completion. A one-slot staged reference cannot hold a pending
+block and therefore records `DEPTH_FIRST_SINGLE_SLOT`; lookahead requires at
+least two slots.
+
+Compact GPU metrics record `cuda_h2d_stream_count`,
+`cuda_compute_stream_count`, `cuda_d2h_stream_count` and one
+`h2d_compute_overlap_*` sample for every adjacent block pair. They also record
+`cuda_submission_policy`, `h2d_lookahead_submission_count` (N-1) and
+`h2d_lookahead_eod_flush_count` (one for a non-empty transfer). A zero overlap
+sample is valid at a low arrival rate. A performance claim that the split
+pipeline overlaps transfers and computation requires positive overlap metrics
+and a retained Nsight timeline showing H2D of block N+1 intersecting compute
+of block N; stream counts or slot rotation alone are insufficient.
+
 The target is physical untagged-IPv4 Ethernet line rate. Fixed points are 1,
 5, 10, 20, 30, 35 and 40 Gbps. Every point runs one 30-second warm-up and three
 30-second measurements. After the first failure, bisect to a 0.5-Gbps maximum

@@ -9,9 +9,19 @@
 int main() {
     rdma_dada::pipeline::WorkerMetrics metrics;
     metrics.ConfigureExecution("STAGED_PIPELINE", 3U, 900U, 120U);
+    metrics.ConfigureCudaStreamTopology(1U, 3U, 3U);
+    metrics.ConfigureCudaSubmissionPolicy("ONE_BLOCK_H2D_LOOKAHEAD");
     metrics.RecordInputRingRegistration(8U, 419430400U, 75000000U);
     metrics.RecordSubmission(100U, 11U, 7U, 1U, 1000U);
+    metrics.RecordStagedSubmissionTiming(0U, 2U, 3U, false, 0U);
     metrics.RecordSubmission(200U, 13U, 5U, 2U, 1500U);
+    metrics.RecordStagedSubmissionTiming(1U, 4U, 6U, true, 17U);
+    metrics.RecordStagedSubmissionTiming(2U, 8U, 9U, true, 23U);
+    metrics.RecordH2dComputeOverlap(1500000U);
+    metrics.RecordH2dComputeOverlap(2500000U);
+    metrics.RecordH2dLookaheadSubmission(false);
+    metrics.RecordH2dLookaheadSubmission(false);
+    metrics.RecordH2dLookaheadSubmission(true);
     metrics.RecordCompletion(false, 17U);
     metrics.RecordCompletion(true, 19U);
     metrics.RecordPublication(40U, 3U, 2000U);
@@ -61,6 +71,44 @@ int main() {
         contents.str().find("\"completed_blocks\": 2") == std::string::npos ||
         contents.str().find("\"published_blocks\": 2") == std::string::npos ||
         contents.str().find("\"max_inflight\": 2") == std::string::npos ||
+        contents.str().find("\"cuda_h2d_stream_count\": 1") ==
+            std::string::npos ||
+        contents.str().find("\"cuda_compute_stream_count\": 3") ==
+            std::string::npos ||
+        contents.str().find("\"cuda_d2h_stream_count\": 3") ==
+            std::string::npos ||
+        contents.str().find(
+            "\"cuda_submission_policy\": \"ONE_BLOCK_H2D_LOOKAHEAD\"") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_lookahead_submission_count\": 2") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_lookahead_eod_flush_count\": 1") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_compute_overlap_sample_count\": 2") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_compute_overlap_ns_total\": 4000000") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_compute_overlap_ns_max\": 2500000") ==
+            std::string::npos ||
+        contents.str().find("\"slot_submission_counts\": [1, 1, 1]") ==
+            std::string::npos ||
+        contents.str().find(
+            "\"submit_return_to_next_entry_ns_sample_count\": 2") ==
+            std::string::npos ||
+        contents.str().find(
+            "\"submit_return_to_next_entry_ns_total\": 40") ==
+            std::string::npos ||
+        contents.str().find(
+            "\"submit_return_to_next_entry_ns_max\": 23") ==
+            std::string::npos ||
+        contents.str().find("\"slot_acquire_wait_ns_total\": 14") ==
+            std::string::npos ||
+        contents.str().find("\"slot_acquire_wait_ns_max\": 8") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_lease_wait_ns_total\": 18") ==
+            std::string::npos ||
+        contents.str().find("\"h2d_lease_wait_ns_max\": 9") ==
+            std::string::npos ||
         contents.str().find("\"completion_reorder_count\": 1") ==
             std::string::npos ||
         contents.str().find("\"input_staging_copy_ns_total\": 24") ==

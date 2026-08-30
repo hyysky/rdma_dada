@@ -10,6 +10,7 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -76,7 +77,8 @@ public:
               active(false),
               submitted_ready(false)
 #if defined(RDMA_DADA_HAVE_CUDA)
-              , stream(NULL), device_input(NULL), device_converted(NULL),
+              , compute_stream(NULL), device_input(NULL),
+              device_converted(NULL),
               device_scratch(NULL), device_output(NULL), event_start(NULL),
               event_h2d(NULL), event_algorithm(NULL), event_d2h(NULL),
               event_completion(NULL)
@@ -91,7 +93,7 @@ public:
         bool submitted_ready;
         PipelineClock::time_point service_start;
 #if defined(RDMA_DADA_HAVE_CUDA)
-        cudaStream_t stream;
+        cudaStream_t compute_stream;
         std::uint8_t* device_input;
         std::uint8_t* device_converted;
         std::uint8_t* device_scratch;
@@ -107,9 +109,14 @@ public:
     Impl()
         : configured(false), aborted(false), accepting(false), draining(false),
           writer_stop(false), next_publish_sequence(0U),
+          pending_compute_slot(NULL),
+          prior_submit_return_valid(false), prior_submit_return_ns(0U),
+          prior_compute_timing_valid(false),
+          prior_compute_start_ms(0.0F), prior_compute_end_ms(0.0F),
           input_location(MemoryLocation::kHost)
 #if defined(RDMA_DADA_HAVE_CUDA)
-          , stream(NULL), device_input(NULL), device_converted(NULL),
+          , h2d_stream(NULL), timeline_origin(NULL), stream(NULL),
+          device_input(NULL), device_converted(NULL),
           device_scratch(NULL), device_output(NULL), event_start(NULL),
           event_h2d(NULL), event_algorithm(NULL), event_d2h(NULL)
 #endif
@@ -117,9 +124,12 @@ public:
 
     StageStatus Release() {
 #if defined(RDMA_DADA_HAVE_CUDA)
+        if (h2d_stream) cudaStreamSynchronize(h2d_stream);
         for (std::size_t index = 0; index < slots.size(); ++index) {
             Slot& slot = *slots[index];
-            if (slot.stream) cudaStreamSynchronize(slot.stream);
+            if (slot.compute_stream) {
+                cudaStreamSynchronize(slot.compute_stream);
+            }
             if (slot.device_input) cudaFree(slot.device_input);
             if (slot.device_converted) cudaFree(slot.device_converted);
             if (slot.device_scratch) cudaFree(slot.device_scratch);
@@ -129,7 +139,7 @@ public:
             if (slot.event_algorithm) cudaEventDestroy(slot.event_algorithm);
             if (slot.event_d2h) cudaEventDestroy(slot.event_d2h);
             if (slot.event_completion) cudaEventDestroy(slot.event_completion);
-            if (slot.stream) cudaStreamDestroy(slot.stream);
+            if (slot.compute_stream) cudaStreamDestroy(slot.compute_stream);
             if (slot.pinned_output) {
                 cudaHostUnregister(slot.pinned_output);
                 std::free(slot.pinned_output);
@@ -139,6 +149,10 @@ public:
         slots.clear();
         scheduler.reset();
 #if defined(RDMA_DADA_HAVE_CUDA)
+        if (timeline_origin) cudaEventDestroy(timeline_origin);
+        timeline_origin = NULL;
+        if (h2d_stream) cudaStreamDestroy(h2d_stream);
+        h2d_stream = NULL;
         if (stream) cudaStreamSynchronize(stream);
         if (device_input) cudaFree(device_input);
         if (device_converted) cudaFree(device_converted);
@@ -164,8 +178,9 @@ public:
 
 #if defined(RDMA_DADA_HAVE_CUDA)
     StageStatus AllocateStagedSlots();
-    StageStatus EnqueueStaged(Slot* slot, const std::uint8_t* ring_data,
-                              std::uint64_t input_bytes);
+    StageStatus EnqueueStagedH2d(Slot* slot, const std::uint8_t* ring_data,
+                                 std::uint64_t input_bytes);
+    StageStatus EnqueueStagedCompute(Slot* slot);
     void WriterLoop();
 #endif
 
@@ -175,6 +190,12 @@ public:
     bool draining;
     bool writer_stop;
     std::uint64_t next_publish_sequence;
+    Slot* pending_compute_slot;
+    bool prior_submit_return_valid;
+    std::uint64_t prior_submit_return_ns;
+    bool prior_compute_timing_valid;
+    float prior_compute_start_ms;
+    float prior_compute_end_ms;
     std::string first_error;
     WorkerConfig config;
     WorkerBlockGeometry geometry;
@@ -192,6 +213,8 @@ public:
     std::condition_variable condition;
     std::thread writer;
 #if defined(RDMA_DADA_HAVE_CUDA)
+    cudaStream_t h2d_stream;
+    cudaEvent_t timeline_origin;
     cudaStream_t stream;
     std::uint8_t* device_input;
     std::uint8_t* device_converted;
@@ -207,6 +230,19 @@ public:
 #if defined(RDMA_DADA_HAVE_CUDA)
 StageStatus GpuBlockPipeline::Impl::AllocateStagedSlots() {
     scheduler.reset(new OrderedSlotScheduler(config.cuda_inflight_blocks));
+    StageStatus status = CudaStatus(cudaStreamCreateWithFlags(
+        &h2d_stream, cudaStreamNonBlocking),
+        "cudaStreamCreateWithFlags staged H2D");
+    if (!status.ok()) return status;
+    status = CudaStatus(cudaEventCreate(&timeline_origin),
+                        "cudaEventCreate staged timeline origin");
+    if (!status.ok()) return status;
+    status = CudaStatus(cudaEventRecord(timeline_origin, h2d_stream),
+                        "cudaEventRecord staged timeline origin");
+    if (!status.ok()) return status;
+    status = CudaStatus(cudaEventSynchronize(timeline_origin),
+                        "cudaEventSynchronize staged timeline origin");
+    if (!status.ok()) return status;
     for (std::uint32_t index = 0U;
         index < config.cuda_inflight_blocks; ++index) {
         std::unique_ptr<Slot> slot(new Slot());
@@ -226,14 +262,15 @@ StageStatus GpuBlockPipeline::Impl::AllocateStagedSlots() {
         // path when any later operation fails.
         slots.push_back(std::move(slot));
         Slot* owned_slot = slots.back().get();
-        StageStatus status = CudaStatus(cudaHostRegister(
+        status = CudaStatus(cudaHostRegister(
             owned_slot->pinned_output,
             static_cast<std::size_t>(geometry.output_block_bytes),
             cudaHostRegisterDefault), "cudaHostRegister output staging");
         if (!status.ok()) return status;
         status = CudaStatus(cudaStreamCreateWithFlags(
-                                &owned_slot->stream, cudaStreamNonBlocking),
-                            "cudaStreamCreateWithFlags slot");
+                                &owned_slot->compute_stream,
+                                cudaStreamNonBlocking),
+                            "cudaStreamCreateWithFlags slot compute");
         if (!status.ok()) return status;
         status = CudaStatus(cudaEventCreate(&owned_slot->event_start),
                             "cudaEventCreate slot start");
@@ -276,7 +313,7 @@ StageStatus GpuBlockPipeline::Impl::AllocateStagedSlots() {
     return StageStatus::Ok();
 }
 
-StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
+StageStatus GpuBlockPipeline::Impl::EnqueueStagedH2d(
     Slot* slot, const std::uint8_t* ring_data, std::uint64_t input_bytes) {
     if (!slot) return StageStatus::Error("staged slot is null");
     slot->service_start = PipelineClock::now();
@@ -294,11 +331,11 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
         converted_bytes, &scratch_bytes, &slot->output_bytes);
     if (!status.ok()) return status;
 
-    const BlockExecutionContext context = {
+    const BlockExecutionContext h2d_context = {
         ExecutionBackend::kCuda, config.cuda_device,
-        reinterpret_cast<void*>(slot->stream)
+        reinterpret_cast<void*>(h2d_stream)
     };
-    status = CudaStatus(cudaEventRecord(slot->event_start, slot->stream),
+    status = CudaStatus(cudaEventRecord(slot->event_start, h2d_stream),
                         "cudaEventRecord staged start");
     OutputBlock device_input = {
         slot->device_input, geometry.input_block_bytes, 0U,
@@ -309,11 +346,42 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
             ring_data, input_bytes, slot->lease.sequence,
             MemoryLocation::kPinnedHost
         };
-        status = h2d.ProcessBlock(host_input, &device_input, context);
+        status = h2d.ProcessBlock(host_input, &device_input, h2d_context);
     }
     if (status.ok()) {
-        status = CudaStatus(cudaEventRecord(slot->event_h2d, slot->stream),
+        status = CudaStatus(cudaEventRecord(slot->event_h2d, h2d_stream),
                             "cudaEventRecord staged H2D");
+    }
+    return status;
+}
+
+StageStatus GpuBlockPipeline::Impl::EnqueueStagedCompute(Slot* slot) {
+    if (!slot) return StageStatus::Error("staged slot is null");
+    const std::uint64_t ntime =
+        slot->input_bytes / geometry.input_frame_bytes;
+    const std::uint64_t converted_bytes =
+        ntime * geometry.converted_frame_bytes;
+    std::uint64_t scratch_bytes = 0U;
+    std::uint64_t output_bytes = 0U;
+    StageStatus status = chain.PlanBlock(
+        converted_bytes, &scratch_bytes, &output_bytes);
+    if (!status.ok()) return status;
+    if (output_bytes != slot->output_bytes) {
+        return StageStatus::Error(
+            "staged deferred compute output plan changed");
+    }
+    const BlockExecutionContext compute_context = {
+        ExecutionBackend::kCuda, config.cuda_device,
+        reinterpret_cast<void*>(slot->compute_stream)
+    };
+    OutputBlock device_input = {
+        slot->device_input, geometry.input_block_bytes, slot->input_bytes,
+        slot->lease.sequence, MemoryLocation::kCudaDevice
+    };
+    if (status.ok()) {
+        status = CudaStatus(cudaStreamWaitEvent(
+                                slot->compute_stream, slot->event_h2d, 0U),
+                            "cudaStreamWaitEvent staged compute after H2D");
     }
     OutputBlock converted = {
         slot->device_converted, geometry.converted_block_bytes, 0U,
@@ -324,7 +392,8 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
             device_input.data, device_input.size, slot->lease.sequence,
             MemoryLocation::kCudaDevice
         };
-        status = conversion.ProcessBlock(integer_input, &converted, context);
+        status = conversion.ProcessBlock(
+            integer_input, &converted, compute_context);
     }
     OutputBlock device_result = {
         slot->device_output, geometry.output_block_bytes, 0U,
@@ -337,7 +406,7 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
         };
         status = chain.ProcessBlock(
             converted_input, &device_result, slot->device_scratch,
-            scratch_bytes, context);
+            scratch_bytes, compute_context);
     }
     if (status.ok() && device_result.size != slot->output_bytes) {
         status = StageStatus::Error(
@@ -345,7 +414,8 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
     }
     if (status.ok()) {
         status = CudaStatus(cudaEventRecord(
-                                slot->event_algorithm, slot->stream),
+                                slot->event_algorithm,
+                                slot->compute_stream),
                             "cudaEventRecord staged algorithm");
     }
     if (status.ok()) {
@@ -357,19 +427,21 @@ StageStatus GpuBlockPipeline::Impl::EnqueueStaged(
             slot->pinned_output, geometry.output_block_bytes, 0U,
             slot->lease.sequence, MemoryLocation::kPinnedHost
         };
-        status = d2h.ProcessBlock(result, &host_result, context);
+        status = d2h.ProcessBlock(result, &host_result, compute_context);
         if (status.ok() && host_result.size != slot->output_bytes) {
             status = StageStatus::Error(
                 "staged D2H produced unexpected output bytes");
         }
     }
     if (status.ok()) {
-        status = CudaStatus(cudaEventRecord(slot->event_d2h, slot->stream),
+        status = CudaStatus(cudaEventRecord(
+                                slot->event_d2h, slot->compute_stream),
                             "cudaEventRecord staged D2H");
     }
     if (status.ok()) {
         status = CudaStatus(cudaEventRecord(
-                                slot->event_completion, slot->stream),
+                                slot->event_completion,
+                                slot->compute_stream),
                             "cudaEventRecord staged completion");
     }
     return status;
@@ -492,6 +564,32 @@ void GpuBlockPipeline::Impl::WriterLoop() {
             &algorithm_ms, slot->event_h2d, slot->event_algorithm);
         (void)cudaEventElapsedTime(
             &d2h_ms, slot->event_algorithm, slot->event_d2h);
+        float h2d_start_ms = 0.0F;
+        float h2d_end_ms = 0.0F;
+        float compute_end_ms = 0.0F;
+        const bool timeline_available =
+            cudaEventElapsedTime(&h2d_start_ms, timeline_origin,
+                                 slot->event_start) == cudaSuccess &&
+            cudaEventElapsedTime(&h2d_end_ms, timeline_origin,
+                                 slot->event_h2d) == cudaSuccess &&
+            cudaEventElapsedTime(&compute_end_ms, timeline_origin,
+                                 slot->event_algorithm) == cudaSuccess;
+        if (timeline_available && prior_compute_timing_valid) {
+            const float overlap_start = std::max(
+                h2d_start_ms, prior_compute_start_ms);
+            const float overlap_end = std::min(
+                h2d_end_ms, prior_compute_end_ms);
+            const std::uint64_t overlap_ns = overlap_end > overlap_start
+                ? static_cast<std::uint64_t>(
+                      (overlap_end - overlap_start) * 1000000.0F)
+                : 0U;
+            metrics.RecordH2dComputeOverlap(overlap_ns);
+        }
+        if (timeline_available) {
+            prior_compute_timing_valid = true;
+            prior_compute_start_ms = h2d_end_ms;
+            prior_compute_end_ms = compute_end_ms;
+        }
         metrics.RecordBlock(
             slot->input_bytes, slot->output_bytes,
             ElapsedNs(slot->service_start, PipelineClock::now()),
@@ -561,6 +659,12 @@ StageStatus GpuBlockPipeline::Configure(
     impl_->draining = false;
     impl_->writer_stop = false;
     impl_->next_publish_sequence = 0U;
+    impl_->pending_compute_slot = NULL;
+    impl_->prior_submit_return_valid = false;
+    impl_->prior_submit_return_ns = 0U;
+    impl_->prior_compute_timing_valid = false;
+    impl_->prior_compute_start_ms = 0.0F;
+    impl_->prior_compute_end_ms = 0.0F;
     impl_->first_error.clear();
     impl_->metrics.Reset();
     const std::uint64_t slot_count =
@@ -596,6 +700,17 @@ StageStatus GpuBlockPipeline::Configure(
         CudaPipelineModeName(config.cuda_pipeline_mode),
         config.cuda_inflight_blocks, planned_device_bytes,
         planned_pinned_host_bytes);
+    if (config.cuda_pipeline_mode == CudaPipelineMode::kStagedPipeline) {
+        impl_->metrics.ConfigureCudaStreamTopology(
+            1U, config.cuda_inflight_blocks, config.cuda_inflight_blocks);
+        impl_->metrics.ConfigureCudaSubmissionPolicy(
+            config.cuda_inflight_blocks == 1U ?
+                "DEPTH_FIRST_SINGLE_SLOT" :
+                "ONE_BLOCK_H2D_LOOKAHEAD");
+    } else {
+        impl_->metrics.ConfigureCudaStreamTopology(1U, 1U, 1U);
+        impl_->metrics.ConfigureCudaSubmissionPolicy("DEPTH_FIRST");
+    }
 
     StageParameters transfer_parameters;
     transfer_parameters.SetString("EXECUTION_BACKEND", "CUDA");
@@ -748,9 +863,17 @@ StageStatus GpuBlockPipeline::SubmitBlock(std::uint64_t sequence,
 #else
     if (impl_->config.cuda_pipeline_mode ==
         CudaPipelineMode::kStagedPipeline) {
+        const PipelineClock::time_point submit_entry = PipelineClock::now();
+        const std::uint64_t submit_entry_ns = MonotonicNs(submit_entry);
+        const bool has_prior_submit = impl_->prior_submit_return_valid;
+        const std::uint64_t submit_return_to_next_entry_ns =
+            has_prior_submit && submit_entry_ns >= impl_->prior_submit_return_ns
+                ? submit_entry_ns - impl_->prior_submit_return_ns
+                : 0U;
         const PipelineClock::time_point slot_wait_start = PipelineClock::now();
         SlotLease lease = {};
         Impl::Slot* slot = NULL;
+        Impl::Slot* prior_slot = NULL;
         std::uint64_t current_inflight = 0U;
         {
             std::unique_lock<std::mutex> lock(impl_->mutex);
@@ -774,36 +897,90 @@ StageStatus GpuBlockPipeline::SubmitBlock(std::uint64_t sequence,
             slot->lease = lease;
             slot->active = true;
             slot->submitted_ready = false;
+            prior_slot = impl_->pending_compute_slot;
+            impl_->pending_compute_slot = NULL;
             for (std::size_t index = 0;
                  index < impl_->slots.size(); ++index) {
                 if (impl_->slots[index]->active) ++current_inflight;
             }
         }
-        const std::uint64_t submission_ns =
-            MonotonicNs(PipelineClock::now());
-        StageStatus enqueued = impl_->EnqueueStaged(
+        const std::uint64_t slot_acquire_wait_ns =
+            ElapsedNs(slot_wait_start, PipelineClock::now());
+        StageStatus enqueued = impl_->EnqueueStagedH2d(
             slot, ring_data, input_bytes);
+        StageStatus prior_compute = StageStatus::Ok();
+        if (enqueued.ok() && prior_slot) {
+            prior_compute = impl_->EnqueueStagedCompute(prior_slot);
+            if (prior_compute.ok()) {
+                impl_->metrics.RecordSubmission(
+                    0U, 0U,
+                    ElapsedNs(prior_slot->service_start,
+                              PipelineClock::now()),
+                    current_inflight,
+                    MonotonicNs(PipelineClock::now()));
+                impl_->metrics.RecordH2dLookaheadSubmission(false);
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                prior_slot->submitted_ready = true;
+                impl_->condition.notify_all();
+            }
+        }
+        std::uint64_t h2d_lease_wait_ns = 0U;
         if (enqueued.ok()) {
+            const PipelineClock::time_point h2d_wait_start =
+                PipelineClock::now();
             enqueued = CudaStatus(
                 cudaEventSynchronize(slot->event_h2d),
                 "cudaEventSynchronize staged H2D before ring release");
+            h2d_lease_wait_ns =
+                ElapsedNs(h2d_wait_start, PipelineClock::now());
+        }
+        StageStatus current_compute = StageStatus::Ok();
+        const bool single_slot = impl_->slots.size() == 1U;
+        if (enqueued.ok() && single_slot) {
+            current_compute = impl_->EnqueueStagedCompute(slot);
+            if (current_compute.ok()) {
+                impl_->metrics.RecordSubmission(
+                    0U, 0U,
+                    ElapsedNs(slot->service_start, PipelineClock::now()),
+                    current_inflight,
+                    MonotonicNs(PipelineClock::now()));
+            }
+        }
+        if (enqueued.ok() && !prior_compute.ok()) {
+            enqueued = prior_compute;
+        }
+        if (enqueued.ok() && !current_compute.ok()) {
+            enqueued = current_compute;
         }
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             if (!enqueued.ok()) {
+                if (prior_slot && !prior_compute.ok()) {
+                    (void)impl_->scheduler->MarkFailed(
+                        prior_slot->lease, prior_compute.message());
+                }
                 (void)impl_->scheduler->MarkFailed(lease,
                                                    enqueued.message());
                 impl_->aborted = true;
                 impl_->accepting = false;
                 impl_->first_error = enqueued.message();
             } else {
-                slot->submitted_ready = true;
-                impl_->metrics.RecordSubmission(
-                    0U, 0U,
-                    ElapsedNs(slot_wait_start, PipelineClock::now()),
-                    current_inflight, submission_ns);
+                if (single_slot) {
+                    slot->submitted_ready = true;
+                } else {
+                    impl_->pending_compute_slot = slot;
+                }
+                impl_->metrics.RecordStagedSubmissionTiming(
+                    lease.slot_index, slot_acquire_wait_ns,
+                    h2d_lease_wait_ns, has_prior_submit,
+                    submit_return_to_next_entry_ns);
             }
             impl_->condition.notify_all();
+        }
+        if (enqueued.ok()) {
+            impl_->prior_submit_return_ns =
+                MonotonicNs(PipelineClock::now());
+            impl_->prior_submit_return_valid = true;
         }
         return enqueued;
     }
@@ -998,10 +1175,42 @@ StageStatus GpuBlockPipeline::Drain() {
 #if defined(RDMA_DADA_HAVE_CUDA)
     if (impl_->config.cuda_pipeline_mode ==
         CudaPipelineMode::kStagedPipeline) {
+        Impl::Slot* final_slot = NULL;
+        std::uint64_t current_inflight = 0U;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->accepting = false;
+            impl_->draining = true;
+            final_slot = impl_->pending_compute_slot;
+            impl_->pending_compute_slot = NULL;
+            for (std::size_t index = 0U;
+                 index < impl_->slots.size(); ++index) {
+                if (impl_->slots[index]->active) ++current_inflight;
+            }
+            impl_->condition.notify_all();
+        }
+        if (final_slot) {
+            StageStatus final_status =
+                impl_->EnqueueStagedCompute(final_slot);
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            if (!final_status.ok()) {
+                (void)impl_->scheduler->MarkFailed(
+                    final_slot->lease, final_status.message());
+                impl_->aborted = true;
+                impl_->first_error = final_status.message();
+            } else {
+                impl_->metrics.RecordSubmission(
+                    0U, 0U,
+                    ElapsedNs(final_slot->service_start,
+                              PipelineClock::now()),
+                    current_inflight,
+                    MonotonicNs(PipelineClock::now()));
+                impl_->metrics.RecordH2dLookaheadSubmission(true);
+                final_slot->submitted_ready = true;
+            }
+            impl_->condition.notify_all();
+        }
         std::unique_lock<std::mutex> lock(impl_->mutex);
-        impl_->accepting = false;
-        impl_->draining = true;
-        impl_->condition.notify_all();
         impl_->condition.wait(lock, [this]() {
             return impl_->aborted || impl_->scheduler->empty();
         });
@@ -1048,6 +1257,7 @@ StageStatus GpuBlockPipeline::Finish() {
     const StageStatus h2d = impl_->h2d.Finish();
     const StageStatus d2h = impl_->d2h.Finish();
     (void)impl_->Release();
+    impl_->pending_compute_slot = NULL;
     impl_->configured = false;
     impl_->aborted = false;
     impl_->accepting = false;

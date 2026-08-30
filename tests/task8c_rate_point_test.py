@@ -1681,6 +1681,94 @@ class Task8cRatePointTest(unittest.TestCase):
         )
         self.assertIn("TASK8C_NUMA_NODE=1", bundle["prepare.sh"])
 
+    def test_gpu_stage_can_wrap_only_pipeline_worker_with_nsys(self):
+        plan = make_plan(
+            75.0, 10.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        bundle = MODULE.build_qths_bundle(
+            plan,
+            "/tmp/task8c-gpu-nsys",
+            pipeline_profiler="nsys",
+            nsys_path="/usr/local/cuda-12.8/bin/nsys",
+        )
+
+        self.assertIn('mkdir -p "$run_dir/nsys"', bundle["start.sh"])
+        self.assertIn(
+            "/usr/local/cuda-12.8/bin/nsys profile "
+            "--trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none "
+            "--force-overwrite=true "
+            "--output=\"$run_dir/nsys/pipeline-worker\" ",
+            bundle["start.sh"],
+        )
+        self.assertIn(
+            '"$project/pipeline_worker" "$run_dir/resolved_observation.json"',
+            bundle["start.sh"],
+        )
+        self.assertNotIn("nsys", bundle["reader_start.sh"] if "reader_start.sh" in bundle else "")
+
+    def test_default_gpu_stage_does_not_enable_nsys(self):
+        plan = make_plan(
+            75.0, 10.0, compute_consumer="dbnull", pipeline_stage="gpu"
+        )
+        bundle = MODULE.build_qths_bundle(plan, "/tmp/task8c-gpu-no-nsys")
+        self.assertNotIn("nsys profile", bundle["start.sh"])
+
+    def test_pipeline_profiler_is_rejected_outside_gpu_stage(self):
+        with self.assertRaisesRegex(
+            ValueError, "pipeline profiler requires gpu pipeline_stage"
+        ):
+            MODULE.build_qths_bundle(
+                make_plan(1.0, 10.0, compute_consumer="dbnull"),
+                "/tmp/task8c-full-nsys",
+                pipeline_profiler="nsys",
+                nsys_path="/usr/local/cuda-12.8/bin/nsys",
+            )
+
+    def test_pipeline_profiler_request_is_gpu_only(self):
+        request = MODULE.RateRequest(
+            75.0, 10.0, compute_consumer="dbnull",
+            pipeline_stage="full", pipeline_profiler="nsys",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "pipeline_profiler requires gpu pipeline_stage"
+        ):
+            request.validate()
+
+    def test_pipeline_profiler_cli_is_explicit_and_defaults_off(self):
+        parser = MODULE._build_parser()
+        common = [
+            "--aggregate-gbps", "75", "--pipeline-stage", "gpu",
+            "--compute-consumer", "dbnull", "--dry-run",
+        ]
+        self.assertEqual(parser.parse_args(common).pipeline_profiler, "none")
+        self.assertEqual(
+            parser.parse_args(common + ["--pipeline-profiler", "nsys"])
+            .pipeline_profiler,
+            "nsys",
+        )
+
+    def test_backend_profiler_setting_reaches_generated_gpu_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backend = MODULE.SshBackend(
+                transport=RecordingTransport(),
+                project_root=root,
+                pipeline_profiler="nsys",
+            )
+            backend.local_run_dir = root
+            backend.remote_run_dir = "/tmp/task8c-profile-bundle"
+            bundle_root = backend._write_bundle(
+                make_plan(
+                    75.0, 10.0, compute_consumer="dbnull",
+                    pipeline_stage="gpu",
+                ),
+                "",
+            )
+            start = (bundle_root / "qths" / "start.sh").read_text()
+        self.assertIn(
+            "/usr/local/cuda-12.8/bin/nsys profile", start
+        )
+
     def test_gpu_stage_preserves_compiler_input_header(self):
         plan = make_plan(
             30.0, 10.0, compute_consumer="dbnull", pipeline_stage="gpu"
@@ -1910,6 +1998,21 @@ class Task8cRatePointTest(unittest.TestCase):
                     "completed_blocks": pressure.block_count,
                     "published_blocks": pressure.block_count,
                     "max_inflight": 3,
+                    "cuda_h2d_stream_count": 1,
+                    "cuda_compute_stream_count": 3,
+                    "cuda_d2h_stream_count": 3,
+                    "cuda_submission_policy": "ONE_BLOCK_H2D_LOOKAHEAD",
+                    "h2d_lookahead_submission_count": max(
+                        pressure.block_count - 1, 0
+                    ),
+                    "h2d_lookahead_eod_flush_count": (
+                        1 if pressure.block_count else 0
+                    ),
+                    "h2d_compute_overlap_sample_count": max(
+                        pressure.block_count - 1, 0
+                    ),
+                    "h2d_compute_overlap_ns_total": 1_000_000,
+                    "h2d_compute_overlap_ns_max": 500_000,
                     "input_bytes": pressure.total_bytes,
                     "output_bytes": output_bytes,
                     "input_staging_bytes": 0,
@@ -1945,6 +2048,18 @@ class Task8cRatePointTest(unittest.TestCase):
             MODULE._validate_statistics(statistics, plan, "")
         self.assertIn("published_blocks", raised.exception.stderr)
         statistics["gpu"]["metrics"]["published_blocks"] += 1
+        del statistics["gpu"]["metrics"]["cuda_h2d_stream_count"]
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("cuda_h2d_stream_count", raised.exception.stderr)
+        statistics["gpu"]["metrics"]["cuda_h2d_stream_count"] = 1
+        del statistics["gpu"]["metrics"]["cuda_submission_policy"]
+        with self.assertRaises(MODULE.StageError) as raised:
+            MODULE._validate_statistics(statistics, plan, "")
+        self.assertIn("cuda_submission_policy", raised.exception.stderr)
+        statistics["gpu"]["metrics"]["cuda_submission_policy"] = (
+            "ONE_BLOCK_H2D_LOOKAHEAD"
+        )
         del statistics["gpu"]["metrics"]["active_elapsed_ns"]
         with self.assertRaises(MODULE.StageError) as raised:
             MODULE._validate_statistics(statistics, plan, "")
@@ -2969,6 +3084,15 @@ class Task8cRatePointTest(unittest.TestCase):
                     "completed_blocks": blocks,
                     "published_blocks": blocks,
                     "max_inflight": 3,
+                    "cuda_h2d_stream_count": 1,
+                    "cuda_compute_stream_count": 3,
+                    "cuda_d2h_stream_count": 3,
+                    "cuda_submission_policy": "ONE_BLOCK_H2D_LOOKAHEAD",
+                    "h2d_lookahead_submission_count": max(blocks - 1, 0),
+                    "h2d_lookahead_eod_flush_count": 1 if blocks else 0,
+                    "h2d_compute_overlap_sample_count": max(blocks - 1, 0),
+                    "h2d_compute_overlap_ns_total": 1_000_000,
+                    "h2d_compute_overlap_ns_max": 500_000,
                     "input_bytes": input_bytes,
                     "output_bytes": output_bytes,
                     "input_staging_bytes": 0,
@@ -4261,6 +4385,40 @@ class Task8cRatePointTest(unittest.TestCase):
             self.assertEqual(
                 compact["evidence_sha256"],
                 hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            )
+
+    def test_compaction_preserves_nsys_report_outside_verbose_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = pathlib.Path(directory) / "suite"
+            run_dir = suite_root / "measured-01"
+            profile_dir = run_dir / "qths" / "nsys"
+            profile_dir.mkdir(parents=True)
+            report = profile_dir / "pipeline-worker.nsys-rep"
+            report.write_bytes(b"nsys-report")
+            (run_dir / "manifest.json").write_text("{}\n")
+            result = {
+                "TEST_RESULT": "HARNESS_FAIL",
+                "run_id": "measured-01",
+                "cleanup": {"CLEANUP_RESULT": "PASS"},
+            }
+
+            compact = MODULE.compact_suite_run(
+                suite_root, "measured-01", result
+            )
+
+            retained = (
+                suite_root / "profiles" / "measured-01" /
+                "pipeline-worker.nsys-rep"
+            )
+            self.assertFalse(run_dir.exists())
+            self.assertEqual(retained.read_bytes(), b"nsys-report")
+            self.assertEqual(
+                compact["profiling"]["reports"][0]["path"],
+                "profiles/measured-01/pipeline-worker.nsys-rep",
+            )
+            self.assertEqual(
+                compact["profiling"]["reports"][0]["sha256"],
+                hashlib.sha256(b"nsys-report").hexdigest(),
             )
 
     def test_suite_identity_ignores_compiler_temporary_source_path_only(self):

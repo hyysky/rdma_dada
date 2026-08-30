@@ -149,6 +149,7 @@ class RateRequest:
     baseline_profile_path: str | None = None
     baseline_profile_sha256: str | None = None
     experiment_name: str | None = None
+    pipeline_profiler: str = "none"
 
     def validate(self) -> None:
         if (
@@ -176,6 +177,10 @@ class RateRequest:
         if self.compute_consumer not in ("dbdisk", "dbnull"):
             raise ValueError("compute_consumer must be dbdisk or dbnull")
         topology = pipeline_topology(self.pipeline_stage)
+        if self.pipeline_profiler not in ("none", "nsys"):
+            raise ValueError("pipeline_profiler must be none or nsys")
+        if self.pipeline_profiler != "none" and self.pipeline_stage != "gpu":
+            raise ValueError("pipeline_profiler requires gpu pipeline_stage")
         if self.pipeline_stage in ("receive", "unpack") and self.compute_consumer != "dbnull":
             raise ValueError(f"{self.pipeline_stage} pipeline_stage requires dbnull")
         if self.pipeline_stage == "receive" and self.unpack_missing_per_second:
@@ -1339,13 +1344,21 @@ def build_qths_bundle(
     dbnull_path: str = "dada_dbnull",
     qths_binary_dir: str = "/home/user/wy/rdma_dada/build-linux",
     ethtool_path: str = "ethtool",
+    pipeline_profiler: str = "none",
+    nsys_path: str = "/usr/local/cuda-12.8/bin/nsys",
 ) -> dict[str, str | bytes]:
     if not plan.artifact_files:
         raise ValueError("compiler artifact bundle is required")
+    if pipeline_profiler not in ("none", "nsys"):
+        raise ValueError("pipeline_profiler must be none or nsys")
+    if pipeline_profiler != "none" and plan.pipeline_stage != "gpu":
+        raise ValueError("pipeline profiler requires gpu pipeline_stage")
+    if pipeline_profiler == "nsys" and not pathlib.PurePosixPath(nsys_path).is_absolute():
+        raise ValueError("nsys_path must be absolute")
     if plan.pipeline_stage == "gpu":
         return _build_gpu_qths_bundle(
             plan, remote_run_dir, dada_db_path, dbdisk_path, dbnull_path,
-            qths_binary_dir,
+            qths_binary_dir, pipeline_profiler, nsys_path,
         )
     receive_only = plan.pipeline_stage == "receive"
     full_gpu_pipeline = plan.uses_pipeline_worker
@@ -1777,6 +1790,8 @@ def _build_gpu_qths_bundle(
     dbdisk_path: str,
     dbnull_path: str,
     qths_binary_dir: str,
+    pipeline_profiler: str,
+    nsys_path: str,
 ) -> dict[str, str | bytes]:
     """Build an isolated compute-ring -> GPU worker -> output-ring run."""
     supervise = build_process_supervisor()
@@ -1809,6 +1824,16 @@ def _build_gpu_qths_bundle(
             f'{sink_prefix}{dbdisk_path} -k {plan.output_key} '
             f'-D {sink_directory} -s -W >"$run_dir/reader.log" 2>&1 &'
         )
+    pipeline_worker_command = '"$project/pipeline_worker"'
+    profiler_prepare = ""
+    if pipeline_profiler == "nsys":
+        profiler_prepare = 'mkdir -p "$run_dir/nsys"\n'
+        pipeline_worker_command = (
+            f"{nsys_path} profile --trace=cuda,nvtx,osrt --sample=none "
+            "--cpuctxsw=none --force-overwrite=true "
+            '--output="$run_dir/nsys/pipeline-worker" '
+            '"$project/pipeline_worker"'
+        )
     prepare = f'''#!/usr/bin/env bash
 set -euo pipefail
 run_dir={remote_run_dir}
@@ -1827,9 +1852,9 @@ kill -0 "$(cat "$run_dir/output-ring.pid")"
 set -euo pipefail
 run_dir={remote_run_dir}
 project={qths_binary_dir}
-{reader_start}
+{profiler_prepare}{reader_start}
 echo $! >"$run_dir/reader.pid"
-{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" {gpu_worker_prefix}"$project/pipeline_worker" "$run_dir/resolved_observation.json" --metrics-json "$run_dir/pipeline-worker-metrics.json" >"$run_dir/pipeline-worker.log" 2>&1 &
+{numa_env}/usr/bin/python3 "$run_dir/supervise.py" "$run_dir/pipeline-worker.exit" {gpu_worker_prefix}{pipeline_worker_command} "$run_dir/resolved_observation.json" --metrics-json "$run_dir/pipeline-worker-metrics.json" >"$run_dir/pipeline-worker.log" 2>&1 &
 echo $! >"$run_dir/pipeline-worker.pid"
 sleep 1
 kill -0 "$(cat "$run_dir/reader.pid")"
@@ -2108,6 +2133,10 @@ class SshBackend:
         known_hosts: pathlib.Path = pathlib.Path("/tmp/task8c-known-hosts"),
         qths_binary_dir: pathlib.Path | None = None,
         sender_binary_dir: pathlib.Path | None = None,
+        pipeline_profiler: str = "none",
+        nsys_path: pathlib.PurePosixPath = pathlib.PurePosixPath(
+            "/usr/local/cuda-12.8/bin/nsys"
+        ),
     ) -> None:
         self.transport = transport or SubprocessTransport()
         self.project_root = pathlib.Path(project_root)
@@ -2117,6 +2146,8 @@ class SshBackend:
         self.sender_binary_dir = pathlib.Path(
             sender_binary_dir or self.project_root / "build-linux"
         )
+        self.pipeline_profiler = pipeline_profiler
+        self.nsys_path = pathlib.PurePosixPath(nsys_path)
         self.known_hosts = pathlib.Path(known_hosts)
         self.remote_run_dir = ""
         self.local_run_dir = pathlib.Path()
@@ -2136,6 +2167,8 @@ class SshBackend:
             "dada_dbnull": "dada_dbnull",
         }
         self._diagnostic_paths = {"ethtool": "ethtool"}
+        if self.pipeline_profiler == "nsys":
+            self._diagnostic_paths["nsys"] = str(self.nsys_path)
         self._sender_ethtool_paths: dict[str, str] = {}
 
     def observation_compiler(
@@ -2251,6 +2284,8 @@ class SshBackend:
             self._psrdada_paths["dada_dbnull"],
             str(self.qths_binary_dir),
             self._diagnostic_paths["ethtool"],
+            self.pipeline_profiler,
+            str(self.nsys_path),
         ).items():
             path = qths_root / name
             if isinstance(content, bytes):
@@ -2327,6 +2362,19 @@ class SshBackend:
         )
         for tool in required_psrdada_tools:
             self._psrdada_paths[tool] = self._resolve_psrdada_tool(tool)
+        if self.pipeline_profiler == "nsys":
+            nsys_path = str(self.nsys_path)
+            available = self._ssh(
+                "qths1", ["test", "-x", nsys_path], "CONFIG_READY",
+                check=False,
+            )
+            if available.returncode != 0:
+                raise StageError(
+                    "CONFIG_READY", ["test", "-x", nsys_path],
+                    available.returncode, available.stdout, available.stderr,
+                    "configured Nsight Systems executable is unavailable",
+                    "ENV_BLOCKED",
+                )
         if plan.topology.uses_receiver:
             self._diagnostic_paths["ethtool"] = self._resolve_executable(
                 "ethtool", ("/usr/sbin/ethtool", "/usr/bin/ethtool"), "qths1"
@@ -2465,6 +2513,31 @@ class SshBackend:
                 )
             binary_hashes[f"{host}:{name}"] = output[0]
             binary_paths[f"{host}:{name}"] = path
+        profiler_evidence: dict[str, Any] = {"tool": "none"}
+        if self.pipeline_profiler == "nsys":
+            nsys_path = str(self.nsys_path)
+            output = self._ssh(
+                "qths1", ["sha256sum", nsys_path], "CONFIG_READY"
+            ).stdout.split()
+            version = self._ssh(
+                "qths1", [nsys_path, "--version"], "CONFIG_READY"
+            ).stdout.strip()
+            if not output:
+                raise StageError(
+                    "CONFIG_READY", ["sha256sum", nsys_path], 1, "",
+                    "missing Nsight Systems SHA256", "ENV_BLOCKED",
+                )
+            binary_hashes["qths1:nsys"] = output[0]
+            binary_paths["qths1:nsys"] = nsys_path
+            profiler_evidence = {
+                "tool": "nsys",
+                "path": nsys_path,
+                "sha256": output[0],
+                "version": version,
+                "trace": ["cuda", "nvtx", "osrt"],
+                "sample": "none",
+                "cpuctxsw": "none",
+            }
         for tool in required_psrdada_tools:
             tool_path = self._psrdada_paths[tool]
             output = self._ssh(
@@ -2528,6 +2601,7 @@ class SshBackend:
             "geometry_id": plan.geometry_id,
             "receiver_preflight": receiver_preflight,
             "sender_config_evidence": list(self._sender_config_evidence),
+            "profiler": profiler_evidence,
         }
 
     def _resolve_psrdada_tool(self, tool: str) -> str:
@@ -2957,6 +3031,23 @@ class SshBackend:
                     ),
                     "COLLECTING", True,
                 )
+            if self.pipeline_profiler == "nsys":
+                self.transport.run(
+                    self._scp_argv(
+                        f"qths1:{self.remote_run_dir}/nsys",
+                        str(qths_copy),
+                        recursive=True,
+                    ),
+                    "COLLECTING", True,
+                )
+                reports = sorted((qths_copy / "nsys").glob("*.nsys-rep"))
+                if len(reports) != 1:
+                    raise StageError(
+                        "COLLECTING", ["validate", "nsys-report"], 1,
+                        "\n".join(str(path) for path in reports),
+                        "expected exactly one Nsight Systems report",
+                        "HARNESS_FAIL",
+                    )
             pipeline_log = (qths_copy / "pipeline-worker.log").read_text()
             if "pipeline transfer completed" not in pipeline_log:
                 raise StageError(
@@ -3132,6 +3223,21 @@ class SshBackend:
                         diagnostic_errors.append(diagnostic)
                 except Exception as error:
                     diagnostic_errors.append(repr(error))
+            if self._pipeline_stage == "gpu" and self.pipeline_profiler == "nsys":
+                try:
+                    completed = self.transport.run(
+                        self._scp_argv(
+                            f"qths1:{self.remote_run_dir}/nsys",
+                            str(diagnostic_root),
+                            recursive=True,
+                        ),
+                        "CLEANUP", check=False,
+                    )
+                    diagnostic = nonzero_diagnostic(completed)
+                    if diagnostic is not None:
+                        diagnostic_errors.append(diagnostic)
+                except Exception as error:
+                    diagnostic_errors.append(repr(error))
         if self.remote_run_dir and (owned_rings or capability_added):
             try:
                 completed = self._ssh(
@@ -3275,6 +3381,63 @@ def _validate_sender(
         )
 
 
+def _validate_staged_stream_metrics(
+    metrics: dict[str, Any], expected_blocks: int,
+    expected_inflight_blocks: int,
+) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    lookahead_enabled = expected_inflight_blocks >= 2
+    required = {
+        "cuda_h2d_stream_count": 1,
+        "cuda_compute_stream_count": expected_inflight_blocks,
+        "cuda_d2h_stream_count": expected_inflight_blocks,
+        "cuda_submission_policy": (
+            "ONE_BLOCK_H2D_LOOKAHEAD" if lookahead_enabled
+            else "DEPTH_FIRST_SINGLE_SLOT"
+        ),
+        "h2d_lookahead_submission_count": (
+            max(expected_blocks - 1, 0) if lookahead_enabled else 0
+        ),
+        "h2d_lookahead_eod_flush_count": (
+            1 if lookahead_enabled and expected_blocks else 0
+        ),
+        "h2d_compute_overlap_sample_count": max(expected_blocks - 1, 0),
+    }
+    for name, expected in required.items():
+        actual = metrics.get(name) if isinstance(metrics, dict) else None
+        if actual != expected:
+            mismatches.append({
+                "field": f"gpu.metrics.{name}",
+                "expected": expected,
+                "actual": actual,
+            })
+    overlap_total = (
+        metrics.get("h2d_compute_overlap_ns_total")
+        if isinstance(metrics, dict) else None
+    )
+    overlap_max = (
+        metrics.get("h2d_compute_overlap_ns_max")
+        if isinstance(metrics, dict) else None
+    )
+    if not isinstance(overlap_total, int) or overlap_total < 0:
+        mismatches.append({
+            "field": "gpu.metrics.h2d_compute_overlap_ns_total",
+            "expected": ">= 0",
+            "actual": overlap_total,
+        })
+    if (
+        not isinstance(overlap_max, int)
+        or overlap_max < 0
+        or isinstance(overlap_total, int) and overlap_max > overlap_total
+    ):
+        mismatches.append({
+            "field": "gpu.metrics.h2d_compute_overlap_ns_max",
+            "expected": "in [0, h2d_compute_overlap_ns_total]",
+            "actual": overlap_max,
+        })
+    return mismatches
+
+
 def _validate_statistics(
     statistics: dict[str, Any], plan: RatePlan, expected_sample_prefix: str
 ) -> None:
@@ -3391,6 +3554,10 @@ def _validate_statistics(
                         "expected": expected,
                         "actual": actual,
                     })
+            mismatches.extend(_validate_staged_stream_metrics(
+                gpu_metrics, pressure.block_count,
+                expected_inflight_blocks,
+            ))
             registration_ns = (
                 gpu_metrics.get("input_ring_registration_ns")
                 if isinstance(gpu_metrics, dict) else None
@@ -3583,6 +3750,9 @@ def _validate_statistics(
                     "expected": expected,
                     "actual": actual,
                 })
+        mismatches.extend(_validate_staged_stream_metrics(
+            metrics, expected_blocks, expected_inflight_blocks,
+        ))
         registration_ns = (
             metrics.get("input_ring_registration_ns")
             if isinstance(metrics, dict) else None
@@ -4477,6 +4647,37 @@ def _write_failure_debug(suite_root: pathlib.Path, run_id: str,
     })
 
 
+def _compact_profiler_artifacts(
+    suite_root: pathlib.Path, run_dir: pathlib.Path, run_id: str
+) -> dict[str, Any] | None:
+    source_roots = [
+        root for root in (
+            run_dir / "qths" / "nsys",
+            run_dir / "qths-cleanup" / "nsys",
+        )
+        if root.is_dir()
+    ]
+    if not source_roots:
+        return None
+    destination_root = suite_root / "profiles" / run_id
+    reports: list[dict[str, Any]] = []
+    sources: dict[str, pathlib.Path] = {}
+    for source_root in source_roots:
+        for source in source_root.iterdir():
+            if source.is_file():
+                sources.setdefault(source.name, source)
+    for source in (sources[name] for name in sorted(sources)):
+        destination_root.mkdir(parents=True, exist_ok=True)
+        destination = destination_root / source.name
+        shutil.copy2(source, destination)
+        reports.append({
+            "path": destination.relative_to(suite_root).as_posix(),
+            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "bytes": destination.stat().st_size,
+        })
+    return {"tool": "nsys", "reports": reports} if reports else None
+
+
 def compact_suite_run(suite_root: pathlib.Path, run_id: str,
                       result: dict[str, Any]) -> dict[str, Any]:
     """Replace a completed verbose run directory with JSON plus raw evidence."""
@@ -4513,6 +4714,9 @@ def compact_suite_run(suite_root: pathlib.Path, run_id: str,
             if isinstance(value, dict):
                 stages.append(value)
     compact = dict(result)
+    profiling = _compact_profiler_artifacts(suite_root, run_dir, run_id)
+    if profiling is not None:
+        compact["profiling"] = profiling
     compact["processes"] = _compact_processes(run_dir, manifest)
     manifest_plan = manifest.get("plan")
     binary_sha = manifest.get("config", {}).get("binary_sha")
@@ -4799,6 +5003,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pipeline-profiler",
+        choices=("none", "nsys"),
+        default="none",
+        help=(
+            "diagnostic-only wrapper for pipeline_worker; nsys is restricted "
+            "to the gpu stage and preserves a task-owned .nsys-rep"
+        ),
+    )
+    parser.add_argument(
         "--worker-cpu-list",
         help="ordered coordinator,worker...,writer CPU mapping for unpack",
     )
@@ -4971,6 +5184,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         sender_source_port_101=args.sender_source_port_101,
         sender_source_port_102=args.sender_source_port_102,
         experiment_name=args.experiment_name,
+        pipeline_profiler=args.pipeline_profiler,
     )
     if args.baseline_profile is not None:
         try:
@@ -5033,6 +5247,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         known_hosts=args.known_hosts,
         qths_binary_dir=args.qths_binary_dir,
         sender_binary_dir=args.sender_binary_dir,
+        pipeline_profiler=args.pipeline_profiler,
     )
     default_result_id = result_directory_name(request)
     if args.preflight_only:
@@ -5057,6 +5272,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 known_hosts=args.known_hosts,
                 qths_binary_dir=args.qths_binary_dir,
                 sender_binary_dir=args.sender_binary_dir,
+                pipeline_profiler=args.pipeline_profiler,
             ),
             args.result_root,
             args.warmup_runs,

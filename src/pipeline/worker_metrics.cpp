@@ -27,8 +27,25 @@ void WorkerMetrics::Reset() {
     published_blocks_ = 0U;
     max_inflight_ = 0U;
     completion_reorder_count_ = 0U;
+    cuda_h2d_stream_count_ = 0U;
+    cuda_compute_stream_count_ = 0U;
+    cuda_d2h_stream_count_ = 0U;
+    cuda_submission_policy_ = "DEPTH_FIRST";
+    h2d_lookahead_submission_count_ = 0U;
+    h2d_lookahead_eod_flush_count_ = 0U;
+    h2d_compute_overlap_sample_count_ = 0U;
+    h2d_compute_overlap_ns_total_ = 0U;
+    h2d_compute_overlap_ns_max_ = 0U;
     slot_wait_ns_total_ = 0U;
     slot_wait_ns_max_ = 0U;
+    slot_submission_counts_.clear();
+    submit_return_to_next_entry_ns_sample_count_ = 0U;
+    submit_return_to_next_entry_ns_total_ = 0U;
+    submit_return_to_next_entry_ns_max_ = 0U;
+    slot_acquire_wait_ns_total_ = 0U;
+    slot_acquire_wait_ns_max_ = 0U;
+    h2d_lease_wait_ns_total_ = 0U;
+    h2d_lease_wait_ns_max_ = 0U;
     writer_wait_ns_total_ = 0U;
     writer_wait_ns_max_ = 0U;
     input_staging_copy_ns_total_ = 0U;
@@ -70,8 +87,70 @@ void WorkerMetrics::ConfigureExecution(
     std::lock_guard<std::mutex> lock(mutex_);
     execution_mode_ = execution_mode;
     inflight_blocks_ = inflight_blocks;
+    slot_submission_counts_.assign(inflight_blocks, 0U);
     planned_device_bytes_ = planned_device_bytes;
     planned_pinned_host_bytes_ = planned_pinned_host_bytes;
+}
+
+void WorkerMetrics::ConfigureCudaStreamTopology(
+    std::uint32_t h2d_stream_count,
+    std::uint32_t compute_stream_count,
+    std::uint32_t d2h_stream_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cuda_h2d_stream_count_ = h2d_stream_count;
+    cuda_compute_stream_count_ = compute_stream_count;
+    cuda_d2h_stream_count_ = d2h_stream_count;
+}
+
+void WorkerMetrics::ConfigureCudaSubmissionPolicy(
+    const std::string& policy) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cuda_submission_policy_ = policy;
+}
+
+void WorkerMetrics::RecordH2dLookaheadSubmission(bool eod_flush) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (eod_flush) {
+        ++h2d_lookahead_eod_flush_count_;
+    } else {
+        ++h2d_lookahead_submission_count_;
+    }
+}
+
+void WorkerMetrics::RecordH2dComputeOverlap(std::uint64_t overlap_ns) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++h2d_compute_overlap_sample_count_;
+    h2d_compute_overlap_ns_total_ += overlap_ns;
+    h2d_compute_overlap_ns_max_ =
+        std::max(h2d_compute_overlap_ns_max_, overlap_ns);
+}
+
+void WorkerMetrics::RecordStagedSubmissionTiming(
+    std::uint32_t slot_index,
+    std::uint64_t slot_acquire_wait_ns,
+    std::uint64_t h2d_lease_wait_ns,
+    bool has_prior_submit,
+    std::uint64_t submit_return_to_next_entry_ns) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slot_index >= slot_submission_counts_.size()) {
+        slot_submission_counts_.resize(
+            static_cast<std::size_t>(slot_index) + 1U, 0U);
+    }
+    ++slot_submission_counts_[slot_index];
+    slot_acquire_wait_ns_total_ += slot_acquire_wait_ns;
+    slot_acquire_wait_ns_max_ =
+        std::max(slot_acquire_wait_ns_max_, slot_acquire_wait_ns);
+    h2d_lease_wait_ns_total_ += h2d_lease_wait_ns;
+    h2d_lease_wait_ns_max_ =
+        std::max(h2d_lease_wait_ns_max_, h2d_lease_wait_ns);
+    if (has_prior_submit) {
+        ++submit_return_to_next_entry_ns_sample_count_;
+        submit_return_to_next_entry_ns_total_ +=
+            submit_return_to_next_entry_ns;
+        submit_return_to_next_entry_ns_max_ = std::max(
+            submit_return_to_next_entry_ns_max_,
+            submit_return_to_next_entry_ns);
+    }
 }
 
 void WorkerMetrics::RecordSubmission(
@@ -180,8 +259,47 @@ bool WorkerMetrics::WriteJson(const std::string& path,
            << "  \"max_inflight\": " << max_inflight_ << ",\n"
            << "  \"completion_reorder_count\": "
            << completion_reorder_count_ << ",\n"
+           << "  \"cuda_h2d_stream_count\": "
+           << cuda_h2d_stream_count_ << ",\n"
+           << "  \"cuda_compute_stream_count\": "
+           << cuda_compute_stream_count_ << ",\n"
+           << "  \"cuda_d2h_stream_count\": "
+           << cuda_d2h_stream_count_ << ",\n"
+           << "  \"cuda_submission_policy\": \""
+           << cuda_submission_policy_ << "\",\n"
+           << "  \"h2d_lookahead_submission_count\": "
+           << h2d_lookahead_submission_count_ << ",\n"
+           << "  \"h2d_lookahead_eod_flush_count\": "
+           << h2d_lookahead_eod_flush_count_ << ",\n"
+           << "  \"h2d_compute_overlap_sample_count\": "
+           << h2d_compute_overlap_sample_count_ << ",\n"
+           << "  \"h2d_compute_overlap_ns_total\": "
+           << h2d_compute_overlap_ns_total_ << ",\n"
+           << "  \"h2d_compute_overlap_ns_max\": "
+           << h2d_compute_overlap_ns_max_ << ",\n"
            << "  \"slot_wait_ns_total\": " << slot_wait_ns_total_ << ",\n"
            << "  \"slot_wait_ns_max\": " << slot_wait_ns_max_ << ",\n"
+           << "  \"slot_submission_counts\": [";
+    for (std::size_t index = 0U; index < slot_submission_counts_.size();
+         ++index) {
+        if (index != 0U) output << ", ";
+        output << slot_submission_counts_[index];
+    }
+    output << "],\n"
+           << "  \"submit_return_to_next_entry_ns_sample_count\": "
+           << submit_return_to_next_entry_ns_sample_count_ << ",\n"
+           << "  \"submit_return_to_next_entry_ns_total\": "
+           << submit_return_to_next_entry_ns_total_ << ",\n"
+           << "  \"submit_return_to_next_entry_ns_max\": "
+           << submit_return_to_next_entry_ns_max_ << ",\n"
+           << "  \"slot_acquire_wait_ns_total\": "
+           << slot_acquire_wait_ns_total_ << ",\n"
+           << "  \"slot_acquire_wait_ns_max\": "
+           << slot_acquire_wait_ns_max_ << ",\n"
+           << "  \"h2d_lease_wait_ns_total\": "
+           << h2d_lease_wait_ns_total_ << ",\n"
+           << "  \"h2d_lease_wait_ns_max\": "
+           << h2d_lease_wait_ns_max_ << ",\n"
            << "  \"writer_wait_ns_total\": " << writer_wait_ns_total_ << ",\n"
            << "  \"writer_wait_ns_max\": " << writer_wait_ns_max_ << ",\n"
            << "  \"input_staging_copy_ns_total\": "
