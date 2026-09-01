@@ -339,6 +339,80 @@
     {
       "catalog_entry": {
         "actual_payload_gbps": {
+          "maximum": 47.549137370363106,
+          "median": 47.54913303309412,
+          "minimum": 47.54912767272844
+        },
+        "cleanup_result": "PASS",
+        "configuration": {
+          "gpu_worker_cpu": 21,
+          "ingress_numa_node": null,
+          "numa_node": 1,
+          "processing_numa_node": null,
+          "receiver_poll_batch": 32,
+          "receiver_poll_cpu": null,
+          "receiver_wr_num": 1024,
+          "reorder_horizon_groups": null,
+          "rings": {
+            "compute": {
+              "block_bytes": 49946624,
+              "blocks": 8
+            },
+            "output": {
+              "block_bytes": 582400,
+              "blocks": 8
+            },
+            "raw": null
+          },
+          "sink_cpu_list": "20",
+          "unpack_start_delay_seconds": null,
+          "window_groups": null,
+          "worker_cpu_list": null
+        },
+        "duration_seconds": 60.0,
+        "first_failure": null,
+        "identity": {
+          "baseline_profile_id": null,
+          "baseline_profile_sha256": null,
+          "binary_sha256": {
+            "qths1:dada_db": "61b1a6a92f8f45b07fc760868aee59f683511ffa331ba80b62306466a7d5e1a4",
+            "qths1:dada_dbnull": "fbe083b4fdc775e0b3e4513c1c150a1e73e7475164beef83487823b8ba13bcbc",
+            "qths1:gpu_pressure_writer": "a6d205c521b3e50e919000d83087777e4e182a8ae08aefc84af1eafc877ad114",
+            "qths1:pipeline_worker": "cb639c0b5bb941a70805a80c1dadebcc1ce5760368beb12cc7d600c1bea0677f"
+          },
+          "config_id": "56594edc38ca2119078e9a7abe3f949f1aef8ecd289edf02884dc7063af8f35e",
+          "geometry_id": "83906cb5fa1b31bac0f976af9f98bbe4832eb8040b6e688f7660d235dec8ede1",
+          "source_manifest_sha256": "d4b7768b5630cfe77ad83f4a98d1629263811f75ff8ed7f98324ad4255f46657"
+        },
+        "measured_count": 3,
+        "modules": [
+          "gpu_pressure_writer",
+          "pipeline_worker",
+          "dada_dbnull"
+        ],
+        "result_path": "suites/gpu-47.5Gbps-60s-20260829T123253Z",
+        "started_utc": "2026-08-29T12:33:00.081780Z",
+        "suite_id": "gpu-47.5Gbps-60s-20260829T123253Z",
+        "suite_manifest_sha256": "a24e79c9ee086d90c69d248e64e0bc120adc406c9577cb7525e01701bb932a7e",
+        "summary_sha256": "194146b21c03798ebd0ba3a8d2051ef47fafb933319ddb921449a1eaf1593df0",
+        "target_payload_gbps": 47.5,
+        "test_result": "PASS",
+        "test_topology": "gpu",
+        "warmup_count": 1
+      },
+      "origin": {
+        "imported_utc": "2026-09-01T07:00:54Z",
+        "remote_suite_root": "/home/user/wy/task8c-pressure-saturation/direct-formal-47p5Gbps-60s/gpu-47.5Gbps-60s-20260829T123253Z",
+        "schema_version": 1,
+        "source_host": "qths1",
+        "source_manifest_sha256": "d4b7768b5630cfe77ad83f4a98d1629263811f75ff8ed7f98324ad4255f46657",
+        "suite_id": "gpu-47.5Gbps-60s-20260829T123253Z"
+      },
+      "promoted_utc": "2026-09-01T07:00:55Z"
+    },
+    {
+      "catalog_entry": {
+        "actual_payload_gbps": {
           "maximum": 90.06015771656897,
           "median": 89.89285128097266,
           "minimum": 89.8418119095786

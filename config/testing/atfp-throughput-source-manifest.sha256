@@ -49,7 +49,7 @@ a5781c0f6f6375cbaa9094a5a8f0173af1a82dad11809f388debc7f0ff4d4748  ./docs/agents/
 ac355c205fa83a3f0f56f2c0aeb3d8c2ca099eea02f16611653f24dbe369c402  ./docs/agents/testing.md
 722c2691073337dab61d9b8a4f0ed6288c176d9a5930f3ba40582fec30857a7d  ./docs/parameter-dependency-mindmap.svg
 3213e88d9ef2005a2a8271a8c81ed3b23ef2c0f34fec1ea0724df39169a64ab0  ./docs/results/README.md
-bf04b5db146016bff6a5e75c187813c7b547c9f0af48ef4ce065116071b09387  ./docs/results/accepted-results.json
+b5e2e62f6323ef9e0ebc2c391a4d2a38575500cbea2dc0eeec549320609511e3  ./docs/results/accepted-results.json
 b8e5e13e8b7b1f0bee32340c0d635b92db9800d154c378d3f3cf23d539158a79  ./docs/results/evidence-adjudications.json
 e77418534491a080d04ebd8d793bf9dd9863f003e446b2030a120e47ffde410f  ./docs/superpowers/plans/2026-08-05-project-vdif-v1.md
 eceba916a73cdd58836ca267d0ddeffe9af6332d55ad530e82c1c4c4a3574617  ./docs/superpowers/plans/2026-08-06-vdif-unpack-and-sender-simulation.md
@@ -78,6 +78,7 @@ f39e2dd955be11c8bd2299680f2dee5083879a238c40466ca5f0fe128567d17a  ./docs/superpo
 b732dc2ce14970c8e5e14af753db4c1a7cbf0897862f8e12a73f636d6b0da49d  ./docs/superpowers/specs/2026-08-19-parallel-vdif-unpack-design.md
 ee818e56c11cac991a1de61054503911e7a6bc2b8dccbb76c054fc813118430f  ./docs/superpowers/specs/2026-08-26-test-result-catalog-and-handoff-design.md
 39e91f2a6bd203ac449a0dc8bdd96ed284cb4d0298058eae6d675105fdb7183f  ./docs/superpowers/specs/2026-08-27-gpu-multistream-pipeline-design.md
+8f93db437c57b9993e31f57613a58e60d4dfb50a2736071dcbc017c2f528718c  ./docs/superpowers/specs/2026-08-30-module-numerical-suite-design.md
 2c4b94fac0b4229ee8c3db5c2425fc8bfb315cdf11fcd3354bf42eb99afa423b  ./include/rdma_dada/config/beamform_weight_metadata.h
 38bee463e067b9bab8569aafffe34f3113ef1199c0ff7524e399c688be5e6de3  ./include/rdma_dada/config/gpu_pipeline_budget.h
 4999a6bc17b102f8dd44db05be860ccfaf71146f941492aa3f0d726a4535ee8e  ./include/rdma_dada/config/json_value.h
