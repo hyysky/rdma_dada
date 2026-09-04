@@ -22,6 +22,13 @@ The accepted qths1 ingress/unpack baseline is
 profile to keep the receiver/raw/unpack seam unchanged while adding GPU and
 output-ring roles. Changes to inherited fields remain named experiments.
 
+The production A=469 upstream profile is
+`qths1-unpack-30p2505gbps-60s-a469-v1.json`. It is extracted from the accepted
+60-second Full Power suite and covers only the shared receiver/raw/unpack
+boundary. A single-worker comparison loads this profile and overrides only
+`worker_cpu_list` under an explicit experiment name; the comparison result does
+not replace the parallel baseline.
+
 When no accepted profile exists, the only allowed formal bootstrap name is
 `bootstrap-<pipeline-stage>-v1`. A bootstrap run is a candidate only. It becomes
 an accepted profile after the remote result, process ledger, cleanup state, raw

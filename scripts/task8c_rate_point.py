@@ -4239,19 +4239,21 @@ class RatePointController:
                     )
             self._state("COLLECTING")
             statistics = self.backend.collect(plan, self.run_dir)
-            _validate_statistics(
-                statistics,
-                plan,
-                str(summaries[0]["payload_prefix_hex"]) if summaries else "",
-            )
+            # Preserve the observed boundary counters even when validation
+            # classifies the completed transfer as a performance failure.
             result.update(
                 {
-                    "TEST_RESULT": "PASS",
                     "senders": summaries,
                     "statistics": statistics,
                     "preparation": preparation,
                 }
             )
+            _validate_statistics(
+                statistics,
+                plan,
+                str(summaries[0]["payload_prefix_hex"]) if summaries else "",
+            )
+            result["TEST_RESULT"] = "PASS"
             self._state("PASS", test_result="PASS")
         except StageError as error:
             result["TEST_RESULT"] = error.classification
@@ -4866,6 +4868,7 @@ def run_rate_request_sequence(
     warmup_runs: int,
     measured_runs: int,
     suite_id: str | None = None,
+    performance_characterization: bool = False,
 ) -> dict[str, Any]:
     if warmup_runs < 0 or measured_runs <= 0:
         raise ValueError("warmup_runs must be non-negative and measured_runs positive")
@@ -4894,11 +4897,23 @@ def run_rate_request_sequence(
                 "result_path": f"runs/{run_id}.json",
             }
             runs.append(run)
-            if run["TEST_RESULT"] != "PASS" or run["CLEANUP_RESULT"] != "PASS":
+            may_continue = (
+                performance_characterization
+                and run["TEST_RESULT"] == "PERFORMANCE_FAIL"
+                and run["CLEANUP_RESULT"] == "PASS"
+            )
+            if (
+                run["TEST_RESULT"] != "PASS"
+                or run["CLEANUP_RESULT"] != "PASS"
+            ) and not may_continue:
                 break
         if runs and (
             runs[-1]["TEST_RESULT"] != "PASS"
             or runs[-1]["CLEANUP_RESULT"] != "PASS"
+        ) and not (
+            performance_characterization
+            and runs[-1]["TEST_RESULT"] == "PERFORMANCE_FAIL"
+            and runs[-1]["CLEANUP_RESULT"] == "PASS"
         ):
             break
     measured_rates = []
@@ -4931,7 +4946,18 @@ def run_rate_request_sequence(
         "request": dataclasses.asdict(request),
         "warmup_count": warmup_runs,
         "measured_count": measured_runs,
+        "completed_warmup_count": sum(
+            run["role"] == "warmup" for run in runs
+        ),
+        "completed_measured_count": sum(
+            run["role"] == "measured" for run in runs
+        ),
         "runs": runs,
+        "performance_characterization": performance_characterization,
+        "unpack_loss_characterization": (
+            _summarize_unpack_loss(suite_root, runs)
+            if performance_characterization else None
+        ),
         "actual_aggregate_gbps": aggregate,
         "actual_aggregate_gbps_source": (
             "input_writer.actual_payload_gbps"
@@ -4942,6 +4968,70 @@ def run_rate_request_sequence(
     _atomic_json(suite_root / "summary.json", summary)
     _write_suite_manifest(suite_root)
     return summary
+
+
+def _numeric_distribution(values: list[int]) -> dict[str, int | float]:
+    return {
+        "minimum": min(values),
+        "median": statistics.median(values),
+        "maximum": max(values),
+    }
+
+
+def _summarize_unpack_loss(
+    suite_root: pathlib.Path, runs: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Aggregate decisive measured-run loss counters for characterization."""
+    samples: dict[str, list[int]] = {
+        "sender_to_receiver_packet_deficit": [],
+        "formal_unpack_record_deficit": [],
+        "receiver_to_unpack_record_gap": [],
+        "missing_station_records": [],
+        "incomplete_groups": [],
+        "fully_missing_groups": [],
+    }
+    measured = [run for run in runs if run["role"] == "measured"]
+    for run in measured:
+        result = json.loads((suite_root / run["result_path"]).read_text())
+        plan = result.get("plan", {})
+        observed = result.get("statistics", {})
+        receiver = observed.get("receiver", {})
+        unpack = observed.get("unpack", {})
+        senders = result.get("senders", [])
+        if not all(isinstance(value, dict) for value in (plan, receiver, unpack)):
+            return None
+        try:
+            sent_packets = sum(int(sender["sent_packets"]) for sender in senders)
+            receiver_accepted = int(receiver["accepted"])
+            unpack_records = int(unpack["accepted"])
+            formal_expected = int(plan["group_count"]) * int(plan["nant"])
+            values = {
+                "sender_to_receiver_packet_deficit": max(
+                    0, sent_packets - receiver_accepted
+                ),
+                "formal_unpack_record_deficit": max(
+                    0, formal_expected - unpack_records
+                ),
+                "receiver_to_unpack_record_gap": max(
+                    0, receiver_accepted - unpack_records
+                ),
+                "missing_station_records": int(unpack["missing_station"]),
+                "incomplete_groups": int(unpack["incomplete_groups"]),
+                "fully_missing_groups": int(unpack["fully_missing_groups"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        for name, value in values.items():
+            samples[name].append(value)
+    if not measured or any(len(values) != len(measured) for values in samples.values()):
+        return None
+    return {
+        "measured_repetitions": len(measured),
+        **{
+            name: _numeric_distribution(values)
+            for name, values in samples.items()
+        },
+    }
 
 
 def _actual_result_payload_gbps(result: dict[str, Any]) -> float:
@@ -5079,6 +5169,15 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--execute", action="store_true")
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--measured-runs", type=int, default=1)
+    parser.add_argument(
+        "--performance-characterization",
+        action="store_true",
+        help=(
+            "continue an unpack/dbnull suite after a completed "
+            "PERFORMANCE_FAIL with clean cleanup so all requested repetitions "
+            "record the loss distribution; other failures remain fail-closed"
+        ),
+    )
     parser.add_argument("--suite-id")
     parser.add_argument(
         "--baseline-profile",
@@ -5133,6 +5232,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.performance_characterization and (
+        not args.execute
+        or args.pipeline_stage != "unpack"
+        or args.compute_consumer != "dbnull"
+        or args.warmup_runs < 1
+        or args.measured_runs < 3
+    ):
+        print(
+            "--performance-characterization requires --execute, "
+            "--pipeline-stage unpack, --compute-consumer dbnull, "
+            "at least one warm-up and three measured runs",
+            file=sys.stderr,
+        )
+        return 2
     explicit_profile_fields = {
         name
         for name, value in (
@@ -5278,6 +5391,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.warmup_runs,
             args.measured_runs,
             args.suite_id or default_result_id,
+            performance_characterization=args.performance_characterization,
         )
     print(json.dumps(result, sort_keys=True), flush=True)
     cleanup_passed = (

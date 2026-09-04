@@ -343,6 +343,29 @@ Unless a test is explicitly named as a preparation-policy experiment,
 configuration and its result must not be substituted for the accepted
 one-second baseline.
 
+The production single-worker unpack characterization loads the accepted
+upstream profile
+`config/testing/profiles/qths1-unpack-30p2505gbps-60s-a469-v1.json`, then uses
+the named experiment override `--worker-cpu-list 14,15,19`: coordinator CPU
+14, one parser/copy worker on CPU 15, and writer CPU 19. Receiver CPU 13, sink
+CPU 20, NUMA node 1, fixed source ports 45871/55871, poll batch 32, WR count
+1024, ring/window geometry and the one-second preparation interval remain
+fixed. The runner must record the single `runtime.worker_cpu_list` profile
+diff. Formal evidence uses 60 seconds, one warm-up and three measured
+repetitions.
+
+This experiment is expected to establish a loss boundary, so its versioned
+runner command must include `--performance-characterization`. That option is
+restricted to `unpack` + `dbnull` execution with at least warm-up 1 + measured
+3. A completed `PERFORMANCE_FAIL` with `CLEANUP_RESULT=PASS` does not stop the
+remaining repetitions; `PRODUCT_FAIL`, `HARNESS_FAIL`, environment/startup
+failure, or cleanup failure remains fail-closed. The suite result remains
+`PERFORMANCE_FAIL` when any repetition fails. Its `summary.json` aggregates
+measured sender-to-receiver packet deficit, formal unpack-record deficit,
+receiver-to-unpack record gap, missing-Station records, incomplete groups and
+fully missing groups. A failed characterization suite is catalog-queryable
+evidence but must not be promoted as an accepted PASS baseline.
+
 GPU worker performance profiles also pin the Observation
 `processing.cuda_pipeline` contract. `SYNCHRONOUS_DIRECT/1` is the retained
 unoptimized comparison path. `STAGED_PIPELINE/N` uses exactly `N` bounded

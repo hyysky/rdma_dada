@@ -166,6 +166,24 @@ class Task8cProfilesTest(unittest.TestCase):
         self.assertEqual(profile.geometry["target_payload_gbps"], 30.0)
         self.assertEqual(profile.geometry["duration_seconds"], 60.0)
 
+    def test_checked_in_a469_unpack_profile_is_production_scale(self):
+        profile = profiles.load_profile(
+            ROOT / "config" / "testing" / "profiles"
+            / "qths1-unpack-30p2505gbps-60s-a469-v1.json"
+        )
+
+        self.assertEqual(profile.pipeline_stage, "unpack")
+        self.assertEqual(
+            profile.runtime["worker_cpu_list"], "14,15,16,17,18,19"
+        )
+        self.assertEqual(profile.runtime["unpack_start_delay_seconds"], 1)
+        self.assertEqual(profile.geometry["target_payload_gbps"], 30.2505)
+        self.assertEqual(profile.geometry["duration_seconds"], 60.0)
+        self.assertEqual(profile.geometry["raw_block_bytes"], 50336832)
+        self.assertEqual(profile.geometry["compute_block_bytes"], 49946624)
+        self.assertEqual(profile.geometry["window_blocks"], 33)
+        self.assertEqual(profile.geometry["reorder_horizon_groups"], 416)
+
     def test_load_profile_rejects_unknown_top_level_field(self):
         value = valid_profile()
         value["unexpected"] = True

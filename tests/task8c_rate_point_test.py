@@ -4666,6 +4666,130 @@ class Task8cRatePointTest(unittest.TestCase):
         self.assertEqual(summary["runs"][0]["TEST_RESULT"], "PASS")
         self.assertEqual(summary["runs"][0]["CLEANUP_RESULT"], "FAIL")
 
+    def test_characterization_sequence_completes_performance_failure_repetitions(self):
+        class PerformanceFailedBackend(FakeBackend):
+            def collect(self, plan, run_dir):
+                statistics = super().collect(plan, run_dir)
+                statistics["receiver"]["accepted"] -= 20
+                statistics["receiver"]["published"] -= 20
+                statistics["unpack"].update({
+                    "records": statistics["receiver"]["accepted"],
+                    "accepted": statistics["receiver"]["accepted"],
+                    "complete_groups": plan.group_count - 10,
+                    "incomplete_groups": 10,
+                    "fully_missing_groups": 0,
+                    "missing_station": 20,
+                })
+                statistics["compute"].update({
+                    "consumer": "dada_dbnull",
+                    "exit_code": 0,
+                    "zero_copy": True,
+                    "single_transfer": True,
+                })
+                return statistics
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE,
+                "compile_rate_plan",
+                side_effect=lambda request, *_args: dataclasses.replace(
+                    make_plan(
+                        request.aggregate_gbps,
+                        request.duration_seconds,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                    ),
+                    unpack_start_delay_seconds=1,
+                ),
+            ):
+                summary = MODULE.run_rate_request_sequence(
+                    MODULE.RateRequest(
+                        30.0,
+                        60.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                        worker_cpu_list="14,15,19",
+                        unpack_start_delay_seconds=1,
+                    ),
+                    pathlib.Path("observation.json"),
+                    pathlib.Path("observation_config_compile"),
+                    PerformanceFailedBackend,
+                    pathlib.Path(directory),
+                    warmup_runs=1,
+                    measured_runs=3,
+                    suite_id="single-worker-characterization",
+                    performance_characterization=True,
+                )
+
+        self.assertEqual(summary["TEST_RESULT"], "PERFORMANCE_FAIL")
+        self.assertEqual(len(summary["runs"]), 4)
+        self.assertEqual(
+            [run["run_id"] for run in summary["runs"]],
+            ["warmup-01", "measured-01", "measured-02", "measured-03"],
+        )
+        self.assertTrue(summary["performance_characterization"])
+        loss = summary["unpack_loss_characterization"]
+        self.assertEqual(loss["measured_repetitions"], 3)
+        self.assertEqual(loss["sender_to_receiver_packet_deficit"]["median"], 20)
+        self.assertEqual(loss["formal_unpack_record_deficit"]["median"], 20)
+        self.assertEqual(loss["receiver_to_unpack_record_gap"]["median"], 0)
+        self.assertEqual(loss["missing_station_records"]["median"], 20)
+        self.assertEqual(loss["incomplete_groups"]["median"], 10)
+
+    def test_characterization_sequence_still_stops_on_product_failure(self):
+        class ProductFailedBackend(FakeBackend):
+            def collect(self, plan, run_dir):
+                raise MODULE.StageError(
+                    "COLLECTING",
+                    ["validate", "pipeline-statistics"],
+                    1,
+                    stderr="bad header",
+                    classification="PRODUCT_FAIL",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE,
+                "compile_rate_plan",
+                side_effect=lambda request, *_args: make_plan(
+                    request.aggregate_gbps,
+                    request.duration_seconds,
+                    compute_consumer="dbnull",
+                    pipeline_stage="unpack",
+                ),
+            ):
+                summary = MODULE.run_rate_request_sequence(
+                    MODULE.RateRequest(
+                        30.0,
+                        60.0,
+                        compute_consumer="dbnull",
+                        pipeline_stage="unpack",
+                        worker_cpu_list="14,15,19",
+                    ),
+                    pathlib.Path("observation.json"),
+                    pathlib.Path("observation_config_compile"),
+                    ProductFailedBackend,
+                    pathlib.Path(directory),
+                    warmup_runs=1,
+                    measured_runs=3,
+                    suite_id="product-failure",
+                    performance_characterization=True,
+                )
+
+        self.assertEqual(summary["TEST_RESULT"], "PRODUCT_FAIL")
+        self.assertEqual(len(summary["runs"]), 1)
+
+    def test_cli_parses_explicit_performance_characterization_mode(self):
+        args = MODULE._build_parser().parse_args([
+            "--aggregate-gbps", "30.2505",
+            "--pipeline-stage", "unpack",
+            "--compute-consumer", "dbnull",
+            "--performance-characterization",
+            "--execute",
+        ])
+
+        self.assertTrue(args.performance_characterization)
+
     def test_every_run_persists_a_manifest_before_remote_work(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = MODULE.RatePointController(
